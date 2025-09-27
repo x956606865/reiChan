@@ -1,9 +1,11 @@
+mod manga;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::Manager;
+use tauri::{async_runtime, Emitter, Manager};
 
 use rusqlite::{params, Connection};
 
@@ -16,6 +18,16 @@ pub struct PortUsage {
     remote_address: Option<String>,
     remote_port: Option<u16>,
     pid: Option<u32>,
+    process_name: Option<String>,
+    parent_pid: Option<u32>,
+    parent_process_name: Option<String>,
+    ancestors: Vec<ProcessLink>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessLink {
+    pid: u32,
     process_name: Option<String>,
 }
 
@@ -43,6 +55,26 @@ struct AppState {
 #[tauri::command]
 fn list_ports() -> Result<Vec<PortUsage>, String> {
     collect_ports().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn kill_port_process(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("Invalid PID".to_string());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        return kill_process_unix(pid).map_err(|err| err.to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return kill_process_windows(pid).map_err(|err| err.to_string());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Unsupported platform".to_string())
 }
 
 #[tauri::command]
@@ -97,6 +129,54 @@ fn update_port_favorite(
     .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+fn rename_manga_sequence(options: manga::RenameOptions) -> Result<manga::RenameOutcome, String> {
+    manga::perform_rename(options).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn analyze_manga_directory(directory: PathBuf) -> Result<manga::MangaSourceAnalysis, String> {
+    manga::analyze_manga_directory(directory).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn upload_copyparty(
+    app: tauri::AppHandle,
+    request: manga::UploadRequest,
+) -> Result<manga::UploadOutcome, String> {
+    manga::perform_upload(Some(app.clone()), request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn create_manga_job(options: manga::CreateJobOptions) -> Result<manga::JobSubmission, String> {
+    manga::create_remote_job(options).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn fetch_manga_job_status(
+    request: manga::JobStatusRequest,
+) -> Result<manga::JobStatusSnapshot, String> {
+    manga::fetch_job_state(request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn watch_manga_job(
+    app: tauri::AppHandle,
+    request: manga::JobWatchRequest,
+) -> Result<(), String> {
+    let job_id = request.job_id.clone();
+    async_runtime::spawn({
+        let app_handle = app.clone();
+        async move {
+            if let Err(err) = manga::watch_job_events(app_handle.clone(), request).await {
+                let fallback = manga::JobEventEnvelope::system_error(job_id, err.to_string());
+                let _ = app_handle.emit(manga::JOB_EVENT_NAME, &fallback);
+            }
+        }
+    });
+    Ok(())
+}
+
 fn collect_ports() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -113,6 +193,40 @@ fn collect_ports() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn kill_process_unix(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kill").arg(pid.to_string()).output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No such process") {
+        return Ok(());
+    }
+
+    Err(format!("kill failed: {}", stderr.trim()).into())
+}
+
+#[cfg(target_os = "windows")]
+fn kill_process_windows(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not found") {
+        return Ok(());
+    }
+
+    Err(format!("taskkill failed: {}", stderr.trim()).into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn collect_ports_unix() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
     let output = Command::new("lsof")
         .args(["-nP", "-i", "-FpctunP"])
@@ -123,7 +237,9 @@ fn collect_ports_unix() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_lsof_output(&stdout)
+    let mut ports = parse_lsof_output(&stdout)?;
+    attach_process_tree_unix(&mut ports)?;
+    Ok(ports)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -184,6 +300,9 @@ fn parse_lsof_output(stdout: &str) -> Result<Vec<PortUsage>, Box<dyn std::error:
                         remote_port,
                         pid,
                         process_name: current_process.clone(),
+                        parent_pid: None,
+                        parent_process_name: None,
+                        ancestors: Vec::new(),
                     });
                 }
             }
@@ -323,10 +442,14 @@ fn collect_ports_windows() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>>
                 remote_port,
                 pid,
                 process_name: pid.and_then(|p| pid_to_name.get(&p).cloned()),
+                parent_pid: None,
+                parent_process_name: None,
+                ancestors: Vec::new(),
             });
         }
     }
 
+    attach_process_tree_windows(&mut results)?;
     Ok(results)
 }
 
@@ -369,6 +492,220 @@ fn parse_windows_endpoint(value: &str) -> WindowsEndpoint {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_process_tree_unix(ports: &mut [PortUsage]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{HashMap, HashSet};
+
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,ppid=,comm="])
+        .output()?;
+
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut process_map: HashMap<u32, (Option<u32>, String)> = HashMap::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let pid_str = match parts.next() {
+            Some(value) => value,
+            None => continue,
+        };
+        let ppid_str = match parts.next() {
+            Some(value) => value,
+            None => continue,
+        };
+        let remainder = parts.collect::<Vec<_>>().join(" ");
+
+        let pid = match pid_str.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let ppid_raw = match ppid_str.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => 0,
+        };
+
+        let parent = if ppid_raw == 0 { None } else { Some(ppid_raw) };
+        let name = if remainder.is_empty() {
+            String::from("(unknown)")
+        } else {
+            remainder
+        };
+
+        process_map.insert(pid, (parent, name));
+    }
+
+    for port in ports.iter_mut() {
+        let pid = match port.pid {
+            Some(value) => value,
+            None => continue,
+        };
+
+        if let Some((parent_pid, _)) = process_map.get(&pid).cloned() {
+            port.parent_pid = parent_pid;
+            if let Some(ppid) = parent_pid {
+                if let Some((_, parent_name)) = process_map.get(&ppid) {
+                    let normalized_name = parent_name.trim();
+                    if normalized_name != "launchd" && !normalized_name.ends_with("/launchd") {
+                        port.parent_process_name = Some(normalized_name.to_string());
+                    }
+                }
+            }
+
+            let mut lineage = Vec::new();
+            let mut current = parent_pid;
+            let mut visited = HashSet::new();
+
+            while let Some(current_pid) = current {
+                if current_pid <= 1 {
+                    break;
+                }
+
+                if !visited.insert(current_pid) {
+                    break;
+                }
+
+                if let Some((next_parent, name)) = process_map.get(&current_pid) {
+                    let normalized_name = name.trim();
+                    if normalized_name == "launchd" || normalized_name.ends_with("/launchd") {
+                        break;
+                    }
+
+                    lineage.push(ProcessLink {
+                        pid: current_pid,
+                        process_name: Some(normalized_name.to_string()),
+                    });
+
+                    if let Some(parent_pid) = *next_parent {
+                        if parent_pid <= 1 {
+                            break;
+                        }
+                    }
+
+                    current = *next_parent;
+                } else {
+                    break;
+                }
+            }
+
+            lineage.reverse();
+            port.ancestors = lineage;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn attach_process_tree_windows(ports: &mut [PortUsage]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{HashMap, HashSet};
+
+    let output = Command::new("wmic")
+        .args([
+            "process",
+            "get",
+            "ProcessId,ParentProcessId,Name",
+            "/FORMAT:CSV",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(val) => val,
+        Err(_) => return Ok(()),
+    };
+
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut process_map: HashMap<u32, (Option<u32>, String)> = HashMap::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Node,") {
+            continue;
+        }
+
+        let parts: Vec<&str> = trimmed.split(',').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let parent_pid = parts[1].trim().parse::<u32>().ok();
+        let pid = match parts[2].trim().parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let parent = parent_pid.and_then(|value| if value == 0 { None } else { Some(value) });
+        let name = parts[3].trim();
+
+        process_map.insert(pid, (parent, name.to_string()));
+    }
+
+    for port in ports.iter_mut() {
+        let pid = match port.pid {
+            Some(value) => value,
+            None => continue,
+        };
+
+        if let Some((parent_pid, _)) = process_map.get(&pid).cloned() {
+            port.parent_pid = parent_pid;
+            if let Some(ppid) = parent_pid {
+                if let Some((_, parent_name)) = process_map.get(&ppid) {
+                    if parent_name.trim() != "System" {
+                        port.parent_process_name = Some(parent_name.clone());
+                    }
+                }
+            }
+
+            let mut lineage = Vec::new();
+            let mut current = parent_pid;
+            let mut visited = HashSet::new();
+
+            while let Some(current_pid) = current {
+                if current_pid == 0 || current_pid == 4 {
+                    break;
+                }
+
+                if !visited.insert(current_pid) {
+                    break;
+                }
+
+                if let Some((next_parent, name)) = process_map.get(&current_pid) {
+                    lineage.push(ProcessLink {
+                        pid: current_pid,
+                        process_name: Some(name.clone()),
+                    });
+
+                    if let Some(parent_pid) = *next_parent {
+                        if parent_pid == 0 || parent_pid == 4 {
+                            break;
+                        }
+                    }
+
+                    current = *next_parent;
+                } else {
+                    break;
+                }
+            }
+
+            lineage.reverse();
+            port.ancestors = lineage;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -382,10 +719,18 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_ports,
+            kill_port_process,
             list_port_favorites,
-            update_port_favorite
+            update_port_favorite,
+            analyze_manga_directory,
+            rename_manga_sequence,
+            upload_copyparty,
+            create_manga_job,
+            fetch_manga_job_status,
+            watch_manga_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

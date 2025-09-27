@@ -1,0 +1,1790 @@
+import type { ChangeEvent } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+type RenameEntry = {
+  originalName: string;
+  renamedName: string;
+};
+
+type RenameOutcome = {
+  directory: string;
+  manifestPath?: string | null;
+  entries: RenameEntry[];
+  dryRun: boolean;
+  warnings: string[];
+};
+
+type UploadMode = "zip" | "folder";
+
+type UploadOutcome = {
+  remoteUrl: string;
+  uploadedBytes: number;
+  fileCount: number;
+  mode: UploadMode;
+};
+
+type UploadProgressStage =
+  | "preparing"
+  | "uploading"
+  | "finalizing"
+  | "completed"
+  | "failed";
+
+type UploadProgressPayload = {
+  stage: UploadProgressStage;
+  transferredBytes: number;
+  totalBytes: number;
+  processedFiles: number;
+  totalFiles: number;
+  message?: string | null;
+};
+
+type RenameFormState = {
+  directory: string;
+  pad: number;
+  targetExtension: string;
+};
+
+type UploadFormState = {
+  serviceUrl: string;
+  remotePath: string;
+  bearerToken: string;
+  title: string;
+  volume: string;
+  mode: UploadMode;
+};
+
+type JobEventTransport = "websocket" | "polling" | "system";
+
+type JobEventPayload = {
+  jobId: string;
+  status: string;
+  processed: number;
+  total: number;
+  artifactPath?: string | null;
+  message?: string | null;
+  transport: JobEventTransport;
+  error?: string | null;
+};
+
+type JobSubmission = {
+  jobId: string;
+};
+
+type JobRecord = JobEventPayload & {
+  lastUpdated: number;
+};
+
+type JobFormState = {
+  serviceUrl: string;
+  bearerToken: string;
+  title: string;
+  volume: string;
+  inputType: "zip" | "folder";
+  inputPath: string;
+  pollIntervalMs: number;
+};
+
+type MangaSourceMode = "singleVolume" | "multiVolume";
+
+type VolumeCandidate = {
+  directory: string;
+  folderName: string;
+  imageCount: number;
+  detectedNumber?: number | null;
+};
+
+type MangaSourceAnalysis = {
+  root: string;
+  mode: MangaSourceMode;
+  rootImageCount: number;
+  totalImages: number;
+  volumeCandidates: VolumeCandidate[];
+  skippedEntries: string[];
+};
+
+type VolumeMapping = {
+  directory: string;
+  folderName: string;
+  imageCount: number;
+  detectedNumber: number | null;
+  volumeNumber: number | null;
+  volumeName: string;
+};
+
+type VolumeRenameOutcome = {
+  mapping: VolumeMapping;
+  outcome: RenameOutcome;
+};
+
+type RenameSummary =
+  | {
+      mode: "single";
+      outcome: RenameOutcome;
+    }
+  | {
+      mode: "multi";
+      volumes: VolumeRenameOutcome[];
+      dryRun: boolean;
+    };
+
+type StepId = "source" | "volumes" | "rename" | "upload" | "jobs";
+
+type StepDescriptor = {
+  id: StepId;
+  label: string;
+};
+
+const DEFAULT_PAD = 4;
+const DEFAULT_POLL_INTERVAL = 1000;
+const SETTINGS_KEY = "manga-upscale-agent:v1";
+const UPLOAD_DEFAULTS_KEY = `${SETTINGS_KEY}:upload-defaults`;
+
+const MangaUpscaleAgent = () => {
+  const [renameForm, setRenameForm] = useState<RenameFormState>({
+    directory: "",
+    pad: DEFAULT_PAD,
+    targetExtension: "jpg",
+  });
+  const [renameSummary, setRenameSummary] = useState<RenameSummary | null>(null);
+  const [renameLoading, setRenameLoading] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [sourceAnalysis, setSourceAnalysis] = useState<MangaSourceAnalysis | null>(null);
+  const [volumeMappings, setVolumeMappings] = useState<VolumeMapping[]>([]);
+  const [volumeMappingError, setVolumeMappingError] = useState<string | null>(null);
+  const [mappingConfirmed, setMappingConfirmed] = useState(false);
+  const [selectedVolumeKey, setSelectedVolumeKey] = useState<string | null>(null);
+  const [hasRestoredDefaults, setHasRestoredDefaults] = useState(false);
+
+  const isMultiVolumeSource = sourceAnalysis?.mode === "multiVolume";
+
+  const [uploadForm, setUploadForm] = useState<UploadFormState>({
+    serviceUrl: "",
+    remotePath: "",
+    bearerToken: "",
+    title: "",
+    volume: "",
+    mode: "zip",
+  });
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressPayload | null>(null);
+
+  const [jobForm, setJobForm] = useState<JobFormState>({
+    serviceUrl: "",
+    bearerToken: "",
+    title: "",
+    volume: "",
+    inputType: "zip",
+    inputPath: "",
+    pollIntervalMs: DEFAULT_POLL_INTERVAL,
+  });
+  const [jobs, setJobs] = useState<JobRecord[]>([]);
+  const [jobLoading, setJobLoading] = useState(false);
+  const [jobError, setJobError] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<string | null>(null);
+  const [currentStep, setCurrentStep] = useState<StepId>("source");
+
+  const sanitizeVolumeName = useCallback((folderName: string) => {
+    const replaced = folderName.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+    return replaced.length > 0 ? replaced : folderName;
+  }, []);
+
+  const buildInitialMappings = useCallback(
+    (analysis: MangaSourceAnalysis) => {
+      if (analysis.mode !== "multiVolume") {
+        return [] as VolumeMapping[];
+      }
+
+      const usedNumbers = new Set<number>();
+
+      return analysis.volumeCandidates.map((candidate, index) => {
+        let detectedNumber =
+          typeof candidate.detectedNumber === "number"
+            ? candidate.detectedNumber
+            : candidate.detectedNumber ?? null;
+
+        if (detectedNumber !== null && usedNumbers.has(detectedNumber)) {
+          detectedNumber = null;
+        }
+
+        let assignedNumber = detectedNumber;
+        if (assignedNumber === null) {
+          let fallback = index + 1;
+          while (usedNumbers.has(fallback)) {
+            fallback += 1;
+          }
+          assignedNumber = fallback;
+        }
+
+        usedNumbers.add(assignedNumber);
+
+        return {
+          directory: candidate.directory,
+          folderName: candidate.folderName,
+          imageCount: candidate.imageCount,
+          detectedNumber: candidate.detectedNumber ?? null,
+          volumeNumber: assignedNumber,
+          volumeName: sanitizeVolumeName(candidate.folderName),
+        } satisfies VolumeMapping;
+      });
+    },
+    [sanitizeVolumeName],
+  );
+
+  const analyzeDirectory = useCallback(
+    async (path: string) => {
+      if (!path) {
+        setSourceAnalysis(null);
+        setVolumeMappings([]);
+        setMappingConfirmed(false);
+        setSelectedVolumeKey(null);
+        setAnalysisError(null);
+        return;
+      }
+
+      setAnalysisLoading(true);
+      setAnalysisError(null);
+      setRenameSummary(null);
+
+      try {
+        const analysis = await invoke<MangaSourceAnalysis>("analyze_manga_directory", {
+          directory: path,
+        });
+
+        setSourceAnalysis(analysis);
+
+        if (analysis.mode === "multiVolume") {
+          const mappings = buildInitialMappings(analysis);
+          setVolumeMappings(mappings);
+          setMappingConfirmed(false);
+          setSelectedVolumeKey(mappings.length > 0 ? mappings[0].directory : null);
+        } else {
+          setVolumeMappings([]);
+          setMappingConfirmed(true);
+          setSelectedVolumeKey(null);
+        }
+      } catch (error) {
+        setSourceAnalysis(null);
+        setVolumeMappings([]);
+        setMappingConfirmed(false);
+        setSelectedVolumeKey(null);
+        setAnalysisError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setAnalysisLoading(false);
+      }
+    },
+    [buildInitialMappings],
+  );
+
+  const handleRefreshAnalysis = useCallback(() => {
+    if (!renameForm.directory) {
+      setAnalysisError("请先选择漫画文件夹路径。");
+      return;
+    }
+    analyzeDirectory(renameForm.directory);
+  }, [analyzeDirectory, renameForm.directory]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const stored = window.localStorage.getItem(SETTINGS_KEY);
+      const storedDefaults = window.localStorage.getItem(UPLOAD_DEFAULTS_KEY);
+
+      let uploadPatch: Partial<UploadFormState> | null = null;
+      let jobPatch: Partial<JobFormState> | null = null;
+
+      if (stored) {
+        const parsed = JSON.parse(stored) as {
+          uploadForm?: Partial<UploadFormState>;
+          jobForm?: Partial<JobFormState>;
+        };
+
+        if (parsed.uploadForm) {
+          uploadPatch = { ...parsed.uploadForm };
+        }
+        if (parsed.jobForm) {
+          jobPatch = { ...parsed.jobForm };
+        }
+      }
+
+      if (storedDefaults) {
+        const defaults = JSON.parse(storedDefaults) as Partial<Pick<UploadFormState, "serviceUrl" | "remotePath" >>;
+        if (defaults) {
+          uploadPatch = {
+            ...(uploadPatch ?? {}),
+            ...(uploadPatch?.serviceUrl ? {} : defaults.serviceUrl ? { serviceUrl: defaults.serviceUrl } : {}),
+            ...(uploadPatch?.remotePath ? {} : defaults.remotePath ? { remotePath: defaults.remotePath } : {}),
+          };
+        }
+      }
+
+      if (uploadPatch && Object.keys(uploadPatch).length > 0) {
+        setUploadForm((prev) => ({ ...prev, ...uploadPatch }));
+      }
+      if (jobPatch && Object.keys(jobPatch).length > 0) {
+        setJobForm((prev) => ({ ...prev, ...jobPatch }));
+      }
+      setHasRestoredDefaults(true);
+    } catch (storageError) {
+      console.warn("Failed to restore manga agent settings", storageError);
+      setHasRestoredDefaults(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    const trimmedService = uploadForm.serviceUrl.trim();
+    const trimmedToken = uploadForm.bearerToken.trim();
+    const trimmedTitle = uploadForm.title.trim();
+    const trimmedVolume = uploadForm.volume.trim();
+    const trimmedPath = uploadForm.remotePath.trim();
+
+    setJobForm((prev) => {
+      let changed = false;
+      const next = { ...prev };
+
+      if (!prev.serviceUrl && trimmedService) {
+        next.serviceUrl = trimmedService;
+        changed = true;
+      }
+      if (!prev.bearerToken && trimmedToken) {
+        next.bearerToken = trimmedToken;
+        changed = true;
+      }
+      if (!prev.title && trimmedTitle) {
+        next.title = trimmedTitle;
+        changed = true;
+      }
+      if (!prev.volume && trimmedVolume) {
+        next.volume = trimmedVolume;
+        changed = true;
+      }
+      if (!prev.inputPath && trimmedPath) {
+        next.inputPath = trimmedPath;
+        changed = true;
+      }
+
+      return changed ? next : prev;
+    });
+  }, [
+    uploadForm.serviceUrl,
+    uploadForm.bearerToken,
+    uploadForm.title,
+    uploadForm.volume,
+    uploadForm.remotePath,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (!hasRestoredDefaults) {
+      return;
+    }
+
+    try {
+      const defaults = {
+        serviceUrl: uploadForm.serviceUrl,
+        remotePath: uploadForm.remotePath,
+      };
+      window.localStorage.setItem(UPLOAD_DEFAULTS_KEY, JSON.stringify(defaults));
+    } catch (storageError) {
+      console.warn("Failed to persist upload defaults", storageError);
+    }
+  }, [hasRestoredDefaults, uploadForm.serviceUrl, uploadForm.remotePath]);
+
+  useEffect(() => {
+    let unlistenPromise: Promise<UnlistenFn> | null = null;
+
+    unlistenPromise = listen<JobEventPayload>("manga-job-event", (event) => {
+      const payload = event.payload;
+      if (!payload) {
+        return;
+      }
+
+      const displayMessage = payload.error ?? payload.message ?? null;
+      const record: JobRecord = {
+        jobId: payload.jobId,
+        status: payload.status,
+        processed: payload.processed,
+        total: payload.total,
+        artifactPath: payload.artifactPath ?? null,
+        message: displayMessage,
+        transport: payload.transport,
+        error: payload.error ?? null,
+        lastUpdated: Date.now(),
+      };
+
+      setJobs((prev) => {
+        const index = prev.findIndex((item) => item.jobId === record.jobId);
+        if (index === -1) {
+          return [record, ...prev];
+        }
+
+        const updated = [...prev];
+        updated[index] = record;
+        updated.sort((a, b) => b.lastUpdated - a.lastUpdated);
+        return updated;
+      });
+    });
+
+    return () => {
+      if (unlistenPromise) {
+        unlistenPromise
+          .then((fn) => fn())
+          .catch(() => undefined);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlistenPromise: Promise<UnlistenFn> | null = null;
+
+    unlistenPromise = listen<UploadProgressPayload>("manga-upload-progress", (event) => {
+      if (!event.payload) {
+        return;
+      }
+      setUploadProgress(event.payload);
+    });
+
+    return () => {
+      if (unlistenPromise) {
+        unlistenPromise
+          .then((fn) => fn())
+          .catch(() => undefined);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const payload = {
+      uploadForm,
+      jobForm,
+    };
+
+    try {
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
+    } catch (storageError) {
+      console.warn("Failed to persist manga agent settings", storageError);
+    }
+  }, [uploadForm, jobForm]);
+
+  useEffect(() => {
+    if (!isMultiVolumeSource) {
+      return;
+    }
+
+    if (volumeMappings.length === 0) {
+      setSelectedVolumeKey(null);
+      return;
+    }
+
+    const exists = volumeMappings.some((item) => item.directory === selectedVolumeKey);
+    if (!exists) {
+      setSelectedVolumeKey(volumeMappings[0].directory);
+    }
+  }, [isMultiVolumeSource, selectedVolumeKey, volumeMappings]);
+
+  useEffect(() => {
+    const directoryCandidate =
+      (sourceAnalysis?.root && sourceAnalysis.root.length > 0
+        ? sourceAnalysis.root
+        : undefined) ??
+      (renameForm.directory && renameForm.directory.length > 0
+        ? renameForm.directory
+        : undefined) ??
+      (renameSummary?.mode === "single" ? renameSummary.outcome.directory : "");
+
+    if (!directoryCandidate) {
+      return;
+    }
+
+    const segments = directoryCandidate.split(/[\\/]/).filter(Boolean);
+    const folderName = segments[segments.length - 1];
+    if (!folderName) {
+      return;
+    }
+
+    setUploadForm((prev) => {
+      if (prev.title.trim()) {
+        return prev;
+      }
+      return { ...prev, title: folderName };
+    });
+
+    setJobForm((prev) => {
+      if (prev.title.trim()) {
+        return prev;
+      }
+      return { ...prev, title: folderName };
+    });
+  }, [renameForm.directory, renameSummary, sourceAnalysis?.root]);
+
+  const previewEntries = useMemo(() => {
+    if (!renameSummary || renameSummary.mode !== "single") {
+      return [] as RenameEntry[];
+    }
+    return renameSummary.outcome.entries.slice(0, 8);
+  }, [renameSummary]);
+
+  const selectedVolume = useMemo(() => {
+    if (!selectedVolumeKey) {
+      return null;
+    }
+    return volumeMappings.find((item) => item.directory === selectedVolumeKey) ?? null;
+  }, [selectedVolumeKey, volumeMappings]);
+
+  useEffect(() => {
+    if (!isMultiVolumeSource || !selectedVolume) {
+      return;
+    }
+
+    setUploadForm((prev) => {
+      if (prev.volume.trim()) {
+        return prev;
+      }
+      return { ...prev, volume: selectedVolume.volumeName };
+    });
+
+    setJobForm((prev) => {
+      if (prev.volume.trim()) {
+        return prev;
+      }
+      return { ...prev, volume: selectedVolume.volumeName };
+    });
+  }, [isMultiVolumeSource, selectedVolume]);
+
+  const handleSelectDirectory = useCallback(async () => {
+    const selected = await invoke<string | string[] | null>("plugin:dialog|open", {
+      options: {
+        directory: true,
+        multiple: false,
+        title: "选择漫画图片文件夹",
+      },
+    });
+
+    if (!selected) {
+      return;
+    }
+
+    const first = Array.isArray(selected) ? selected[0] : selected;
+    if (typeof first === "string" && first.length > 0) {
+      setRenameForm((prev) => ({ ...prev, directory: first }));
+      setCurrentStep("source");
+      analyzeDirectory(first);
+    }
+  }, [analyzeDirectory]);
+
+  const runRename = useCallback(
+    async (dryRun: boolean) => {
+      if (!renameForm.directory) {
+        setRenameError("请先选择漫画图片所在文件夹。");
+        return;
+      }
+
+      if (isMultiVolumeSource && !mappingConfirmed) {
+        setRenameError("请先在卷映射步骤完成确认。");
+        return;
+      }
+
+      setRenameLoading(true);
+      setRenameError(null);
+      try {
+        const padValue = Number.isFinite(renameForm.pad)
+          ? Math.max(1, Math.floor(renameForm.pad))
+          : DEFAULT_PAD;
+
+        const payload = {
+          directory: renameForm.directory,
+          pad: padValue,
+          targetExtension:
+            renameForm.targetExtension.trim().toLowerCase() || "jpg",
+          dryRun,
+        };
+
+        if (isMultiVolumeSource) {
+          if (volumeMappings.length === 0) {
+            setRenameError("未检测到任何卷。请检查目录结构。");
+            return;
+          }
+
+          const outcomes: VolumeRenameOutcome[] = [];
+
+          for (const mapping of volumeMappings) {
+            const result = await invoke<RenameOutcome>("rename_manga_sequence", {
+              options: {
+                ...payload,
+                directory: mapping.directory,
+              },
+            });
+
+            outcomes.push({ mapping, outcome: result });
+          }
+
+          setRenameSummary({ mode: "multi", volumes: outcomes, dryRun });
+        } else {
+          const targetDirectory =
+            (sourceAnalysis?.root && sourceAnalysis.root.length > 0
+              ? sourceAnalysis.root
+              : undefined) ?? renameForm.directory;
+
+          const result = await invoke<RenameOutcome>("rename_manga_sequence", {
+            options: {
+              ...payload,
+              directory: targetDirectory,
+            },
+          });
+
+          setRenameSummary({ mode: "single", outcome: result });
+        }
+
+        if (dryRun) {
+          setUploadStatus(null);
+        }
+      } catch (error) {
+        setRenameError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setRenameLoading(false);
+      }
+    },
+    [
+      isMultiVolumeSource,
+      mappingConfirmed,
+      renameForm,
+      sourceAnalysis?.root,
+      volumeMappings,
+    ],
+  );
+
+  const handleRenameInput = useCallback(
+    (field: keyof RenameFormState) =>
+      (event: ChangeEvent<HTMLInputElement>) => {
+        const value = event.currentTarget.value;
+
+        if (field === "directory") {
+          setSourceAnalysis(null);
+          setVolumeMappings([]);
+          setMappingConfirmed(false);
+          setSelectedVolumeKey(null);
+          setAnalysisError(null);
+          setRenameSummary(null);
+          setRenameForm((prev) => ({ ...prev, directory: value }));
+          return;
+        }
+
+        setRenameForm((prev) => {
+          if (field === "pad") {
+            return { ...prev, pad: Number(value) };
+          }
+          if (field === "targetExtension") {
+            return { ...prev, targetExtension: value.toLowerCase() };
+          }
+          return { ...prev, [field]: value } as RenameFormState;
+        });
+      },
+    [],
+  );
+
+  const handleUploadInput = useCallback(
+    (field: keyof UploadFormState) =>
+      (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+        const value = event.currentTarget.value;
+        setUploadForm((prev) => {
+          if (field === "mode") {
+            if (value === "folder") {
+              setUploadError("Folder 模式仍在规划中，当前仅支持 Zip 上传。");
+              return { ...prev, mode: "zip" };
+            }
+            return { ...prev, mode: value as UploadMode };
+          }
+          return { ...prev, [field]: value } as UploadFormState;
+        });
+      },
+    [],
+  );
+
+  const handleUpload = useCallback(async () => {
+    if (!renameForm.directory) {
+      setUploadError("请先完成重命名预览或执行，确保本地目录已确认。");
+      return;
+    }
+    if (!uploadForm.serviceUrl.trim()) {
+      setUploadError("请填写 Copyparty 服务地址。");
+      return;
+    }
+    if (!uploadForm.remotePath.trim()) {
+      setUploadError("请填写远端存储路径，例如 /incoming/project.zip。");
+      return;
+    }
+
+    setUploadLoading(true);
+    setUploadError(null);
+    setUploadStatus(null);
+
+    try {
+      const metadataEntries: Record<string, string> = {};
+
+      const trimmedTitle = uploadForm.title.trim();
+      const trimmedVolume = uploadForm.volume.trim();
+
+      if (trimmedTitle) {
+        metadataEntries.title = trimmedTitle;
+      }
+      if (trimmedVolume) {
+        metadataEntries.volume = trimmedVolume;
+      }
+
+      let localPath = renameForm.directory;
+
+      if (isMultiVolumeSource) {
+        if (!selectedVolume) {
+          setUploadError("请选择要上传的卷，并在卷映射步骤中确认。");
+          return;
+        }
+
+        if (
+          !renameSummary ||
+          renameSummary.mode !== "multi" ||
+          !renameSummary.volumes.some((item) => item.mapping.directory === selectedVolume.directory)
+        ) {
+          setUploadError("请先对所选卷执行重命名预览或执行，生成 manifest。");
+          return;
+        }
+
+        localPath = selectedVolume.directory;
+      } else if (renameSummary?.mode === "single") {
+        localPath = renameSummary.outcome.directory;
+      }
+
+      const request: Record<string, unknown> = {
+        serviceUrl: uploadForm.serviceUrl.trim(),
+        remotePath: uploadForm.remotePath.trim(),
+        localPath,
+        mode: uploadForm.mode,
+      };
+
+      const trimmedToken = uploadForm.bearerToken.trim();
+      if (trimmedToken) {
+        request.bearerToken = trimmedToken;
+      }
+
+      if (Object.keys(metadataEntries).length > 0) {
+        request.metadata = metadataEntries;
+      }
+
+      const result = await invoke<UploadOutcome>("upload_copyparty", {
+        request,
+      });
+
+      const sizeInMb = (result.uploadedBytes / (1024 * 1024)).toFixed(2);
+      setUploadStatus(
+        `上传完成：${result.fileCount} 个文件，约 ${sizeInMb} MB，remote = ${result.remoteUrl}`,
+      );
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUploadLoading(false);
+    }
+  }, [
+    isMultiVolumeSource,
+    renameForm.directory,
+    renameSummary,
+    selectedVolume,
+    uploadForm,
+  ]);
+
+  const handleJobInput = useCallback(
+    (field: keyof JobFormState) =>
+      (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+        const value = event.currentTarget.value;
+        setJobForm((prev) => {
+          if (field === "pollIntervalMs") {
+            const numeric = Number(value);
+            const normalized = Number.isFinite(numeric) ? Math.max(250, Math.floor(numeric)) : DEFAULT_POLL_INTERVAL;
+            return { ...prev, pollIntervalMs: normalized };
+          }
+          if (field === "inputType") {
+            return { ...prev, inputType: value as JobFormState["inputType"] };
+          }
+          return { ...prev, [field]: value } as JobFormState;
+        });
+    },
+    [],
+  );
+
+  const stepDescriptors = useMemo(() => {
+    const steps: StepDescriptor[] = [{ id: "source", label: "选择源目录" }];
+    if (isMultiVolumeSource) {
+      steps.push({ id: "volumes", label: "卷映射确认" });
+    }
+    steps.push(
+      { id: "rename", label: "图片重命名" },
+      { id: "upload", label: "上传到 Copyparty" },
+      { id: "jobs", label: "远端推理" },
+    );
+    return steps;
+  }, [isMultiVolumeSource]);
+
+  const stepOrder = useMemo(() => stepDescriptors.map((item) => item.id), [stepDescriptors]);
+
+  const stepIndexMap = useMemo(() => {
+    const mapping = new Map<StepId, number>();
+    stepOrder.forEach((id, index) => {
+      mapping.set(id, index + 1);
+    });
+    return mapping;
+  }, [stepOrder]);
+
+  useEffect(() => {
+    if (!stepOrder.includes(currentStep)) {
+      setCurrentStep(stepOrder[0] ?? "source");
+    }
+  }, [currentStep, stepOrder]);
+
+  const goToStep = useCallback(
+    (step: StepId) => {
+      if (stepOrder.includes(step)) {
+        setCurrentStep(step);
+      }
+    },
+    [stepOrder],
+  );
+
+  const goToNextStep = useCallback(() => {
+    const index = stepOrder.indexOf(currentStep);
+    if (index === -1) {
+      return;
+    }
+    const next = stepOrder[index + 1];
+    if (next) {
+      setCurrentStep(next);
+    }
+  }, [currentStep, stepOrder]);
+
+  const goToPreviousStep = useCallback(() => {
+    const index = stepOrder.indexOf(currentStep);
+    if (index <= 0) {
+      return;
+    }
+    const previous = stepOrder[index - 1];
+    if (previous) {
+      setCurrentStep(previous);
+    }
+  }, [currentStep, stepOrder]);
+
+  const handleSelectVolume = useCallback((directory: string) => {
+    setSelectedVolumeKey(directory || null);
+  }, []);
+
+  const handleVolumeNumberChange = useCallback(
+    (index: number) =>
+      (event: ChangeEvent<HTMLInputElement>) => {
+        const rawValue = event.currentTarget.value;
+        const numeric = Number(rawValue);
+        const normalized =
+          rawValue.trim() === "" || !Number.isFinite(numeric)
+            ? null
+            : Math.max(1, Math.floor(numeric));
+
+        setVolumeMappings((prev) => {
+          const next = [...prev];
+          next[index] = { ...next[index], volumeNumber: normalized };
+          return next;
+        });
+
+        setMappingConfirmed(false);
+        setRenameSummary(null);
+        setVolumeMappingError(null);
+      },
+    [],
+  );
+
+  const handleVolumeNameChange = useCallback(
+    (index: number) =>
+      (event: ChangeEvent<HTMLInputElement>) => {
+        const value = event.currentTarget.value;
+        setVolumeMappings((prev) => {
+          const next = [...prev];
+          next[index] = { ...next[index], volumeName: value };
+          return next;
+        });
+
+        setMappingConfirmed(false);
+        setRenameSummary(null);
+        setVolumeMappingError(null);
+      },
+    [],
+  );
+
+  const handleConfirmMapping = useCallback(() => {
+    if (!isMultiVolumeSource) {
+      setMappingConfirmed(true);
+      setVolumeMappingError(null);
+      goToNextStep();
+      return;
+    }
+
+    if (volumeMappings.length === 0) {
+      setVolumeMappingError("未检测到任何卷目录，请返回上一步检查源目录。");
+      return;
+    }
+
+    const missingNumber = volumeMappings.some((item) => item.volumeNumber === null);
+    if (missingNumber) {
+      setVolumeMappingError("请为每一卷填写卷号。");
+      return;
+    }
+
+    const seen = new Set<number>();
+    for (const mapping of volumeMappings) {
+      if (mapping.volumeNumber === null) {
+        continue;
+      }
+      if (seen.has(mapping.volumeNumber)) {
+        setVolumeMappingError("卷号不能重复，请调整后再确认。");
+        return;
+      }
+      seen.add(mapping.volumeNumber);
+    }
+
+    setVolumeMappingError(null);
+    setMappingConfirmed(true);
+    goToNextStep();
+  }, [goToNextStep, isMultiVolumeSource, volumeMappings]);
+
+  const applyUploadContext = useCallback(() => {
+    const trimmedService = uploadForm.serviceUrl.trim();
+    const trimmedToken = uploadForm.bearerToken.trim();
+    const trimmedTitle = uploadForm.title.trim();
+    const trimmedVolume = uploadForm.volume.trim();
+    const trimmedPath = uploadForm.remotePath.trim();
+
+    setJobForm((prev) => ({
+      ...prev,
+      serviceUrl: trimmedService || prev.serviceUrl,
+      bearerToken: trimmedToken || prev.bearerToken,
+      title: trimmedTitle || prev.title,
+      volume: trimmedVolume || prev.volume,
+      inputPath: trimmedPath || prev.inputPath,
+    }));
+  }, [uploadForm]);
+
+  const handleCreateJob = useCallback(async () => {
+    const serviceUrl = jobForm.serviceUrl.trim();
+    const title = jobForm.title.trim();
+    const volume = jobForm.volume.trim();
+    const inputPath = jobForm.inputPath.trim();
+    const bearer = jobForm.bearerToken.trim();
+
+    if (!serviceUrl) {
+      setJobError("请填写推理服务地址。");
+      return;
+    }
+    if (!title) {
+      setJobError("请填写作品名，以便在远端区分作业。");
+      return;
+    }
+    if (!volume) {
+      setJobError("请填写卷名，或至少提供批次标识。");
+      return;
+    }
+    if (!inputPath) {
+      setJobError("请提供远端输入路径（例如 incoming/volume.zip）。");
+      return;
+    }
+
+    setJobLoading(true);
+    setJobError(null);
+    setJobStatus(null);
+
+    try {
+      const options = {
+        serviceUrl,
+        bearerToken: bearer || undefined,
+        payload: {
+          title,
+          volume,
+          input: {
+            type: jobForm.inputType,
+            path: inputPath,
+          },
+          params: {
+            scale: 2,
+            model: "RealESRGAN_x4plus_anime_6B",
+            denoise: "medium",
+          },
+        },
+      };
+
+      const submission = await invoke<JobSubmission>("create_manga_job", { options });
+
+      const initialRecord: JobRecord = {
+        jobId: submission.jobId,
+        status: "PENDING",
+        processed: 0,
+        total: 0,
+        artifactPath: null,
+        message: "作业已提交，等待远端处理。",
+        transport: "system",
+        error: null,
+        lastUpdated: Date.now(),
+      };
+
+      setJobs((prev) => [initialRecord, ...prev.filter((item) => item.jobId !== initialRecord.jobId)]);
+      setJobStatus(`作业 ${submission.jobId} 已创建，正在等待进度更新。`);
+
+      const watchPayload: Record<string, unknown> = {
+        serviceUrl,
+        jobId: submission.jobId,
+      };
+      if (bearer) {
+        watchPayload.bearerToken = bearer;
+      }
+      if (Number.isFinite(jobForm.pollIntervalMs) && jobForm.pollIntervalMs >= 250) {
+        watchPayload.pollIntervalMs = Math.floor(jobForm.pollIntervalMs);
+      }
+
+      try {
+        await invoke("watch_manga_job", { request: watchPayload });
+      } catch (watchError) {
+        const message = watchError instanceof Error ? watchError.message : String(watchError);
+        setJobs((prev) =>
+          prev.map((item) =>
+            item.jobId === initialRecord.jobId
+              ? {
+                  ...item,
+                  message: `订阅进度失败：${message}`,
+                  transport: "system",
+                  error: message,
+                  lastUpdated: Date.now(),
+                }
+              : item,
+          ),
+        );
+      }
+    } catch (error) {
+      setJobError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setJobLoading(false);
+    }
+  }, [jobForm]);
+
+  const describeStatus = (status: string) => {
+    switch (status.toUpperCase()) {
+      case "PENDING":
+        return "排队中";
+      case "RUNNING":
+        return "运行中";
+      case "SUCCESS":
+        return "已完成";
+      case "FAILED":
+        return "失败";
+      case "ERROR":
+        return "错误";
+      default:
+        return status;
+    }
+  };
+
+  const statusTone = (status: string) => {
+    switch (status.toUpperCase()) {
+      case "SUCCESS":
+        return "success";
+      case "FAILED":
+      case "ERROR":
+        return "error";
+      case "RUNNING":
+        return "info";
+      default:
+        return "neutral";
+    }
+  };
+
+  const describeTransport = (transport: JobEventTransport) => {
+    switch (transport) {
+      case "websocket":
+        return "WebSocket";
+      case "polling":
+        return "轮询";
+      case "system":
+      default:
+        return "系统";
+    }
+  };
+
+  const describeUploadStage = (progress: UploadProgressPayload) => {
+    switch (progress.stage) {
+      case "preparing":
+        return "准备中";
+      case "uploading":
+        return "上传中";
+      case "finalizing":
+        return "确认中";
+      case "completed":
+        return "完成";
+      case "failed":
+        return "失败";
+      default:
+        return progress.stage;
+    }
+  };
+
+  const uploadPercent = useMemo(() => {
+    if (!uploadProgress) {
+      return null;
+    }
+    if (uploadProgress.stage === "preparing" && uploadProgress.totalFiles > 0) {
+      return Math.round((uploadProgress.processedFiles / uploadProgress.totalFiles) * 100);
+    }
+    if (uploadProgress.stage === "uploading" && uploadProgress.totalBytes > 0) {
+      return Math.round((uploadProgress.transferredBytes / uploadProgress.totalBytes) * 100);
+    }
+    if (uploadProgress.stage === "completed") {
+      return 100;
+    }
+    return null;
+  }, [uploadProgress]);
+
+  return (
+    <div className="manga-agent">
+      <div className="stepper-nav" role="presentation">
+        {stepDescriptors.map((descriptor) => {
+          const index = stepOrder.indexOf(descriptor.id);
+          const currentIndex = stepOrder.indexOf(currentStep);
+          const status =
+            descriptor.id === currentStep
+              ? "active"
+              : index !== -1 && currentIndex !== -1 && index < currentIndex
+              ? "completed"
+              : "";
+          const stepNumber = stepIndexMap.get(descriptor.id) ?? index + 1;
+          return (
+            <div key={descriptor.id} className={`stepper-nav-item ${status}`}>
+              <span className="step-index">步骤 {stepNumber}</span>
+              <span className="step-label">{descriptor.label}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      {currentStep === "source" && (
+        <section className="step-card" aria-label="选择源目录">
+          <header className="step-card-header">
+            <span className="step-index">步骤 {stepIndexMap.get("source") ?? 1}</span>
+            <h3>选择源目录</h3>
+            <p>选取原始漫画文件夹并进行结构分析，识别单卷或多卷场景。</p>
+          </header>
+
+          <div className="form-grid">
+            <label className="form-field">
+              <span className="field-label">漫画根目录</span>
+              <div className="field-row">
+                <input
+                  type="text"
+                  value={renameForm.directory}
+                  onChange={handleRenameInput("directory")}
+                  placeholder="/path/to/folder"
+                />
+                <button type="button" onClick={handleSelectDirectory}>
+                  选择
+                </button>
+                <button type="button" onClick={handleRefreshAnalysis}>
+                  分析
+                </button>
+              </div>
+            </label>
+          </div>
+
+          {analysisLoading && <p className="status">正在扫描目录…</p>}
+          {analysisError && <p className="status status-error">{analysisError}</p>}
+
+          {sourceAnalysis && (
+            <div className="analysis-panel">
+              <p>
+                检测结果：
+                {sourceAnalysis.mode === "multiVolume" ? "多卷目录" : "单卷目录"}；
+                根目录图片 {sourceAnalysis.rootImageCount} 张，总计 {sourceAnalysis.totalImages} 张。
+              </p>
+
+              {sourceAnalysis.mode === "multiVolume" && sourceAnalysis.volumeCandidates.length > 0 && (
+                <table className="analysis-table">
+                  <thead>
+                    <tr>
+                      <th>子目录</th>
+                      <th>图片数</th>
+                      <th>推测卷号</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sourceAnalysis.volumeCandidates.map((candidate) => (
+                      <tr key={candidate.directory}>
+                        <td>{candidate.folderName}</td>
+                        <td>{candidate.imageCount}</td>
+                        <td>{candidate.detectedNumber ?? "-"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+
+              {sourceAnalysis.skippedEntries.length > 0 && (
+                <details>
+                  <summary>忽略的条目 ({sourceAnalysis.skippedEntries.length})</summary>
+                  <ul>
+                    {sourceAnalysis.skippedEntries.slice(0, 10).map((entry) => (
+                      <li key={entry}>{entry}</li>
+                    ))}
+                    {sourceAnalysis.skippedEntries.length > 10 && (
+                      <li>其余 {sourceAnalysis.skippedEntries.length - 10} 条略。</li>
+                    )}
+                  </ul>
+                </details>
+              )}
+            </div>
+          )}
+
+          <div className="wizard-controls">
+            <button
+              type="button"
+              className="primary"
+              onClick={goToNextStep}
+              disabled={!sourceAnalysis || analysisLoading}
+            >
+              下一步
+            </button>
+          </div>
+        </section>
+      )}
+
+      {currentStep === "volumes" && isMultiVolumeSource && (
+        <section className="step-card" aria-label="卷映射确认">
+          <header className="step-card-header">
+            <span className="step-index">步骤 {stepIndexMap.get("volumes") ?? 2}</span>
+            <h3>卷映射确认</h3>
+            <p>为每个子目录指定卷号与显示名称，确认后将用于重命名和上传。</p>
+          </header>
+
+          {volumeMappings.length === 0 ? (
+            <p className="status">未检测到卷目录，请返回检查源目录。</p>
+          ) : (
+            <table className="mapping-table">
+              <thead>
+                <tr>
+                  <th>选择</th>
+                  <th>子目录</th>
+                  <th>图片数</th>
+                  <th>卷号</th>
+                  <th>卷名</th>
+                </tr>
+              </thead>
+              <tbody>
+                {volumeMappings.map((mapping, index) => (
+                  <tr key={mapping.directory}>
+                    <td>
+                      <input
+                        type="radio"
+                        name="active-volume"
+                        value={mapping.directory}
+                        checked={selectedVolumeKey === mapping.directory}
+                        onChange={() => handleSelectVolume(mapping.directory)}
+                      />
+                    </td>
+                    <td>{mapping.folderName}</td>
+                    <td>{mapping.imageCount}</td>
+                    <td>
+                      <input
+                        type="number"
+                        min={1}
+                        value={mapping.volumeNumber ?? ""}
+                        onChange={handleVolumeNumberChange(index)}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        type="text"
+                        value={mapping.volumeName}
+                        onChange={handleVolumeNameChange(index)}
+                      />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {volumeMappingError && <p className="status status-error">{volumeMappingError}</p>}
+
+          <div className="button-row">
+            <button type="button" className="primary" onClick={handleConfirmMapping}>
+              确认映射并继续
+            </button>
+          </div>
+        </section>
+      )}
+
+      {currentStep === "rename" && (
+        <section className="step-card" aria-label="图片重命名">
+          <header className="step-card-header">
+            <span className="step-index">步骤 {stepIndexMap.get("rename") ?? 1}</span>
+            <h3>图片重命名与预览</h3>
+            <p>根据卷映射批量重命名图片并生成 manifest 映射。</p>
+          </header>
+
+          <div className="form-grid">
+            <label className="form-field compact">
+              <span className="field-label">位数</span>
+              <input
+                type="number"
+                min={1}
+                value={renameForm.pad}
+                onChange={handleRenameInput("pad")}
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">目标扩展名</span>
+              <input
+                type="text"
+                value={renameForm.targetExtension}
+                onChange={handleRenameInput("targetExtension")}
+                maxLength={8}
+              />
+            </label>
+          </div>
+
+          <div className="button-row">
+            <button
+              type="button"
+              className="primary"
+              onClick={() => runRename(true)}
+              disabled={renameLoading}
+            >
+              {renameLoading ? "处理中…" : "预览重命名"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => runRename(false)}
+              disabled={renameLoading}
+            >
+              {renameLoading ? "处理中…" : "执行重命名"}
+            </button>
+          </div>
+
+          {renameError && <p className="status status-error">{renameError}</p>}
+
+          {renameSummary && renameSummary.mode === "single" && (
+            <div className="preview-panel">
+              <div className="preview-header">
+                <strong>
+                  {renameSummary.outcome.entries.length} 个文件
+                  {renameSummary.outcome.dryRun ? "（预览）" : "（已重命名）"}
+                </strong>
+                {renameSummary.outcome.manifestPath && (
+                  <span className="manifest-path">manifest: {renameSummary.outcome.manifestPath}</span>
+                )}
+              </div>
+
+              {renameSummary.outcome.warnings.length > 0 && (
+                <ul className="status status-warning">
+                  {renameSummary.outcome.warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              )}
+
+              <table className="preview-table">
+                <thead>
+                  <tr>
+                    <th>原始文件</th>
+                    <th>重命名结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {previewEntries.map((entry) => (
+                    <tr key={`${entry.originalName}-${entry.renamedName}`}>
+                      <td>{entry.originalName}</td>
+                      <td>{entry.renamedName}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              {renameSummary.outcome.entries.length > previewEntries.length && (
+                <p className="preview-more">
+                  其余 {renameSummary.outcome.entries.length - previewEntries.length} 条略。
+                </p>
+              )}
+            </div>
+          )}
+
+          {renameSummary && renameSummary.mode === "multi" && (
+            <div className="preview-panel multi">
+              {renameSummary.volumes.map(({ mapping, outcome }) => (
+                <div key={mapping.directory} className="volume-preview">
+                  <header>
+                    <strong>
+                      卷 {mapping.volumeNumber}: {mapping.volumeName}
+                    </strong>
+                    <span>
+                      {outcome.entries.length} 个文件
+                      {renameSummary.dryRun ? "（预览）" : "（已重命名）"}
+                    </span>
+                    {outcome.manifestPath && (
+                      <span className="manifest-path">manifest: {outcome.manifestPath}</span>
+                    )}
+                  </header>
+
+                  {outcome.warnings.length > 0 && (
+                    <ul className="status status-warning">
+                      {outcome.warnings.map((warning) => (
+                        <li key={warning}>{warning}</li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <table className="preview-table">
+                    <thead>
+                      <tr>
+                        <th>原始文件</th>
+                        <th>重命名结果</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {outcome.entries.slice(0, 5).map((entry) => (
+                        <tr key={`${mapping.directory}-${entry.originalName}-${entry.renamedName}`}>
+                          <td>{entry.originalName}</td>
+                          <td>{entry.renamedName}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  {outcome.entries.length > 5 && (
+                    <p className="preview-more">
+                      其余 {outcome.entries.length - 5} 条略。
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="wizard-controls">
+            <button type="button" onClick={goToPreviousStep}>
+              上一步
+            </button>
+            <button type="button" className="primary" onClick={goToNextStep}>
+              下一步
+            </button>
+          </div>
+        </section>
+      )}
+
+      {currentStep === "upload" && (
+        <section className="step-card" aria-label="步骤 2 上传 Copyparty">
+        <header className="step-card-header">
+          <span className="step-index">步骤 {stepIndexMap.get("upload") ?? 1}</span>
+          <h3>上传到 Copyparty</h3>
+          <p>将整理后的目录打包为 zip 上传，并附带作品信息。</p>
+        </header>
+
+        <div className="form-grid">
+          <label className="form-field">
+            <span className="field-label">服务地址</span>
+            <input
+              type="text"
+              value={uploadForm.serviceUrl}
+              onChange={handleUploadInput("serviceUrl")}
+              placeholder="http://192.168.0.2:3923"
+            />
+          </label>
+
+          <label className="form-field">
+            <span className="field-label">上传路径</span>
+            <input
+              type="text"
+              value={uploadForm.remotePath}
+              onChange={handleUploadInput("remotePath")}
+              placeholder="/incoming/manga-volume.zip"
+            />
+          </label>
+
+          <label className="form-field">
+            <span className="field-label">Bearer Token（可选）</span>
+            <input
+              type="text"
+              value={uploadForm.bearerToken}
+              onChange={handleUploadInput("bearerToken")}
+              placeholder="xxxxxx"
+            />
+          </label>
+
+          <label className="form-field compact">
+            <span className="field-label">作品名（可选）</span>
+            <input
+              type="text"
+              value={uploadForm.title}
+              onChange={handleUploadInput("title")}
+            />
+          </label>
+
+          <label className="form-field compact">
+            <span className="field-label">卷名（可选）</span>
+            <input
+              type="text"
+              value={uploadForm.volume}
+              onChange={handleUploadInput("volume")}
+            />
+          </label>
+
+          {isMultiVolumeSource && volumeMappings.length > 0 && (
+            <label className="form-field compact">
+              <span className="field-label">上传卷</span>
+              <select
+                value={selectedVolumeKey ?? ""}
+                onChange={(event) => handleSelectVolume(event.currentTarget.value)}
+              >
+                {volumeMappings.map((mapping) => (
+                  <option key={mapping.directory} value={mapping.directory}>
+                    卷 {mapping.volumeNumber ?? "-"} · {mapping.volumeName}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <label className="form-field compact">
+            <span className="field-label">模式</span>
+            <select
+              value={uploadForm.mode}
+              onChange={handleUploadInput("mode")}
+            >
+              <option value="zip">Zip</option>
+              <option value="folder">Folder（规划中）</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="button-row">
+          <button type="button" className="primary" onClick={handleUpload} disabled={uploadLoading}>
+            {uploadLoading ? "上传中…" : "上传到 Copyparty"}
+          </button>
+        </div>
+
+        {uploadError && <p className="status status-error">{uploadError}</p>}
+        {uploadStatus && <p className="status status-success">{uploadStatus}</p>}
+        {uploadProgress && (
+          <div className="upload-progress">
+            <div className="upload-progress-header">
+              <span
+                className={`status-chip status-${
+                  uploadProgress.stage === "failed"
+                    ? "error"
+                    : uploadProgress.stage === "completed"
+                      ? "success"
+                      : "info"
+                }`}
+              >
+                {describeUploadStage(uploadProgress)}
+              </span>
+              {uploadPercent != null && (
+                <span className="progress-label">{uploadPercent}%</span>
+              )}
+            </div>
+            <div className="progress-bar">
+              <span style={{ width: `${Math.max(0, Math.min(uploadPercent ?? 0, 100))}%` }} />
+            </div>
+            {(uploadProgress.message || uploadProgress.totalBytes > 0) && (
+              <p className="progress-hint">
+                {uploadProgress.message ??
+                  `${(uploadProgress.transferredBytes / (1024 * 1024)).toFixed(2)} / ${(uploadProgress.totalBytes / (1024 * 1024)).toFixed(2)} MB`}
+              </p>
+            )}
+          </div>
+        )}
+
+        <div className="wizard-controls">
+          <button type="button" onClick={goToPreviousStep}>
+            上一步
+          </button>
+          <button type="button" className="primary" onClick={goToNextStep}>
+            下一步
+          </button>
+        </div>
+      </section>
+      )}
+
+      {currentStep === "jobs" && (
+        <section className="step-card" aria-label="远端推理">
+        <header className="step-card-header">
+          <span className="step-index">步骤 {stepIndexMap.get("jobs") ?? 1}</span>
+          <h3>远端推理</h3>
+          <p>提交 FastAPI 推理作业并实时查看进度。</p>
+        </header>
+
+        <div className="form-grid">
+          <label className="form-field">
+            <span className="field-label">服务地址</span>
+            <input
+              type="text"
+              value={jobForm.serviceUrl}
+              onChange={handleJobInput("serviceUrl")}
+              placeholder="http://192.168.0.2:9000"
+            />
+          </label>
+
+          <label className="form-field">
+            <span className="field-label">Bearer Token（可选）</span>
+            <input
+              type="text"
+              value={jobForm.bearerToken}
+              onChange={handleJobInput("bearerToken")}
+              placeholder="xxxxxx"
+            />
+          </label>
+
+          <label className="form-field">
+            <span className="field-label">作品名</span>
+            <input
+              type="text"
+              value={jobForm.title}
+              onChange={handleJobInput("title")}
+              placeholder="作品名"
+            />
+          </label>
+
+          <label className="form-field compact">
+            <span className="field-label">卷名</span>
+            <input
+              type="text"
+              value={jobForm.volume}
+              onChange={handleJobInput("volume")}
+              placeholder="第 1 卷"
+            />
+          </label>
+
+          <label className="form-field compact">
+            <span className="field-label">输入类型</span>
+            <select value={jobForm.inputType} onChange={handleJobInput("inputType")}>
+              <option value="zip">Zip</option>
+              <option value="folder">Folder</option>
+            </select>
+          </label>
+
+          <label className="form-field">
+            <span className="field-label">远端输入路径</span>
+            <input
+              type="text"
+              value={jobForm.inputPath}
+              onChange={handleJobInput("inputPath")}
+              placeholder="incoming/manga-volume.zip"
+            />
+          </label>
+
+          <label className="form-field compact">
+            <span className="field-label">轮询间隔 (ms)</span>
+            <input
+              type="number"
+              min={250}
+              value={jobForm.pollIntervalMs}
+              onChange={handleJobInput("pollIntervalMs")}
+            />
+          </label>
+        </div>
+
+        <div className="button-row">
+          <button type="button" onClick={applyUploadContext}>
+            从上传填充
+          </button>
+          <button
+            type="button"
+            className="primary"
+            onClick={handleCreateJob}
+            disabled={jobLoading}
+          >
+            {jobLoading ? "提交中…" : "创建推理作业"}
+          </button>
+        </div>
+
+        {jobError && <p className="status status-error">{jobError}</p>}
+        {jobStatus && <p className="status status-success">{jobStatus}</p>}
+
+        {jobs.length > 0 && (
+          <div className="job-board">
+            <table className="jobs-table">
+              <thead>
+                <tr>
+                  <th>作业 ID / 状态</th>
+                  <th>进度</th>
+                  <th>来源</th>
+                  <th>消息</th>
+                  <th>产物</th>
+                </tr>
+              </thead>
+              <tbody>
+                {jobs.map((job) => {
+                  const percent = job.total > 0 ? Math.min(100, Math.round((job.processed / job.total) * 100)) : null;
+                  return (
+                    <tr key={job.jobId}>
+                      <td className="job-id-cell">
+                        <span className="job-id monospace">{job.jobId}</span>
+                        <span className={`status-chip status-${statusTone(job.status)}`}>
+                          {describeStatus(job.status)}
+                        </span>
+                      </td>
+                      <td>
+                        {percent !== null ? (
+                          <div className="progress-cell">
+                            <div className="progress-bar">
+                              <span style={{ width: `${percent}%` }} />
+                            </div>
+                            <span className="progress-label">
+                              {job.processed}/{job.total}（{percent}%）
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="progress-label">-</span>
+                        )}
+                      </td>
+                      <td>
+                        <span className="transport-badge">{describeTransport(job.transport)}</span>
+                      </td>
+                      <td>
+                        {job.message ? job.message : "-"}
+                      </td>
+                      <td>{job.artifactPath ?? "-"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="wizard-controls">
+          <button type="button" onClick={goToPreviousStep}>
+            上一步
+          </button>
+        </div>
+      </section>
+      )}
+    </div>
+  );
+};
+
+export default MangaUpscaleAgent;
