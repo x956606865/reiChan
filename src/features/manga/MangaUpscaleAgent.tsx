@@ -1196,6 +1196,51 @@ const MangaUpscaleAgent = () => {
     return request;
   }, []);
 
+  const startJobWatcher = useCallback(
+    async (job: JobRecord, options?: { silent?: boolean }) => {
+      const terminal = job.status.toUpperCase() === "SUCCESS" || job.status.toUpperCase() === "FAILED";
+      if (!job.serviceUrl || terminal) {
+        return;
+      }
+
+      const request: Record<string, unknown> = {
+        serviceUrl: job.serviceUrl,
+        jobId: job.jobId,
+      };
+
+      if (job.bearerToken && job.bearerToken.trim()) {
+        request.bearerToken = job.bearerToken.trim();
+      }
+
+      if (Number.isFinite(jobForm.pollIntervalMs) && jobForm.pollIntervalMs >= 250) {
+        request.pollIntervalMs = Math.floor(jobForm.pollIntervalMs);
+      }
+
+      try {
+        await invoke("watch_manga_job", { request });
+      } catch (watchError) {
+        if (options?.silent) {
+          return;
+        }
+        const message = watchError instanceof Error ? watchError.message : String(watchError);
+        setJobs((prev) =>
+          prev.map((item) =>
+            item.jobId === job.jobId
+              ? {
+                  ...item,
+                  message: `订阅进度失败：${message}`,
+                  transport: "system",
+                  error: message,
+                  lastUpdated: Date.now(),
+                }
+              : item,
+          ),
+        );
+      }
+    },
+    [jobForm.pollIntervalMs],
+  );
+
   const resumeJob = useCallback(
     async (job: JobRecord, options?: { silent?: boolean }) => {
       if (!job.serviceUrl) {
@@ -1215,14 +1260,20 @@ const MangaUpscaleAgent = () => {
           request: buildJobRequest(job),
         });
 
+        let updatedRecord: JobRecord | null = null;
         setJobs((prev) => {
           const existing = prev.find((item) => item.jobId === payload.jobId) ?? job;
-          const record = mapPayloadToRecord(payload, undefined, existing);
-          const next = prev.filter((item) => item.jobId !== record.jobId);
-          next.push(record);
+          const mapped = mapPayloadToRecord(payload, undefined, existing);
+          updatedRecord = mapped;
+          const next = prev.filter((item) => item.jobId !== mapped.jobId);
+          next.push(mapped);
           next.sort((a, b) => b.lastUpdated - a.lastUpdated);
           return next;
         });
+
+        if (updatedRecord) {
+          await startJobWatcher(updatedRecord, { silent: options?.silent ?? false });
+        }
 
         if (!options?.silent) {
           setJobStatus(`已请求恢复作业 ${job.jobId}，等待更新。`);
@@ -1234,7 +1285,7 @@ const MangaUpscaleAgent = () => {
         }
       }
     },
-    [buildJobRequest, mapPayloadToRecord],
+    [buildJobRequest, mapPayloadToRecord, startJobWatcher],
   );
 
   const cancelJob = useCallback(
@@ -1833,41 +1884,13 @@ const MangaUpscaleAgent = () => {
       setJobs((prev) => [initialRecord, ...prev.filter((item) => item.jobId !== initialRecord.jobId)]);
       setJobStatus(`作业 ${submission.jobId} 已创建，正在等待进度更新。`);
 
-      const watchPayload: Record<string, unknown> = {
-        serviceUrl,
-        jobId: submission.jobId,
-      };
-      if (bearer) {
-        watchPayload.bearerToken = bearer;
-      }
-      if (Number.isFinite(jobForm.pollIntervalMs) && jobForm.pollIntervalMs >= 250) {
-        watchPayload.pollIntervalMs = Math.floor(jobForm.pollIntervalMs);
-      }
-
-      try {
-        await invoke("watch_manga_job", { request: watchPayload });
-      } catch (watchError) {
-        const message = watchError instanceof Error ? watchError.message : String(watchError);
-        setJobs((prev) =>
-          prev.map((item) =>
-            item.jobId === initialRecord.jobId
-              ? {
-                  ...item,
-                  message: `订阅进度失败：${message}`,
-                  transport: "system",
-                  error: message,
-                  lastUpdated: Date.now(),
-                }
-              : item,
-          ),
-        );
-      }
+      await startJobWatcher(initialRecord);
     } catch (error) {
       setJobError(error instanceof Error ? error.message : String(error));
     } finally {
       setJobLoading(false);
     }
-  }, [inferManifestForVolume, jobForm, jobParams]);
+  }, [inferManifestForVolume, jobForm, jobParams, startJobWatcher]);
 
   const describeStatus = (status: string) => {
     switch (status.toUpperCase()) {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use natord::compare;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{self, Map, Value};
+use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use tauri::{async_runtime, AppHandle, Emitter};
 use tempfile::NamedTempFile;
@@ -826,6 +826,8 @@ pub enum ArtifactError {
     ManifestParse(PathBuf, serde_json::Error),
     TargetDir(PathBuf, std::io::Error),
     ReportWrite(PathBuf, serde_json::Error),
+    CachedReportRead(PathBuf, serde_json::Error),
+    NotModifiedWithoutCache(PathBuf),
 }
 
 impl fmt::Display for ArtifactError {
@@ -853,6 +855,16 @@ impl fmt::Display for ArtifactError {
             }
             ArtifactError::ReportWrite(path, err) => {
                 write!(f, "failed to write report {}: {}", path.display(), err)
+            }
+            ArtifactError::CachedReportRead(path, err) => {
+                write!(f, "failed to read cached report {}: {}", path.display(), err)
+            }
+            ArtifactError::NotModifiedWithoutCache(path) => {
+                write!(
+                    f,
+                    "remote returned 304 but no cached artifact at {}",
+                    path.display()
+                )
             }
         }
     }
@@ -1106,13 +1118,7 @@ pub fn download_and_validate_artifact(
     }
 
     let extract_root = request.target_dir.join(&request.job_id);
-    if extract_root.exists() {
-        fs::remove_dir_all(&extract_root)
-            .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
-    }
-    fs::create_dir_all(&extract_root)
-        .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
-
+    let cache_report_path = extract_root.join("artifact-report.json");
     let artifact_url = build_service_endpoint(
         &request.service_url,
         &format!("jobs/{}/artifact", request.job_id),
@@ -1130,9 +1136,29 @@ pub fn download_and_validate_artifact(
 
     let mut response = http_request.send()?;
 
+    if response.status() == StatusCode::NOT_MODIFIED {
+        if cache_report_path.exists() {
+            let file = File::open(&cache_report_path)?;
+            let mut report: ArtifactReport = serde_json::from_reader(BufReader::new(file))
+                .map_err(|err| ArtifactError::CachedReportRead(cache_report_path.clone(), err))?;
+            report
+                .warnings
+                .push("远端产物未变更，返回本地缓存结果。".to_string());
+            return Ok(report);
+        }
+        return Err(ArtifactError::NotModifiedWithoutCache(extract_root.clone()));
+    }
+
     if !response.status().is_success() {
         return Err(ArtifactError::UnexpectedStatus(response.status()));
     }
+
+    if extract_root.exists() {
+        fs::remove_dir_all(&extract_root)
+            .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
+    }
+    fs::create_dir_all(&extract_root)
+        .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
 
     let mut temp_file = NamedTempFile::new()?;
     let mut hasher = Sha256::new();
@@ -1579,7 +1605,7 @@ fn compute_file_digest(path: &Path) -> Result<FileDigest, ArtifactError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod artifact_tests {
     use super::*;
     use httpmock::MockServer;
     use serde_json::json;
@@ -1703,6 +1729,70 @@ mod tests {
         let report = download_and_validate_artifact(request).expect("report");
         assert_eq!(report.summary.mismatched, 1);
         assert_eq!(report.summary.matched, 0);
+    }
+
+    #[test]
+    fn download_and_validate_artifact_uses_cache_on_not_modified() {
+        let temp = tempdir().unwrap();
+        let manifest_dir = temp.path().join("manifest");
+        fs::create_dir_all(&manifest_dir).unwrap();
+
+        let expected_path = manifest_dir.join("0001.jpg");
+        fs::write(&expected_path, b"expected").unwrap();
+
+        let manifest_path = manifest_dir.join("manifest.json");
+        let manifest = json!({
+            "files": [
+                {"source": "0001.jpg", "target": "0001.jpg"}
+            ],
+            "skipped": []
+        });
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let zip_bytes = build_zip_archive(vec![("0001.jpg", b"expected")]);
+
+        let server = MockServer::start();
+        let first_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact");
+            then.status(200)
+                .header("content-type", "application/zip")
+                .body(zip_bytes.clone());
+        });
+
+        let target_dir = temp.path().join("output");
+
+        let request = ArtifactDownloadRequest {
+            service_url: server.base_url(),
+            job_id: "test".to_string(),
+            artifact_path: "artifacts/test.zip".to_string(),
+            target_dir: target_dir.clone(),
+            bearer_token: None,
+            manifest_path: Some(manifest_path.clone()),
+            expected_hash: None,
+        };
+
+        let first_report = download_and_validate_artifact(request.clone()).expect("first report");
+        assert_eq!(first_report.summary.matched, 1);
+        first_mock.assert();
+
+        let second_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact");
+            then.status(304);
+        });
+
+        let mut cached_request = request.clone();
+        cached_request.expected_hash = Some(first_report.hash.clone());
+
+        let cached_report = download_and_validate_artifact(cached_request).expect("cached report");
+        assert_eq!(cached_report.summary.matched, 1);
+        assert!(cached_report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("未变更")));
+        assert!(cached_report.extract_path.exists());
+        second_mock.assert();
     }
     #[test]
     fn resume_remote_job_posts_payload() {
