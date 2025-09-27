@@ -22,19 +22,36 @@ from typing import Dict, Literal, Optional, Set
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 JobStatus = Literal["PENDING", "RUNNING", "SUCCESS", "FAILED"]
 
 
-class JobInput(BaseModel):
+def _to_camel(string: str) -> str:
+    """Convert snake_case field names to camelCase for API I/O."""
+
+    head, *tail = string.split("_")
+    return head + "".join(part.capitalize() for part in tail)
+
+
+class ApiModel(BaseModel):
+    """Base model that exposes camelCase aliases to match the UI contract."""
+
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+    )
+
+
+class JobInput(ApiModel):
     """Describe the uploaded asset that should be processed."""
 
     type: Literal["folder", "zip"] = Field(default="folder", description="Source payload kind")
     path: str = Field(..., min_length=1, description="Relative path inside storage root")
 
 
-class JobParams(BaseModel):
+class JobParams(ApiModel):
     """Inference parameters (fixed defaults for M1)."""
 
     scale: int = Field(default=2, ge=1, le=4, description="Upscale factor")
@@ -51,7 +68,7 @@ class JobParams(BaseModel):
     device: Literal["auto", "cuda", "cpu"] = Field(default="auto")
 
 
-class JobCreate(BaseModel):
+class JobCreate(ApiModel):
     """Request body for ``POST /jobs``."""
 
     title: str = Field(..., min_length=1)
@@ -60,16 +77,16 @@ class JobCreate(BaseModel):
     params: JobParams = JobParams()
 
 
-class JobSubmitted(BaseModel):
+class JobSubmitted(ApiModel):
     job_id: str
 
 
-class JobResumePayload(BaseModel):
+class JobResumePayload(ApiModel):
     inputPath: Optional[str] = None
     inputType: Optional[str] = None
 
 
-class JobState(BaseModel):
+class JobState(ApiModel):
     job_id: str
     status: JobStatus
     processed: int

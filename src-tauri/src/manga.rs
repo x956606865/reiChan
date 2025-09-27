@@ -1130,14 +1130,18 @@ pub fn download_and_validate_artifact(
     if let Some(token) = request.bearer_token.as_deref() {
         http_request = http_request.bearer_auth(token);
     }
+    let has_cached_report = cache_report_path.exists();
     if let Some(hash) = request.expected_hash.as_deref() {
-        http_request = http_request.header("If-None-Match", hash);
+        if has_cached_report {
+            // Only send an ETag when the previous report exists locally so a 304 can reuse it.
+            http_request = http_request.header("If-None-Match", hash);
+        }
     }
 
     let mut response = http_request.send()?;
 
     if response.status() == StatusCode::NOT_MODIFIED {
-        if cache_report_path.exists() {
+        if has_cached_report {
             let file = File::open(&cache_report_path)?;
             let mut report: ArtifactReport = serde_json::from_reader(BufReader::new(file))
                 .map_err(|err| ArtifactError::CachedReportRead(cache_report_path.clone(), err))?;
@@ -1730,6 +1734,44 @@ mod artifact_tests {
         let report = download_and_validate_artifact(request).expect("report");
         assert_eq!(report.summary.mismatched, 1);
         assert_eq!(report.summary.matched, 0);
+    }
+
+    #[test]
+    fn download_and_validate_artifact_ignores_etag_without_cache() {
+        let temp = tempdir().unwrap();
+
+        let zip_bytes = build_zip_archive(vec![("0001.jpg", b"payload")]);
+
+        let server = MockServer::start();
+        let etag_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact")
+                .header("if-none-match", "abc123");
+            then.status(304);
+        });
+
+        let success_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact");
+            then.status(200)
+                .header("content-type", "application/zip")
+                .body(zip_bytes.clone());
+        });
+
+        let request = ArtifactDownloadRequest {
+            service_url: server.base_url(),
+            job_id: "test".to_string(),
+            artifact_path: "artifacts/test.zip".to_string(),
+            target_dir: temp.path().join("output"),
+            bearer_token: None,
+            manifest_path: None,
+            expected_hash: Some("abc123".to_string()),
+        };
+
+        let report = download_and_validate_artifact(request).expect("report");
+        assert_eq!(report.summary.matched, 1);
+        assert_eq!(etag_mock.hits(), 0);
+        success_mock.assert();
     }
 
     #[test]

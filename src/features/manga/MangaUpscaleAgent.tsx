@@ -2747,12 +2747,14 @@ const MangaUpscaleAgent = () => {
                         />
                       </td>
                       <td className="job-id-cell">
-                        <span className="job-id monospace">{job.jobId}</span>
+                        <span className="job-id monospace" title={job.jobId}>
+                          {job.jobId}
+                        </span>
                         <span className={`status-chip status-${statusTone(job.status)}`}>
                           {describeStatus(job.status)}
                         </span>
                       </td>
-                      <td>
+                      <td className="progress-col">
                         {percent !== null ? (
                           <div className="progress-cell">
                             <div className="progress-bar">
@@ -2766,19 +2768,25 @@ const MangaUpscaleAgent = () => {
                           <span className="progress-label">-</span>
                         )}
                       </td>
-                      <td>
+                      <td className="transport-cell">
                         <span className="transport-badge">{describeTransport(job.transport)}</span>
                       </td>
-                      <td>
+                      <td className="message-cell">
                         {job.message ? job.message : "-"}
                       </td>
                       <td className="retry-cell">{job.retries ?? 0}</td>
                       <td className="error-cell">{job.lastError ?? "-"}</td>
-                      <td>
+                      <td className="artifact-cell">
                         {job.artifactPath ? (
                           <div className="artifact-info">
-                            <span>{job.artifactPath}</span>
-                            {job.artifactHash && <span className="artifact-hash">hash: {job.artifactHash.slice(0, 8)}…</span>}
+                            <span className="artifact-path" title={job.artifactPath}>
+                              {job.artifactPath}
+                            </span>
+                            {job.artifactHash && (
+                              <span className="artifact-hash" title={job.artifactHash}>
+                                hash: {job.artifactHash.slice(0, 8)}…
+                              </span>
+                            )}
                           </div>
                         ) : (
                           "-"
