@@ -1272,7 +1272,7 @@ const MangaUpscaleAgent = () => {
         });
 
         if (updatedRecord) {
-          await startJobWatcher(updatedRecord, { silent: options?.silent ?? false });
+          void startJobWatcher(updatedRecord, { silent: options?.silent ?? false });
         }
 
         if (!options?.silent) {
@@ -1884,7 +1884,7 @@ const MangaUpscaleAgent = () => {
       setJobs((prev) => [initialRecord, ...prev.filter((item) => item.jobId !== initialRecord.jobId)]);
       setJobStatus(`作业 ${submission.jobId} 已创建，正在等待进度更新。`);
 
-      await startJobWatcher(initialRecord);
+      void startJobWatcher(initialRecord);
     } catch (error) {
       setJobError(error instanceof Error ? error.message : String(error));
     } finally {

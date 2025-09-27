@@ -1141,6 +1141,7 @@ pub fn download_and_validate_artifact(
             let file = File::open(&cache_report_path)?;
             let mut report: ArtifactReport = serde_json::from_reader(BufReader::new(file))
                 .map_err(|err| ArtifactError::CachedReportRead(cache_report_path.clone(), err))?;
+            report.report_path = Some(cache_report_path.clone());
             report
                 .warnings
                 .push("远端产物未变更，返回本地缓存结果。".to_string());
@@ -1791,6 +1792,8 @@ mod artifact_tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("未变更")));
+        let expected_report_path = target_dir.join("test").join("artifact-report.json");
+        assert_eq!(cached_report.report_path.as_ref(), Some(&expected_report_path));
         assert!(cached_report.extract_path.exists());
         second_mock.assert();
     }
