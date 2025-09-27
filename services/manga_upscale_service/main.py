@@ -157,7 +157,12 @@ async def get_artifact(job_id: str) -> FileResponse:
     if record.artifact_path is None:
         raise HTTPException(status_code=409, detail="Job not finished yet")
 
-    artifact_path = ARTIFACTS_DIR / record.artifact_path
+    artifact_path = (STORAGE_ROOT / record.artifact_path).resolve()
+    try:
+        artifact_path.relative_to(ARTIFACTS_DIR)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="Artifact path escaped storage root") from exc
+
     if not artifact_path.exists():
         raise HTTPException(status_code=410, detail="Artifact missing")
 

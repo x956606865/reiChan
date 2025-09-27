@@ -404,65 +404,94 @@ const MangaUpscaleAgent = () => {
   }, [hasRestoredDefaults, uploadForm.serviceUrl, uploadForm.remotePath]);
 
   useEffect(() => {
-    let unlistenPromise: Promise<UnlistenFn> | null = null;
+    let disposed = false;
+    const disposers: UnlistenFn[] = [];
 
-    unlistenPromise = listen<JobEventPayload>("manga-job-event", (event) => {
-      const payload = event.payload;
-      if (!payload) {
-        return;
-      }
+    const bind = async () => {
+      try {
+        const uploadUnlisten = await listen<UploadProgressPayload>(
+          "manga-upload-progress",
+          (event) => {
+            const payload = event.payload;
+            if (!payload) {
+              return;
+            }
 
-      const displayMessage = payload.error ?? payload.message ?? null;
-      const record: JobRecord = {
-        jobId: payload.jobId,
-        status: payload.status,
-        processed: payload.processed,
-        total: payload.total,
-        artifactPath: payload.artifactPath ?? null,
-        message: displayMessage,
-        transport: payload.transport,
-        error: payload.error ?? null,
-        lastUpdated: Date.now(),
-      };
+            setUploadProgress(payload);
 
-      setJobs((prev) => {
-        const index = prev.findIndex((item) => item.jobId === record.jobId);
-        if (index === -1) {
-          return [record, ...prev];
+            switch (payload.stage) {
+              case "preparing":
+                setUploadError(null);
+                setUploadStatus(null);
+                break;
+              case "failed":
+                setUploadError(payload.message ?? "上传失败");
+                setUploadStatus(null);
+                break;
+              case "completed":
+                setUploadError(null);
+                setUploadStatus((prev) => payload.message ?? prev ?? "上传完成");
+                break;
+              default:
+                break;
+            }
+          },
+        );
+
+        if (disposed) {
+          uploadUnlisten();
+          return;
         }
+        disposers.push(uploadUnlisten);
 
-        const updated = [...prev];
-        updated[index] = record;
-        updated.sort((a, b) => b.lastUpdated - a.lastUpdated);
-        return updated;
-      });
-    });
+        const jobUnlisten = await listen<JobEventPayload>("manga-job-event", (event) => {
+          const payload = event.payload;
+          if (!payload) {
+            return;
+          }
 
-    return () => {
-      if (unlistenPromise) {
-        unlistenPromise
-          .then((fn) => fn())
-          .catch(() => undefined);
+          const displayMessage = payload.error ?? payload.message ?? null;
+          const record: JobRecord = {
+            jobId: payload.jobId,
+            status: payload.status,
+            processed: payload.processed,
+            total: payload.total,
+            artifactPath: payload.artifactPath ?? null,
+            message: displayMessage,
+            transport: payload.transport,
+            error: payload.error ?? null,
+            lastUpdated: Date.now(),
+          };
+
+          setJobs((prev) => {
+            const next = prev.filter((item) => item.jobId !== record.jobId);
+            next.push(record);
+            next.sort((a, b) => b.lastUpdated - a.lastUpdated);
+            return next;
+          });
+        });
+
+        if (disposed) {
+          jobUnlisten();
+          return;
+        }
+        disposers.push(jobUnlisten);
+      } catch (bindingError) {
+        console.warn("Failed to bind manga upscale events", bindingError);
       }
     };
-  }, []);
 
-  useEffect(() => {
-    let unlistenPromise: Promise<UnlistenFn> | null = null;
-
-    unlistenPromise = listen<UploadProgressPayload>("manga-upload-progress", (event) => {
-      if (!event.payload) {
-        return;
-      }
-      setUploadProgress(event.payload);
-    });
+    void bind();
 
     return () => {
-      if (unlistenPromise) {
-        unlistenPromise
-          .then((fn) => fn())
-          .catch(() => undefined);
-      }
+      disposed = true;
+      disposers.forEach((dispose) => {
+        try {
+          dispose();
+        } catch {
+          /* ignore */
+        }
+      });
     };
   }, []);
 
