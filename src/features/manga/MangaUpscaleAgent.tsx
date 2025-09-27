@@ -58,6 +58,58 @@ type UploadFormState = {
 
 type JobEventTransport = "websocket" | "polling" | "system";
 
+type JobParamsConfig = {
+  model: string;
+  scale: number;
+  denoise: "low" | "medium" | "high";
+  outputFormat: "jpg" | "png" | "webp";
+  jpegQuality: number;
+  tileSize: number | null;
+  tilePad: number | null;
+  batchSize: number | null;
+  device: "auto" | "cuda" | "cpu";
+};
+
+type JobMetadataInfo = {
+  title?: string | null;
+  volume?: string | null;
+};
+
+type JobParamFavorite = JobParamsConfig & {
+  id: string;
+  name: string;
+  createdAt: number;
+};
+
+type ArtifactValidationItem = {
+  filename: string;
+  expectedHash?: string | null;
+  actualHash?: string | null;
+  expectedBytes?: number | null;
+  actualBytes?: number | null;
+  status: "matched" | "missing" | "extra" | "mismatch";
+};
+
+type ArtifactReport = {
+  jobId: string;
+  artifactPath: string;
+  extractPath: string;
+  manifestPath?: string | null;
+  hash: string;
+  createdAt: string;
+  summary: {
+    matched: number;
+    missing: number;
+    extra: number;
+    mismatched: number;
+    totalManifest: number;
+    totalExtracted: number;
+  };
+  items: ArtifactValidationItem[];
+  warnings: string[];
+  reportPath?: string | null;
+};
+
 type JobEventPayload = {
   jobId: string;
   status: string;
@@ -65,8 +117,13 @@ type JobEventPayload = {
   total: number;
   artifactPath?: string | null;
   message?: string | null;
-  transport: JobEventTransport;
+  transport?: JobEventTransport;
   error?: string | null;
+  retries?: number;
+  lastError?: string | null;
+  artifactHash?: string | null;
+  params?: JobParamsConfig | null;
+  metadata?: JobMetadataInfo | null;
 };
 
 type JobSubmission = {
@@ -75,6 +132,12 @@ type JobSubmission = {
 
 type JobRecord = JobEventPayload & {
   lastUpdated: number;
+  serviceUrl: string;
+  bearerToken?: string | null;
+  inputPath?: string | null;
+  inputType?: JobFormState["inputType"];
+  manifestPath?: string | null;
+  transport: JobEventTransport;
 };
 
 type JobFormState = {
@@ -141,6 +204,20 @@ const DEFAULT_PAD = 4;
 const DEFAULT_POLL_INTERVAL = 1000;
 const SETTINGS_KEY = "manga-upscale-agent:v1";
 const UPLOAD_DEFAULTS_KEY = `${SETTINGS_KEY}:upload-defaults`;
+const PARAM_DEFAULTS_KEY = `${SETTINGS_KEY}:job-params`;
+const PARAM_FAVORITES_KEY = `${SETTINGS_KEY}:job-param-favorites`;
+
+const DEFAULT_JOB_PARAMS: JobParamsConfig = {
+  model: "RealESRGAN_x4plus_anime_6B",
+  scale: 2,
+  denoise: "medium",
+  outputFormat: "jpg",
+  jpegQuality: 95,
+  tileSize: null,
+  tilePad: null,
+  batchSize: null,
+  device: "auto",
+};
 
 const MangaUpscaleAgent = () => {
   const [renameForm, setRenameForm] = useState<RenameFormState>({
@@ -178,17 +255,27 @@ const MangaUpscaleAgent = () => {
 
   const [jobForm, setJobForm] = useState<JobFormState>({
     serviceUrl: "",
-    bearerToken: "",
+   bearerToken: "",
     title: "",
     volume: "",
     inputType: "zip",
     inputPath: "",
     pollIntervalMs: DEFAULT_POLL_INTERVAL,
   });
+  const [jobParams, setJobParams] = useState<JobParamsConfig>(DEFAULT_JOB_PARAMS);
+  const [jobParamFavorites, setJobParamFavorites] = useState<JobParamFavorite[]>([]);
+  const [jobParamsRestored, setJobParamsRestored] = useState(false);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const [jobLoading, setJobLoading] = useState(false);
   const [jobError, setJobError] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string | null>(null);
+  const [jobStatusFilter, setJobStatusFilter] = useState<"all" | "active" | "completed" | "failed">("all");
+  const [jobSearch, setJobSearch] = useState("");
+  const [selectedJobIds, setSelectedJobIds] = useState<string[]>([]);
+  const [artifactReports, setArtifactReports] = useState<ArtifactReport[]>([]);
+  const [artifactError, setArtifactError] = useState<string | null>(null);
+  const [artifactBusyJob, setArtifactBusyJob] = useState<string | null>(null);
+  const [artifactTargetRoot, setArtifactTargetRoot] = useState<string>("");
   const [currentStep, setCurrentStep] = useState<StepId>("source");
 
   const sanitizeVolumeName = useCallback((folderName: string) => {
@@ -342,6 +429,67 @@ const MangaUpscaleAgent = () => {
   }, []);
 
   useEffect(() => {
+    if (typeof window === "undefined" || jobParamsRestored) {
+      return;
+    }
+
+    try {
+      const storedParams = window.localStorage.getItem(PARAM_DEFAULTS_KEY);
+      const storedFavorites = window.localStorage.getItem(PARAM_FAVORITES_KEY);
+
+      if (storedParams) {
+        const parsed = JSON.parse(storedParams) as Partial<JobParamsConfig>;
+        setJobParams((prev) => ({ ...prev, ...parsed }));
+      }
+
+      if (storedFavorites) {
+        const favorites = JSON.parse(storedFavorites) as JobParamFavorite[];
+        if (Array.isArray(favorites)) {
+          setJobParamFavorites(
+            favorites
+              .filter((item) => typeof item?.id === "string" && typeof item?.name === "string")
+              .map((item) => ({
+                ...DEFAULT_JOB_PARAMS,
+                ...item,
+                id: item.id,
+                name: item.name,
+                createdAt: item.createdAt ?? Date.now(),
+              })),
+          );
+        }
+      }
+    } catch (storageError) {
+      console.warn("Failed to restore manga agent job params", storageError);
+    } finally {
+      setJobParamsRestored(true);
+    }
+  }, [jobParamsRestored]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !jobParamsRestored) {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(PARAM_DEFAULTS_KEY, JSON.stringify(jobParams));
+    } catch (storageError) {
+      console.warn("Failed to persist job params", storageError);
+    }
+  }, [jobParams, jobParamsRestored]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !jobParamsRestored) {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(PARAM_FAVORITES_KEY, JSON.stringify(jobParamFavorites));
+    } catch (storageError) {
+      console.warn("Failed to persist job param favorites", storageError);
+    }
+  }, [jobParamFavorites, jobParamsRestored]);
+
+  useEffect(() => {
     const trimmedService = uploadForm.serviceUrl.trim();
     const trimmedToken = uploadForm.bearerToken.trim();
     const trimmedTitle = uploadForm.title.trim();
@@ -450,20 +598,9 @@ const MangaUpscaleAgent = () => {
             return;
           }
 
-          const displayMessage = payload.error ?? payload.message ?? null;
-          const record: JobRecord = {
-            jobId: payload.jobId,
-            status: payload.status,
-            processed: payload.processed,
-            total: payload.total,
-            artifactPath: payload.artifactPath ?? null,
-            message: displayMessage,
-            transport: payload.transport,
-            error: payload.error ?? null,
-            lastUpdated: Date.now(),
-          };
-
           setJobs((prev) => {
+            const existing = prev.find((item) => item.jobId === payload.jobId);
+            const record = mapPayloadToRecord(payload, undefined, existing ?? undefined);
             const next = prev.filter((item) => item.jobId !== record.jobId);
             next.push(record);
             next.sort((a, b) => b.lastUpdated - a.lastUpdated);
@@ -500,9 +637,10 @@ const MangaUpscaleAgent = () => {
       return;
     }
 
-    const payload = {
+  const payload = {
       uploadForm,
       jobForm,
+      jobParams,
     };
 
     try {
@@ -510,7 +648,7 @@ const MangaUpscaleAgent = () => {
     } catch (storageError) {
       console.warn("Failed to persist manga agent settings", storageError);
     }
-  }, [uploadForm, jobForm]);
+  }, [uploadForm, jobForm, jobParams]);
 
   useEffect(() => {
     if (!isMultiVolumeSource) {
@@ -576,6 +714,59 @@ const MangaUpscaleAgent = () => {
     }
     return volumeMappings.find((item) => item.directory === selectedVolumeKey) ?? null;
   }, [selectedVolumeKey, volumeMappings]);
+
+  const filteredJobs = useMemo(() => {
+    const keyword = jobSearch.trim().toLowerCase();
+
+    return jobs.filter((job) => {
+      const statusUpper = job.status.toUpperCase();
+      const matchesStatus = (() => {
+        switch (jobStatusFilter) {
+          case "active":
+            return statusUpper === "PENDING" || statusUpper === "RUNNING";
+          case "completed":
+            return statusUpper === "SUCCESS";
+          case "failed":
+            return statusUpper === "FAILED" || statusUpper === "ERROR";
+          case "all":
+          default:
+            return true;
+        }
+      })();
+
+      if (!matchesStatus) {
+        return false;
+      }
+
+      if (!keyword) {
+        return true;
+      }
+
+      const haystack = [
+        job.jobId,
+        job.message ?? "",
+        job.metadata?.title ?? "",
+        job.metadata?.volume ?? "",
+      ]
+        .join(" ")
+        .toLowerCase();
+
+      return haystack.includes(keyword);
+    });
+  }, [jobSearch, jobStatusFilter, jobs]);
+
+  useEffect(() => {
+    setSelectedJobIds((prev) => prev.filter((id) => jobs.some((job) => job.jobId === id)));
+  }, [jobs]);
+
+  const allVisibleSelected = useMemo(() => {
+    if (filteredJobs.length === 0) {
+      return false;
+    }
+    return filteredJobs.every((job) => selectedJobIds.includes(job.jobId));
+  }, [filteredJobs, selectedJobIds]);
+
+  const hasSelection = selectedJobIds.length > 0;
 
   useEffect(() => {
     if (!isMultiVolumeSource || !selectedVolume) {
@@ -745,6 +936,551 @@ const MangaUpscaleAgent = () => {
       },
     [],
   );
+
+  const handleParamChange = useCallback(
+    (field: keyof JobParamsConfig) =>
+      (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+        const rawValue = event.currentTarget.value;
+
+        setJobParams((prev) => {
+          switch (field) {
+            case "scale": {
+              const numeric = Number(rawValue);
+              const normalized = Number.isFinite(numeric) ? Math.min(4, Math.max(1, Math.floor(numeric))) : prev.scale;
+              return { ...prev, scale: normalized };
+            }
+            case "denoise":
+              return { ...prev, denoise: rawValue as JobParamsConfig["denoise"] };
+            case "model":
+              return { ...prev, model: rawValue };
+            case "outputFormat":
+              return { ...prev, outputFormat: rawValue as JobParamsConfig["outputFormat"] };
+            case "jpegQuality": {
+              const numeric = Number(rawValue);
+              const normalized = Number.isFinite(numeric)
+                ? Math.min(100, Math.max(1, Math.round(numeric)))
+                : prev.jpegQuality;
+              return { ...prev, jpegQuality: normalized };
+            }
+            case "tileSize": {
+              if (rawValue.trim() === "") {
+                return { ...prev, tileSize: null };
+              }
+              const numeric = Number(rawValue);
+              if (!Number.isFinite(numeric)) {
+                return prev;
+              }
+              return { ...prev, tileSize: Math.min(1024, Math.max(32, Math.round(numeric))) };
+            }
+            case "tilePad": {
+              if (rawValue.trim() === "") {
+                return { ...prev, tilePad: null };
+              }
+              const numeric = Number(rawValue);
+              if (!Number.isFinite(numeric)) {
+                return prev;
+              }
+              return { ...prev, tilePad: Math.min(128, Math.max(0, Math.round(numeric))) };
+            }
+            case "batchSize": {
+              if (rawValue.trim() === "") {
+                return { ...prev, batchSize: null };
+              }
+              const numeric = Number(rawValue);
+              if (!Number.isFinite(numeric)) {
+                return prev;
+              }
+              return { ...prev, batchSize: Math.min(16, Math.max(1, Math.round(numeric))) };
+            }
+            case "device":
+              return { ...prev, device: rawValue as JobParamsConfig["device"] };
+            default:
+              return prev;
+          }
+        });
+      },
+    [],
+  );
+
+  const handleResetParams = useCallback(() => {
+    setJobParams(DEFAULT_JOB_PARAMS);
+  }, []);
+
+  const computeFavoriteName = useCallback((params: JobParamsConfig) => {
+    const pieces = [`${params.model}`];
+    pieces.push(`×${params.scale}`);
+    pieces.push(`denoise:${params.denoise}`);
+    if (params.outputFormat === "jpg") {
+      pieces.push(`jpg@${params.jpegQuality}`);
+    } else {
+      pieces.push(params.outputFormat);
+    }
+    return pieces.join(" · ");
+  }, []);
+
+  const handleSaveFavorite = useCallback(() => {
+    const id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `fav-${Date.now()}`;
+    const name = computeFavoriteName(jobParams);
+
+    setJobParamFavorites((prev) => {
+      const exists = prev.some(
+        (item) =>
+          item.model === jobParams.model &&
+          item.scale === jobParams.scale &&
+          item.denoise === jobParams.denoise &&
+          item.outputFormat === jobParams.outputFormat &&
+          item.jpegQuality === jobParams.jpegQuality &&
+          item.tileSize === jobParams.tileSize &&
+          item.tilePad === jobParams.tilePad &&
+          item.batchSize === jobParams.batchSize &&
+          item.device === jobParams.device,
+      );
+
+      if (exists) {
+        return prev;
+      }
+
+      const favorite: JobParamFavorite = {
+        ...jobParams,
+        id,
+        name,
+        createdAt: Date.now(),
+      };
+
+      const combined = [favorite, ...prev];
+      return combined.slice(0, 8);
+    });
+  }, [computeFavoriteName, jobParams]);
+
+  const handleApplyFavorite = useCallback(
+    (favoriteId: string) => {
+      const favorite = jobParamFavorites.find((item) => item.id === favoriteId);
+      if (!favorite) {
+        return;
+      }
+      setJobParams({
+        model: favorite.model,
+        scale: favorite.scale,
+        denoise: favorite.denoise,
+        outputFormat: favorite.outputFormat,
+        jpegQuality: favorite.jpegQuality,
+        tileSize: favorite.tileSize,
+        tilePad: favorite.tilePad,
+        batchSize: favorite.batchSize,
+        device: favorite.device,
+      });
+    },
+    [jobParamFavorites],
+  );
+
+  const handleRemoveFavorite = useCallback(
+    (favoriteId: string) => {
+      setJobParamFavorites((prev) => prev.filter((item) => item.id !== favoriteId));
+    },
+    [],
+  );
+
+  const inferManifestForVolume = useCallback(
+    (volumeName: string | null | undefined): string | null => {
+      if (!renameSummary) {
+        return null;
+      }
+
+      if (renameSummary.mode === "single") {
+        return renameSummary.outcome.manifestPath ?? null;
+      }
+
+      if (renameSummary.mode === "multi") {
+        const normalized = volumeName?.trim().toLowerCase();
+        const match = renameSummary.volumes.find((entry) => {
+          if (!entry.outcome.manifestPath) {
+            return false;
+          }
+          if (!normalized) {
+            return false;
+          }
+          const candidate = entry.mapping.volumeName.trim().toLowerCase();
+          if (candidate === normalized) {
+            return true;
+          }
+          if (normalized.includes(String(entry.mapping.volumeNumber ?? "")) && normalized.includes(candidate)) {
+            return true;
+          }
+          return false;
+        });
+
+        return match?.outcome.manifestPath ?? null;
+      }
+
+      return null;
+    },
+    [renameSummary],
+  );
+
+  const mapPayloadToRecord = useCallback(
+    (payload: JobEventPayload, overrideMessage?: string | null, existing?: JobRecord): JobRecord => {
+      const displayMessage = overrideMessage ?? payload.error ?? payload.message ?? null;
+      const transport = payload.transport ?? "system";
+      return {
+        jobId: payload.jobId,
+        status: payload.status,
+        processed: payload.processed,
+        total: payload.total,
+        artifactPath: payload.artifactPath ?? null,
+        message: displayMessage,
+        transport,
+        error: payload.error ?? null,
+        retries: payload.retries ?? 0,
+        lastError: payload.lastError ?? null,
+        artifactHash: payload.artifactHash ?? null,
+        params: payload.params ?? null,
+        metadata: payload.metadata ?? null,
+        lastUpdated: Date.now(),
+        serviceUrl: existing?.serviceUrl ?? jobForm.serviceUrl,
+        bearerToken: existing?.bearerToken ?? jobForm.bearerToken,
+        inputPath: existing?.inputPath ?? jobForm.inputPath,
+        inputType: existing?.inputType ?? jobForm.inputType,
+        manifestPath:
+          existing?.manifestPath ?? inferManifestForVolume(payload.metadata?.volume ?? null),
+      };
+    },
+    [inferManifestForVolume, jobForm.bearerToken, jobForm.inputPath, jobForm.inputType, jobForm.serviceUrl],
+  );
+
+  const handleToggleJobSelection = useCallback(
+    (jobId: string) => {
+      setSelectedJobIds((prev) =>
+        prev.includes(jobId) ? prev.filter((id) => id !== jobId) : [...prev, jobId],
+      );
+    },
+    [],
+  );
+
+  const handleSelectAllVisible = useCallback(() => {
+    setSelectedJobIds(filteredJobs.map((job) => job.jobId));
+  }, [filteredJobs]);
+
+  const handleClearSelections = useCallback(() => {
+    setSelectedJobIds([]);
+  }, []);
+
+  const handleJobSearchChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setJobSearch(event.currentTarget.value);
+  }, []);
+
+  const handleJobStatusFilterChange = useCallback(
+    (event: ChangeEvent<HTMLSelectElement>) => {
+      const value = event.currentTarget.value as "all" | "active" | "completed" | "failed";
+      setJobStatusFilter(value);
+    },
+    [],
+  );
+
+  const buildJobRequest = useCallback((job: JobRecord) => {
+    const request: Record<string, unknown> = {
+      serviceUrl: job.serviceUrl,
+      jobId: job.jobId,
+    };
+    if (job.bearerToken && job.bearerToken.trim()) {
+      request.bearerToken = job.bearerToken.trim();
+    }
+    if (job.inputPath) {
+      request.inputPath = job.inputPath;
+    }
+    if (job.inputType) {
+      request.inputType = job.inputType;
+    }
+    if (job.artifactPath) {
+      request.artifactPath = job.artifactPath;
+    }
+    return request;
+  }, []);
+
+  const resumeJob = useCallback(
+    async (job: JobRecord, options?: { silent?: boolean }) => {
+      if (!job.serviceUrl) {
+        if (!options?.silent) {
+          setJobError("缺少服务地址，无法恢复作业。");
+        }
+        return;
+      }
+
+      if (!options?.silent) {
+        setJobStatus(`正在恢复作业 ${job.jobId}…`);
+        setJobError(null);
+      }
+
+      try {
+        const payload = await invoke<JobEventPayload>("resume_manga_job", {
+          request: buildJobRequest(job),
+        });
+
+        setJobs((prev) => {
+          const existing = prev.find((item) => item.jobId === payload.jobId) ?? job;
+          const record = mapPayloadToRecord(payload, undefined, existing);
+          const next = prev.filter((item) => item.jobId !== record.jobId);
+          next.push(record);
+          next.sort((a, b) => b.lastUpdated - a.lastUpdated);
+          return next;
+        });
+
+        if (!options?.silent) {
+          setJobStatus(`已请求恢复作业 ${job.jobId}，等待更新。`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!options?.silent) {
+          setJobError(message);
+        }
+      }
+    },
+    [buildJobRequest, mapPayloadToRecord],
+  );
+
+  const cancelJob = useCallback(
+    async (job: JobRecord, options?: { silent?: boolean }) => {
+      if (!job.serviceUrl) {
+        if (!options?.silent) {
+          setJobError("缺少服务地址，无法终止作业。");
+        }
+        return;
+      }
+
+      if (!options?.silent) {
+        setJobStatus(`正在终止作业 ${job.jobId}…`);
+        setJobError(null);
+      }
+
+      try {
+        const payload = await invoke<JobEventPayload>("cancel_manga_job", {
+          request: buildJobRequest(job),
+        });
+
+        setJobs((prev) => {
+          const existing = prev.find((item) => item.jobId === payload.jobId) ?? job;
+          const record = mapPayloadToRecord(payload, undefined, existing);
+          const next = prev.filter((item) => item.jobId !== record.jobId);
+          next.push(record);
+          next.sort((a, b) => b.lastUpdated - a.lastUpdated);
+          return next;
+        });
+
+        if (!options?.silent) {
+          setJobStatus(`已发送终止请求 ${job.jobId}。`);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!options?.silent) {
+          setJobError(message);
+        }
+      }
+    },
+    [buildJobRequest, mapPayloadToRecord],
+  );
+
+  const handleResumeJob = useCallback(
+    (job: JobRecord) => {
+      void resumeJob(job);
+    },
+    [resumeJob],
+  );
+
+  const handleCancelJob = useCallback(
+    (job: JobRecord) => {
+      void cancelJob(job);
+    },
+    [cancelJob],
+  );
+
+  const promptForDirectory = useCallback(
+    async (title: string, defaultPath?: string | null) => {
+      const selection = await invoke<string | string[] | null>("plugin:dialog|open", {
+        options: {
+          directory: true,
+          multiple: false,
+          defaultPath: defaultPath ?? undefined,
+          title,
+        },
+      });
+
+      if (!selection) {
+        return null;
+      }
+      const first = Array.isArray(selection) ? selection[0] : selection;
+      return typeof first === "string" && first.length > 0 ? first : null;
+    },
+    [],
+  );
+
+  const promptForManifest = useCallback(async () => {
+    const selection = await invoke<string | string[] | null>("plugin:dialog|open", {
+      options: {
+        filters: [{ name: "Manifest", extensions: ["json"] }],
+        title: "选择 manifest.json",
+        multiple: false,
+      },
+    });
+
+    if (!selection) {
+      return null;
+    }
+    const first = Array.isArray(selection) ? selection[0] : selection;
+    return typeof first === "string" && first.length > 0 ? first : null;
+  }, []);
+
+  const downloadArtifact = useCallback(
+    async (
+      job: JobRecord,
+      options?: { silent?: boolean; targetDir?: string | null; manifestPathOverride?: string | null },
+    ) => {
+      const silent = options?.silent ?? false;
+
+      if (!job.serviceUrl || !job.jobId) {
+        if (!silent) {
+          setArtifactError("缺少必要信息，无法下载产物。");
+        }
+        return false;
+      }
+
+      if (!job.artifactPath) {
+        if (!silent) {
+          setArtifactError("远端尚未提供产物路径。");
+        }
+        return false;
+      }
+
+      let targetDir = options?.targetDir ?? null;
+      if (!targetDir) {
+        const picked = await promptForDirectory("选择产物输出目录", artifactTargetRoot);
+        if (!picked) {
+          if (!silent) {
+            setArtifactError("已取消选择输出目录。");
+          }
+          return false;
+        }
+        targetDir = picked;
+      }
+
+      let manifestPath =
+        options?.manifestPathOverride ??
+        job.manifestPath ??
+        inferManifestForVolume(job.metadata?.volume ?? null);
+
+      if (!manifestPath && !silent) {
+        manifestPath = await promptForManifest();
+      }
+
+      setArtifactBusyJob(job.jobId);
+      if (!silent) {
+        setArtifactError(null);
+      }
+
+      try {
+        const request: Record<string, unknown> = {
+          ...buildJobRequest(job),
+          targetDir,
+        };
+
+        if (manifestPath) {
+          request.manifestPath = manifestPath;
+        }
+        if (job.artifactHash) {
+          request.expectedHash = job.artifactHash;
+        }
+
+        const report = await invoke<ArtifactReport>("download_manga_artifact", { request });
+
+        setArtifactReports((prev) => {
+          const next = [report, ...prev.filter((item) => item.jobId !== report.jobId)];
+          return next.slice(0, 10);
+        });
+
+        setArtifactTargetRoot(targetDir);
+
+        if (manifestPath) {
+          setJobs((prev) =>
+            prev.map((item) => (item.jobId === job.jobId ? { ...item, manifestPath } : item)),
+          );
+        }
+
+        if (!silent) {
+          setJobStatus(`产物下载完成（${report.jobId}）`);
+        }
+
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!silent) {
+          setArtifactError(message);
+        }
+        return false;
+      } finally {
+        setArtifactBusyJob(null);
+      }
+    },
+    [artifactTargetRoot, buildJobRequest, inferManifestForVolume, promptForDirectory, promptForManifest],
+  );
+
+  const handleDownloadArtifact = useCallback(
+    (job: JobRecord) => {
+      void downloadArtifact(job);
+    },
+    [downloadArtifact],
+  );
+
+  const handleBatchResume = useCallback(async () => {
+    const targets = jobs.filter((job) => selectedJobIds.includes(job.jobId));
+    for (const job of targets) {
+      await resumeJob(job, { silent: true });
+    }
+    setJobStatus(`已尝试恢复 ${targets.length} 项作业。`);
+  }, [jobs, resumeJob, selectedJobIds]);
+
+  const handleBatchCancel = useCallback(async () => {
+    const targets = jobs.filter((job) => selectedJobIds.includes(job.jobId));
+    for (const job of targets) {
+      await cancelJob(job, { silent: true });
+    }
+    setJobStatus(`已发送终止请求 ${targets.length} 项作业。`);
+  }, [cancelJob, jobs, selectedJobIds]);
+
+  const handleBatchDownload = useCallback(async () => {
+    const selected = jobs.filter((job) => selectedJobIds.includes(job.jobId));
+    const ready = selected.filter((job) => !!job.artifactPath);
+
+    if (ready.length === 0) {
+      setJobStatus("选中的作业暂无可下载的产物。");
+      return;
+    }
+
+    let targetDir = artifactTargetRoot;
+    if (!targetDir) {
+      targetDir = await promptForDirectory("选择批量下载目录", artifactTargetRoot);
+      if (!targetDir) {
+        return;
+      }
+    }
+
+    let success = 0;
+    for (const job of ready) {
+      const ok = await downloadArtifact(job, { silent: true, targetDir });
+      if (ok) {
+        success += 1;
+      }
+    }
+
+    if (success === 0) {
+      setJobStatus("批量下载未成功，请检查作业状态。");
+      return;
+    }
+
+    const skipped = selected.length - ready.length;
+    const summaryParts = [`已触发 ${success} 项下载/校验。`];
+    if (skipped > 0) {
+      summaryParts.push(`跳过 ${skipped} 项尚未生成产物的作业。`);
+    }
+    setJobStatus(summaryParts.join(' '));
+  }, [artifactTargetRoot, downloadArtifact, jobs, promptForDirectory, selectedJobIds]);
 
   const handleUpload = useCallback(async () => {
     if (!renameForm.directory) {
@@ -1041,6 +1777,18 @@ const MangaUpscaleAgent = () => {
     setJobStatus(null);
 
     try {
+      const paramsPayload: JobParamsConfig = {
+        scale: jobParams.scale,
+        model: jobParams.model,
+        denoise: jobParams.denoise,
+        outputFormat: jobParams.outputFormat,
+        jpegQuality: jobParams.jpegQuality,
+        tileSize: jobParams.tileSize,
+        tilePad: jobParams.tilePad,
+        batchSize: jobParams.batchSize,
+        device: jobParams.device,
+      };
+
       const options = {
         serviceUrl,
         bearerToken: bearer || undefined,
@@ -1051,11 +1799,7 @@ const MangaUpscaleAgent = () => {
             type: jobForm.inputType,
             path: inputPath,
           },
-          params: {
-            scale: 2,
-            model: "RealESRGAN_x4plus_anime_6B",
-            denoise: "medium",
-          },
+          params: paramsPayload,
         },
       };
 
@@ -1070,6 +1814,19 @@ const MangaUpscaleAgent = () => {
         message: "作业已提交，等待远端处理。",
         transport: "system",
         error: null,
+        retries: 0,
+        lastError: null,
+        artifactHash: null,
+        params: paramsPayload,
+        metadata: {
+          title,
+          volume,
+        },
+        serviceUrl,
+        bearerToken: bearer || null,
+        inputPath,
+        inputType: jobForm.inputType,
+        manifestPath: inferManifestForVolume(volume),
         lastUpdated: Date.now(),
       };
 
@@ -1110,7 +1867,7 @@ const MangaUpscaleAgent = () => {
     } finally {
       setJobLoading(false);
     }
-  }, [jobForm]);
+  }, [inferManifestForVolume, jobForm, jobParams]);
 
   const describeStatus = (status: string) => {
     switch (status.toUpperCase()) {
@@ -1666,6 +2423,178 @@ const MangaUpscaleAgent = () => {
           <p>提交 FastAPI 推理作业并实时查看进度。</p>
         </header>
 
+        <div className="params-panel" aria-label="推理参数配置">
+          <div className="params-panel-header">
+            <h4>推理参数</h4>
+            <p>调整模型、放大倍率与高级选项，配置将自动保存为默认值。</p>
+          </div>
+
+          <div className="params-grid">
+            <label className="form-field">
+              <span className="field-label">模型</span>
+              <input
+                type="text"
+                value={jobParams.model}
+                onChange={handleParamChange("model")}
+                placeholder="RealESRGAN_x4plus_anime_6B"
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">放大倍率</span>
+              <input
+                type="number"
+                min={1}
+                max={4}
+                value={jobParams.scale}
+                onChange={handleParamChange("scale")}
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">降噪等级</span>
+              <select value={jobParams.denoise} onChange={handleParamChange("denoise")}>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">输出格式</span>
+              <select value={jobParams.outputFormat} onChange={handleParamChange("outputFormat")}>
+                <option value="jpg">JPG</option>
+                <option value="png">PNG</option>
+                <option value="webp">WEBP</option>
+              </select>
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">JPEG 质量</span>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={jobParams.jpegQuality}
+                onChange={handleParamChange("jpegQuality")}
+                disabled={jobParams.outputFormat !== "jpg"}
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">Tile 尺寸</span>
+              <input
+                type="number"
+                min={32}
+                max={1024}
+                value={jobParams.tileSize ?? ""}
+                onChange={handleParamChange("tileSize")}
+                placeholder="留空表示自动"
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">Tile Pad</span>
+              <input
+                type="number"
+                min={0}
+                max={128}
+                value={jobParams.tilePad ?? ""}
+                onChange={handleParamChange("tilePad")}
+                placeholder="留空表示自动"
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">Batch Size</span>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                value={jobParams.batchSize ?? ""}
+                onChange={handleParamChange("batchSize")}
+                placeholder="留空表示自动"
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">设备偏好</span>
+              <select value={jobParams.device} onChange={handleParamChange("device")}>
+                <option value="auto">Auto</option>
+                <option value="cuda">CUDA</option>
+                <option value="cpu">CPU</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="params-actions">
+            <button type="button" onClick={handleResetParams}>
+              重置为内置默认
+            </button>
+            <button type="button" onClick={handleSaveFavorite}>
+              收藏当前参数
+            </button>
+          </div>
+
+          {jobParamFavorites.length > 0 && (
+            <div className="params-favorites">
+              <div className="favorite-header">
+                <h5>收藏参数预设</h5>
+                <span>最多保留 8 组，可随时应用或删除。</span>
+              </div>
+              <ul>
+                {jobParamFavorites.map((favorite) => (
+                  <li key={favorite.id}>
+                    <button type="button" onClick={() => handleApplyFavorite(favorite.id)}>
+                      {favorite.name}
+                    </button>
+                    <span className="favorite-meta">{new Date(favorite.createdAt).toLocaleString()}</span>
+                    <button type="button" className="ghost" onClick={() => handleRemoveFavorite(favorite.id)}>
+                      删除
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        <div className="job-toolbar">
+          <div className="job-toolbar-group">
+            <label className="field-label" htmlFor="job-status-filter">
+              状态筛选
+            </label>
+            <select id="job-status-filter" value={jobStatusFilter} onChange={handleJobStatusFilterChange}>
+              <option value="all">全部</option>
+              <option value="active">进行中</option>
+              <option value="completed">已完成</option>
+              <option value="failed">失败/错误</option>
+            </select>
+          </div>
+
+          <div className="job-toolbar-group flex">
+            <label className="field-label" htmlFor="job-search">
+              搜索作业
+            </label>
+            <input
+              id="job-search"
+              type="text"
+              value={jobSearch}
+              onChange={handleJobSearchChange}
+              placeholder="按 Job ID / 标题 过滤"
+            />
+          </div>
+
+          <div className="job-toolbar-actions">
+            <button type="button" onClick={handleSelectAllVisible}>
+              全选当前列表
+            </button>
+            <button type="button" onClick={handleClearSelections}>
+              清除选择
+            </button>
+          </div>
+        </div>
+
         <div className="form-grid">
           <label className="form-field">
             <span className="field-label">服务地址</span>
@@ -1752,24 +2681,48 @@ const MangaUpscaleAgent = () => {
 
         {jobError && <p className="status status-error">{jobError}</p>}
         {jobStatus && <p className="status status-success">{jobStatus}</p>}
+        {artifactError && <p className="status status-error">{artifactError}</p>}
 
-        {jobs.length > 0 && (
+        {filteredJobs.length > 0 ? (
           <div className="job-board">
             <table className="jobs-table">
               <thead>
                 <tr>
+                  <th className="select-col">
+                    <input
+                      type="checkbox"
+                      checked={allVisibleSelected}
+                      onChange={(event) => {
+                        if (event.currentTarget.checked) {
+                          handleSelectAllVisible();
+                        } else {
+                          handleClearSelections();
+                        }
+                      }}
+                    />
+                  </th>
                   <th>作业 ID / 状态</th>
                   <th>进度</th>
                   <th>来源</th>
                   <th>消息</th>
+                  <th>重试</th>
+                  <th>上次错误</th>
                   <th>产物</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
-                {jobs.map((job) => {
+                {filteredJobs.map((job) => {
                   const percent = job.total > 0 ? Math.min(100, Math.round((job.processed / job.total) * 100)) : null;
                   return (
                     <tr key={job.jobId}>
+                      <td className="select-col">
+                        <input
+                          type="checkbox"
+                          checked={selectedJobIds.includes(job.jobId)}
+                          onChange={() => handleToggleJobSelection(job.jobId)}
+                        />
+                      </td>
                       <td className="job-id-cell">
                         <span className="job-id monospace">{job.jobId}</span>
                         <span className={`status-chip status-${statusTone(job.status)}`}>
@@ -1796,12 +2749,85 @@ const MangaUpscaleAgent = () => {
                       <td>
                         {job.message ? job.message : "-"}
                       </td>
-                      <td>{job.artifactPath ?? "-"}</td>
+                      <td className="retry-cell">{job.retries ?? 0}</td>
+                      <td className="error-cell">{job.lastError ?? "-"}</td>
+                      <td>
+                        {job.artifactPath ? (
+                          <div className="artifact-info">
+                            <span>{job.artifactPath}</span>
+                            {job.artifactHash && <span className="artifact-hash">hash: {job.artifactHash.slice(0, 8)}…</span>}
+                          </div>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
+                      <td className="actions-cell">
+                        <button type="button" onClick={() => handleResumeJob(job)}>
+                          恢复
+                        </button>
+                        <button type="button" onClick={() => handleCancelJob(job)}>
+                          终止
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!job.artifactPath || artifactBusyJob === job.jobId}
+                          onClick={() => handleDownloadArtifact(job)}
+                        >
+                          {artifactBusyJob === job.jobId ? "处理中…" : "下载校验"}
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
+          </div>
+        ) : (
+          <p className="status">暂无符合条件的作业。</p>
+        )}
+
+        {hasSelection && (
+          <div className="job-batch-actions">
+            <span>已选择 {selectedJobIds.length} 个作业</span>
+            <div className="job-batch-buttons">
+              <button type="button" onClick={handleBatchResume}>
+                批量恢复
+              </button>
+              <button type="button" onClick={handleBatchCancel}>
+                批量终止
+              </button>
+              <button type="button" onClick={handleBatchDownload}>
+                批量下载校验
+              </button>
+            </div>
+          </div>
+        )}
+
+        {artifactReports.length > 0 && (
+          <div className="artifact-reports">
+            <h4>最近校验结果</h4>
+            <ul>
+              {artifactReports.map((report) => (
+                <li key={`${report.jobId}-${report.createdAt}`}>
+                  <div className="report-header">
+                    <span className="job-id monospace">{report.jobId}</span>
+                    <span className="report-status">
+                      匹配 {report.summary.matched} / {report.summary.totalManifest}
+                    </span>
+                    <span className="report-path">输出：{report.extractPath}</span>
+                  </div>
+                  <div className="report-details">
+                    <span>缺失 {report.summary.missing}</span>
+                    <span>多余 {report.summary.extra}</span>
+                    <span>哈希不一致 {report.summary.mismatched}</span>
+                    {report.warnings.length > 0 && (
+                      <span className="report-warning">{report.warnings[0]}</span>
+                    )}
+                  </div>
+                  {report.reportPath && <span className="report-file">报告：{report.reportPath}</span>}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 

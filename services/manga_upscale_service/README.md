@@ -20,6 +20,16 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 
 启动后可通过 `http://localhost:8001/docs` 访问自动生成的交互文档。
 
+## Windows Quick Start
+
+Double-click `start_service.bat` in this directory to launch the backend with one click. The helper script will:
+
+- verify that `uv` is available on `PATH`,
+- run `uv sync` the first time (or whenever `.venv`/`uv.lock` are missing) to set up dependencies, and
+- start the FastAPI server via `uv run uvicorn main:app --reload`.
+
+If `uv` is not installed yet, install it following the official instructions at <https://astral.sh/uv> and rerun the batch file.
+
 ## 后续扩展点
 
 - 将 `simulate_execution` 替换为真实的推理调用（PyTorch / ONNXRuntime / realesrgan-ncnn-vulkan）；

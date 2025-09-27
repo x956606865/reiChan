@@ -1,19 +1,23 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
+use hex;
 use http::header::AUTHORIZATION;
 use http::HeaderValue;
 use natord::compare;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::{self, Map, Value};
+use sha2::{Digest, Sha256};
 use tauri::{async_runtime, AppHandle, Emitter};
+use tempfile::NamedTempFile;
 use tokio::net::TcpStream;
 use tokio::task::JoinError;
 use tokio::time::sleep;
@@ -21,8 +25,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
+use walkdir::WalkDir;
 use zip::write::FileOptions;
 use zip::CompressionMethod;
+use zip::ZipArchive;
 
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] =
     &["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"];
@@ -525,7 +531,7 @@ pub struct JobInputPayload {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobParamsPayload {
     #[serde(default = "default_scale")]
@@ -534,6 +540,18 @@ pub struct JobParamsPayload {
     pub model: String,
     #[serde(default = "default_denoise")]
     pub denoise: String,
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
+    #[serde(default = "default_jpeg_quality")]
+    pub jpeg_quality: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_pad: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<u32>,
+    #[serde(default = "default_device")]
+    pub device: String,
 }
 
 impl Default for JobParamsPayload {
@@ -542,6 +560,12 @@ impl Default for JobParamsPayload {
             scale: default_scale(),
             model: default_model(),
             denoise: default_denoise(),
+            output_format: default_output_format(),
+            jpeg_quality: default_jpeg_quality(),
+            tile_size: None,
+            tile_pad: None,
+            batch_size: None,
+            device: default_device(),
         }
     }
 }
@@ -556,6 +580,18 @@ fn default_model() -> String {
 
 fn default_denoise() -> String {
     "medium".to_string()
+}
+
+fn default_output_format() -> String {
+    "jpg".to_string()
+}
+
+fn default_jpeg_quality() -> u8 {
+    95
+}
+
+fn default_device() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -584,6 +620,25 @@ pub struct JobStatusSnapshot {
     pub artifact_path: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub retries: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub artifact_hash: Option<String>,
+    #[serde(default)]
+    pub params: Option<JobParamsPayload>,
+    #[serde(default)]
+    pub metadata: Option<JobMetadataSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobMetadataSnapshot {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub volume: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -595,6 +650,34 @@ pub struct JobWatchRequest {
     pub bearer_token: Option<String>,
     #[serde(default)]
     pub poll_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobControlRequest {
+    pub service_url: String,
+    pub job_id: String,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub input_path: Option<String>,
+    #[serde(default)]
+    pub input_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDownloadRequest {
+    pub service_url: String,
+    pub job_id: String,
+    pub artifact_path: String,
+    pub target_dir: PathBuf,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    pub expected_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -617,6 +700,16 @@ pub struct JobEventEnvelope {
     pub transport: JobEventTransport,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub retries: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub artifact_hash: Option<String>,
+    #[serde(default)]
+    pub params: Option<JobParamsPayload>,
+    #[serde(default)]
+    pub metadata: Option<JobMetadataSnapshot>,
 }
 
 impl JobEventEnvelope {
@@ -630,6 +723,11 @@ impl JobEventEnvelope {
             message: snapshot.message,
             transport,
             error: None,
+            retries: snapshot.retries,
+            last_error: snapshot.last_error,
+            artifact_hash: snapshot.artifact_hash,
+            params: snapshot.params,
+            metadata: snapshot.metadata,
         }
     }
 
@@ -643,6 +741,11 @@ impl JobEventEnvelope {
             message: Some(message.clone()),
             transport: JobEventTransport::System,
             error: Some(message),
+            retries: 0,
+            last_error: None,
+            artifact_hash: None,
+            params: None,
+            metadata: None,
         }
     }
 }
@@ -657,6 +760,122 @@ pub enum JobError {
     Join(JoinError),
     InvalidResponse(String),
     InvalidServiceUrl,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactValidationStatus {
+    Matched,
+    Missing,
+    Extra,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactValidationItem {
+    pub filename: String,
+    #[serde(default)]
+    pub expected_hash: Option<String>,
+    #[serde(default)]
+    pub actual_hash: Option<String>,
+    #[serde(default)]
+    pub expected_bytes: Option<u64>,
+    #[serde(default)]
+    pub actual_bytes: Option<u64>,
+    pub status: ArtifactValidationStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactReportSummary {
+    pub matched: u32,
+    pub missing: u32,
+    pub extra: u32,
+    pub mismatched: u32,
+    pub total_manifest: u32,
+    pub total_extracted: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactReport {
+    pub job_id: String,
+    pub artifact_path: PathBuf,
+    pub extract_path: PathBuf,
+    #[serde(default)]
+    pub manifest_path: Option<PathBuf>,
+    pub hash: String,
+    pub created_at: String,
+    pub summary: ArtifactReportSummary,
+    pub items: Vec<ArtifactValidationItem>,
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub report_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum ArtifactError {
+    Request(reqwest::Error),
+    Io(std::io::Error),
+    Zip(zip::result::ZipError),
+    UnexpectedStatus(StatusCode),
+    InvalidServiceUrl,
+    ManifestMissing,
+    ManifestRead(PathBuf, std::io::Error),
+    ManifestParse(PathBuf, serde_json::Error),
+    TargetDir(PathBuf, std::io::Error),
+    ReportWrite(PathBuf, serde_json::Error),
+}
+
+impl fmt::Display for ArtifactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArtifactError::Request(err) => write!(f, "request error: {}", err),
+            ArtifactError::Io(err) => write!(f, "io error: {}", err),
+            ArtifactError::Zip(err) => write!(f, "zip error: {}", err),
+            ArtifactError::UnexpectedStatus(status) => write!(f, "unexpected status: {}", status),
+            ArtifactError::InvalidServiceUrl => write!(f, "service url is empty"),
+            ArtifactError::ManifestMissing => write!(f, "manifest path not provided"),
+            ArtifactError::ManifestRead(path, err) => {
+                write!(f, "failed to read manifest {}: {}", path.display(), err)
+            }
+            ArtifactError::ManifestParse(path, err) => {
+                write!(f, "failed to parse manifest {}: {}", path.display(), err)
+            }
+            ArtifactError::TargetDir(path, err) => {
+                write!(
+                    f,
+                    "unable to prepare target dir {}: {}",
+                    path.display(),
+                    err
+                )
+            }
+            ArtifactError::ReportWrite(path, err) => {
+                write!(f, "failed to write report {}: {}", path.display(), err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArtifactError {}
+
+impl From<reqwest::Error> for ArtifactError {
+    fn from(value: reqwest::Error) -> Self {
+        ArtifactError::Request(value)
+    }
+}
+
+impl From<std::io::Error> for ArtifactError {
+    fn from(value: std::io::Error) -> Self {
+        ArtifactError::Io(value)
+    }
+}
+
+impl From<zip::result::ZipError> for ArtifactError {
+    fn from(value: zip::result::ZipError) -> Self {
+        ArtifactError::Zip(value)
+    }
 }
 
 impl fmt::Display for JobError {
@@ -821,6 +1040,266 @@ pub fn create_remote_job(options: CreateJobOptions) -> Result<JobSubmission, Job
 
     let submission = response.json::<JobSubmission>()?;
     Ok(submission)
+}
+
+pub fn resume_remote_job(request: JobControlRequest) -> Result<JobStatusSnapshot, JobError> {
+    let url = build_service_endpoint(
+        &request.service_url,
+        &format!("jobs/{}/resume", request.job_id),
+    )?;
+    let client = Client::new();
+    let mut http_request = client.post(url);
+
+    if let Some(token) = request.bearer_token.as_deref() {
+        http_request = http_request.bearer_auth(token);
+    }
+
+    let mut payload = serde_json::Map::new();
+    if let Some(path) = request.input_path.as_ref() {
+        payload.insert("inputPath".to_string(), Value::String(path.clone()));
+    }
+    if let Some(kind) = request.input_type.as_ref() {
+        payload.insert("inputType".to_string(), Value::String(kind.clone()));
+    }
+
+    let response = if payload.is_empty() {
+        http_request.send()?
+    } else {
+        http_request.json(&payload).send()?
+    };
+
+    if !response.status().is_success() {
+        return Err(JobError::UnexpectedStatus(response.status()));
+    }
+
+    let snapshot = response.json::<JobStatusSnapshot>()?;
+    Ok(snapshot)
+}
+
+pub fn cancel_remote_job(request: JobControlRequest) -> Result<JobStatusSnapshot, JobError> {
+    let url = build_service_endpoint(
+        &request.service_url,
+        &format!("jobs/{}/cancel", request.job_id),
+    )?;
+    let client = Client::new();
+    let mut http_request = client.post(url);
+
+    if let Some(token) = request.bearer_token.as_deref() {
+        http_request = http_request.bearer_auth(token);
+    }
+
+    let response = http_request.send()?;
+
+    if !response.status().is_success() {
+        return Err(JobError::UnexpectedStatus(response.status()));
+    }
+
+    let snapshot = response.json::<JobStatusSnapshot>()?;
+    Ok(snapshot)
+}
+
+pub fn download_and_validate_artifact(
+    request: ArtifactDownloadRequest,
+) -> Result<ArtifactReport, ArtifactError> {
+    if request.service_url.trim().is_empty() {
+        return Err(ArtifactError::InvalidServiceUrl);
+    }
+
+    let extract_root = request.target_dir.join(&request.job_id);
+    if extract_root.exists() {
+        fs::remove_dir_all(&extract_root)
+            .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
+    }
+    fs::create_dir_all(&extract_root)
+        .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
+
+    let artifact_url = build_service_endpoint(
+        &request.service_url,
+        &format!("jobs/{}/artifact", request.job_id),
+    )
+    .map_err(|_| ArtifactError::InvalidServiceUrl)?;
+
+    let client = Client::new();
+    let mut http_request = client.get(artifact_url);
+    if let Some(token) = request.bearer_token.as_deref() {
+        http_request = http_request.bearer_auth(token);
+    }
+    if let Some(hash) = request.expected_hash.as_deref() {
+        http_request = http_request.header("If-None-Match", hash);
+    }
+
+    let mut response = http_request.send()?;
+
+    if !response.status().is_success() {
+        return Err(ArtifactError::UnexpectedStatus(response.status()));
+    }
+
+    let mut temp_file = NamedTempFile::new()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        temp_file.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+
+    temp_file.flush()?;
+    let artifact_hash = hex::encode(hasher.finalize());
+
+    let mut archive_reader = File::open(temp_file.path())?;
+    let mut archive = ZipArchive::new(&mut archive_reader)?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let out_path = extract_root.join(entry.mangled_name());
+
+        if entry.name().ends_with('/') {
+            fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut outfile = File::create(&out_path)?;
+        io::copy(&mut entry, &mut outfile)?;
+    }
+
+    let expected_map = if let Some(path) = request.manifest_path.as_ref() {
+        Some(read_manifest_expectations(path)?)
+    } else {
+        None
+    };
+
+    let mut actual_map = collect_directory_digests(&extract_root)?;
+
+    let mut warnings: Vec<String> = Vec::new();
+    if request.manifest_path.is_none() {
+        warnings.push("未提供 manifest，按实际文件生成报告。".to_string());
+    }
+
+    let mut items: Vec<ArtifactValidationItem> = Vec::new();
+    let mut matched = 0u32;
+    let mut missing = 0u32;
+    let mut extra = 0u32;
+    let mut mismatched = 0u32;
+
+    if let Some(mut expected) = expected_map {
+        for (name, expected_digest) in expected.drain() {
+            match actual_map.remove(&name) {
+                Some(actual_digest) => {
+                    if expected_digest.hash == actual_digest.hash {
+                        matched += 1;
+                        items.push(ArtifactValidationItem {
+                            filename: name,
+                            expected_hash: Some(expected_digest.hash),
+                            actual_hash: Some(actual_digest.hash),
+                            expected_bytes: Some(expected_digest.bytes),
+                            actual_bytes: Some(actual_digest.bytes),
+                            status: ArtifactValidationStatus::Matched,
+                        });
+                    } else {
+                        mismatched += 1;
+                        items.push(ArtifactValidationItem {
+                            filename: name,
+                            expected_hash: Some(expected_digest.hash),
+                            actual_hash: Some(actual_digest.hash),
+                            expected_bytes: Some(expected_digest.bytes),
+                            actual_bytes: Some(actual_digest.bytes),
+                            status: ArtifactValidationStatus::Mismatch,
+                        });
+                    }
+                }
+                None => {
+                    missing += 1;
+                    items.push(ArtifactValidationItem {
+                        filename: name,
+                        expected_hash: Some(expected_digest.hash),
+                        actual_hash: None,
+                        expected_bytes: Some(expected_digest.bytes),
+                        actual_bytes: None,
+                        status: ArtifactValidationStatus::Missing,
+                    });
+                }
+            }
+        }
+
+        for (name, actual_digest) in actual_map.drain() {
+            extra += 1;
+            items.push(ArtifactValidationItem {
+                filename: name,
+                expected_hash: None,
+                actual_hash: Some(actual_digest.hash),
+                expected_bytes: None,
+                actual_bytes: Some(actual_digest.bytes),
+                status: ArtifactValidationStatus::Extra,
+            });
+        }
+    } else {
+        for (name, actual_digest) in actual_map.drain() {
+            matched += 1;
+            items.push(ArtifactValidationItem {
+                filename: name,
+                expected_hash: None,
+                actual_hash: Some(actual_digest.hash),
+                expected_bytes: None,
+                actual_bytes: Some(actual_digest.bytes),
+                status: ArtifactValidationStatus::Matched,
+            });
+        }
+    }
+
+    let summary = ArtifactReportSummary {
+        matched,
+        missing,
+        extra,
+        mismatched,
+        total_manifest: (matched + missing + mismatched) as u32,
+        total_extracted: (matched + mismatched + extra) as u32,
+    };
+
+    if missing > 0 {
+        warnings.push(format!("缺少 {} 个文件", missing));
+    }
+    if extra > 0 {
+        warnings.push(format!("存在 {} 个额外文件", extra));
+    }
+    if mismatched > 0 {
+        warnings.push(format!("{} 个文件的哈希不一致", mismatched));
+    }
+
+    let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    let report = ArtifactReport {
+        job_id: request.job_id.clone(),
+        artifact_path: PathBuf::from(request.artifact_path.clone()),
+        extract_path: extract_root.clone(),
+        manifest_path: request.manifest_path.clone(),
+        hash: artifact_hash,
+        created_at,
+        summary,
+        items: items.clone(),
+        warnings: warnings.clone(),
+        report_path: None,
+    };
+
+    let report_path = extract_root.join("artifact-report.json");
+    let mut file = File::create(&report_path)?;
+    serde_json::to_writer_pretty(&mut file, &report)
+        .map_err(|err| ArtifactError::ReportWrite(report_path.clone(), err))?;
+    file.write_all(b"\n")?;
+
+    let mut final_report = report;
+    final_report.report_path = Some(report_path);
+
+    Ok(final_report)
 }
 
 pub fn fetch_job_state(request: JobStatusRequest) -> Result<JobStatusSnapshot, JobError> {
@@ -1018,6 +1497,275 @@ fn collect_sorted_files(directory: &Path) -> Result<Vec<(PathBuf, String)>, Uplo
 
     files.sort_by(|a, b| compare(&a.1, &b.1));
     Ok(files)
+}
+
+#[derive(Debug, Clone)]
+struct FileDigest {
+    bytes: u64,
+    hash: String,
+}
+
+fn read_manifest_expectations(path: &Path) -> Result<HashMap<String, FileDigest>, ArtifactError> {
+    let manifest_dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let file =
+        File::open(path).map_err(|err| ArtifactError::ManifestRead(path.to_path_buf(), err))?;
+    let reader = io::BufReader::new(file);
+
+    #[derive(Deserialize)]
+    struct ManifestEntry {
+        target: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ManifestFileRead {
+        files: Vec<ManifestEntry>,
+    }
+
+    let manifest: ManifestFileRead = serde_json::from_reader(reader)
+        .map_err(|err| ArtifactError::ManifestParse(path.to_path_buf(), err))?;
+
+    let mut expectations = HashMap::new();
+    for entry in manifest.files {
+        let target_path = manifest_dir.join(&entry.target);
+        if !target_path.exists() {
+            continue;
+        }
+        let digest = compute_file_digest(&target_path)?;
+        expectations.insert(entry.target, digest);
+    }
+
+    Ok(expectations)
+}
+
+fn collect_directory_digests(root: &Path) -> Result<HashMap<String, FileDigest>, ArtifactError> {
+    let mut digests = HashMap::new();
+
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.into_path();
+        if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+            let digest = compute_file_digest(&path)?;
+            digests.insert(name.to_string(), digest);
+        }
+    }
+
+    Ok(digests)
+}
+
+fn compute_file_digest(path: &Path) -> Result<FileDigest, ArtifactError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    let mut total = 0u64;
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+
+    let hash = hex::encode(hasher.finalize());
+    Ok(FileDigest { bytes: total, hash })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::MockServer;
+    use serde_json::json;
+    use std::io::Cursor;
+    use std::io::Write;
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
+
+    #[test]
+    fn job_params_payload_defaults() {
+        let params = JobParamsPayload::default();
+        assert_eq!(params.scale, 2);
+        assert_eq!(params.model, "RealESRGAN_x4plus_anime_6B");
+        assert_eq!(params.denoise, "medium");
+        assert_eq!(params.output_format, "jpg");
+        assert_eq!(params.jpeg_quality, 95);
+        assert_eq!(params.tile_size, None);
+        assert_eq!(params.tile_pad, None);
+        assert_eq!(params.batch_size, None);
+        assert_eq!(params.device, "auto");
+    }
+
+    fn build_zip_archive(files: Vec<(&str, &[u8])>) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+        for (name, content) in files {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content).unwrap();
+        }
+
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn download_and_validate_artifact_matches_manifest() {
+        let temp = tempdir().unwrap();
+        let manifest_dir = temp.path().join("manifest");
+        fs::create_dir_all(&manifest_dir).unwrap();
+
+        let expected_path = manifest_dir.join("0001.jpg");
+        fs::write(&expected_path, b"expected").unwrap();
+
+        let manifest_path = manifest_dir.join("manifest.json");
+        let manifest = json!({
+            "files": [
+                {"source": "0001.jpg", "target": "0001.jpg"}
+            ],
+            "skipped": []
+        });
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let zip_bytes = build_zip_archive(vec![("0001.jpg", b"expected")]);
+
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact");
+            then.status(200)
+                .header("content-type", "application/zip")
+                .body(zip_bytes.clone());
+        });
+
+        let request = ArtifactDownloadRequest {
+            service_url: server.base_url(),
+            job_id: "test".to_string(),
+            artifact_path: "artifacts/test.zip".to_string(),
+            target_dir: temp.path().join("output"),
+            bearer_token: None,
+            manifest_path: Some(manifest_path.clone()),
+            expected_hash: None,
+        };
+
+        let report = download_and_validate_artifact(request).expect("report");
+        assert_eq!(report.summary.matched, 1);
+        assert_eq!(report.summary.mismatched, 0);
+        assert_eq!(report.summary.missing, 0);
+        assert_eq!(report.summary.extra, 0);
+    }
+
+    #[test]
+    fn download_and_validate_artifact_detects_mismatch() {
+        let temp = tempdir().unwrap();
+        let manifest_dir = temp.path().join("manifest");
+        fs::create_dir_all(&manifest_dir).unwrap();
+
+        let expected_path = manifest_dir.join("0001.jpg");
+        fs::write(&expected_path, b"expected").unwrap();
+
+        let manifest_path = manifest_dir.join("manifest.json");
+        let manifest = json!({
+            "files": [
+                {"source": "0001.jpg", "target": "0001.jpg"}
+            ],
+            "skipped": []
+        });
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let zip_bytes = build_zip_archive(vec![("0001.jpg", b"different")]);
+
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact");
+            then.status(200)
+                .header("content-type", "application/zip")
+                .body(zip_bytes.clone());
+        });
+
+        let request = ArtifactDownloadRequest {
+            service_url: server.base_url(),
+            job_id: "test".to_string(),
+            artifact_path: "artifacts/test.zip".to_string(),
+            target_dir: temp.path().join("output"),
+            bearer_token: None,
+            manifest_path: Some(manifest_path.clone()),
+            expected_hash: None,
+        };
+
+        let report = download_and_validate_artifact(request).expect("report");
+        assert_eq!(report.summary.mismatched, 1);
+        assert_eq!(report.summary.matched, 0);
+    }
+    #[test]
+    fn resume_remote_job_posts_payload() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/jobs/xyz/resume")
+                .header("authorization", "Bearer secret")
+                .json_body(json!({
+                    "inputPath": "staging/vol1.zip",
+                    "inputType": "zip"
+                }));
+            then.status(200).json_body(json!({
+                "job_id": "xyz",
+                "status": "PENDING",
+                "processed": 0,
+                "total": 0
+            }));
+        });
+
+        let snapshot = resume_remote_job(JobControlRequest {
+            service_url: server.url("/api"),
+            job_id: "xyz".to_string(),
+            bearer_token: Some("secret".to_string()),
+            input_path: Some("staging/vol1.zip".to_string()),
+            input_type: Some("zip".to_string()),
+        })
+        .expect("resume snapshot");
+
+        assert_eq!(snapshot.job_id, "xyz");
+        assert_eq!(snapshot.status, "PENDING");
+        mock.assert();
+    }
+
+    #[test]
+    fn cancel_remote_job_posts_without_payload() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/jobs/xyz/cancel");
+            then.status(200).json_body(json!({
+                "job_id": "xyz",
+                "status": "FAILED",
+                "processed": 0,
+                "total": 0,
+                "message": "Cancelled"
+            }));
+        });
+
+        let snapshot = cancel_remote_job(JobControlRequest {
+            service_url: server.url("/api"),
+            job_id: "xyz".to_string(),
+            bearer_token: None,
+            input_path: None,
+            input_type: None,
+        })
+        .expect("cancel snapshot");
+
+        assert_eq!(snapshot.status, "FAILED");
+        assert_eq!(snapshot.job_id, "xyz");
+        mock.assert();
+    }
+
 }
 
 fn upload_as_zip(

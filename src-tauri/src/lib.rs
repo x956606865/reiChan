@@ -177,6 +177,23 @@ async fn watch_manga_job(
     Ok(())
 }
 
+#[tauri::command]
+fn resume_manga_job(request: manga::JobControlRequest) -> Result<manga::JobStatusSnapshot, String> {
+    manga::resume_remote_job(request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn cancel_manga_job(request: manga::JobControlRequest) -> Result<manga::JobStatusSnapshot, String> {
+    manga::cancel_remote_job(request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn download_manga_artifact(
+    request: manga::ArtifactDownloadRequest,
+) -> Result<manga::ArtifactReport, String> {
+    manga::download_and_validate_artifact(request).map_err(|err| err.to_string())
+}
+
 fn collect_ports() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -730,7 +747,10 @@ pub fn run() {
             upload_copyparty,
             create_manga_job,
             fetch_manga_job_status,
-            watch_manga_job
+            watch_manga_job,
+            resume_manga_job,
+            cancel_manga_job,
+            download_manga_artifact
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

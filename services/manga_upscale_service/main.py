@@ -12,6 +12,7 @@ the artifact path. Real model invocation (PyTorch / ONNX / NCNN) will replace
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import uuid
 import zipfile
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Literal, Optional, Set
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -42,6 +43,12 @@ class JobParams(BaseModel):
         description="Model identifier to load on the worker",
     )
     denoise: Literal["low", "medium", "high"] = Field(default="medium")
+    output_format: Literal["jpg", "png", "webp"] = Field(default="jpg")
+    jpeg_quality: int = Field(default=95, ge=1, le=100)
+    tile_size: Optional[int] = Field(default=None, ge=32, le=1024)
+    tile_pad: Optional[int] = Field(default=None, ge=0, le=128)
+    batch_size: Optional[int] = Field(default=None, ge=1, le=16)
+    device: Literal["auto", "cuda", "cpu"] = Field(default="auto")
 
 
 class JobCreate(BaseModel):
@@ -57,6 +64,11 @@ class JobSubmitted(BaseModel):
     job_id: str
 
 
+class JobResumePayload(BaseModel):
+    inputPath: Optional[str] = None
+    inputType: Optional[str] = None
+
+
 class JobState(BaseModel):
     job_id: str
     status: JobStatus
@@ -64,6 +76,11 @@ class JobState(BaseModel):
     total: int
     artifact_path: Optional[str] = None
     message: Optional[str] = None
+    retries: int = 0
+    last_error: Optional[str] = None
+    artifact_hash: Optional[str] = None
+    params: Optional[JobParams] = None
+    metadata: Optional[dict[str, Optional[str]]] = None
 
 
 @dataclass
@@ -74,6 +91,10 @@ class JobRecord:
     total: int = 0
     artifact_path: Optional[str] = None
     message: Optional[str] = None
+    retries: int = 0
+    last_error: Optional[str] = None
+    artifact_hash: Optional[str] = None
+    report_path: Optional[Path] = None
 
 
 app = FastAPI(title="Manga Upscale Service", version="0.1.0")
@@ -146,8 +167,58 @@ async def get_job(job_id: str) -> JobState:
     return state
 
 
+@app.post("/jobs/{job_id}/resume", response_model=JobState)
+async def resume_job(job_id: str, payload: JobResumePayload | None = None) -> JobState:
+    async with jobs_lock:
+        record = jobs.get(job_id)
+
+        if record is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if record.status == "RUNNING":
+            return _build_state(job_id, record)
+
+        record.retries += 1
+        record.status = "PENDING"
+        record.message = None
+        record.last_error = None
+        record.processed = 0
+        record.artifact_path = None
+        record.artifact_hash = None
+        record.report_path = None
+
+        if payload and payload.inputPath:
+            record.payload.input.path = payload.inputPath
+        if payload and payload.inputType:
+            record.payload.input.type = payload.inputType
+
+    await _broadcast(job_id)
+    asyncio.create_task(_run_job(job_id))
+    state = await _snapshot(job_id)
+    assert state is not None
+    return state
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=JobState)
+async def cancel_job(job_id: str) -> JobState:
+    async with jobs_lock:
+        record = jobs.get(job_id)
+
+        if record is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        record.status = "FAILED"
+        record.message = "Cancelled by user"
+        record.last_error = record.message
+
+    await _broadcast(job_id)
+    state = await _snapshot(job_id)
+    assert state is not None
+    return state
+
+
 @app.get("/jobs/{job_id}/artifact")
-async def get_artifact(job_id: str) -> FileResponse:
+async def get_artifact(job_id: str, request: Request):
     async with jobs_lock:
         record = jobs.get(job_id)
 
@@ -166,11 +237,40 @@ async def get_artifact(job_id: str) -> FileResponse:
     if not artifact_path.exists():
         raise HTTPException(status_code=410, detail="Artifact missing")
 
+    etag = record.artifact_hash or _hash_file(artifact_path)
+
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and etag and if_none_match == etag:
+        return Response(status_code=304)
+
+    record.artifact_hash = etag
+
+    headers = {"ETag": etag} if etag else None
     return FileResponse(
         artifact_path,
         media_type="application/zip",
         filename=artifact_path.name,
+        headers=headers,
     )
+
+
+@app.get("/jobs/{job_id}/report")
+async def get_report(job_id: str) -> dict[str, object]:
+    async with jobs_lock:
+        record = jobs.get(job_id)
+
+    if record is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "jobId": job_id,
+        "status": record.status,
+        "artifactPath": record.artifact_path,
+        "artifactHash": record.artifact_hash,
+        "retries": record.retries,
+        "lastError": record.last_error,
+        "message": record.message,
+    }
 
 
 @app.websocket("/ws/jobs/{job_id}")
@@ -203,6 +303,10 @@ async def _run_job(job_id: str) -> None:
 
             total = await _job_total(job_id)
             for step in range(1, total + 1):
+                async with jobs_lock:
+                    record = jobs.get(job_id)
+                    if record is None or record.status != "RUNNING":
+                        return
                 await simulate_execution(job_id, step)
 
             await _mark_success(job_id)
@@ -222,6 +326,12 @@ async def _mark_running(job_id: str) -> None:
             raise RuntimeError(f"Job {job_id} disappeared")
         record.status = "RUNNING"
         record.total = max(record.total, 8)
+        record.message = None
+        record.last_error = None
+        record.processed = 0
+        record.artifact_path = None
+        record.artifact_hash = None
+        record.report_path = None
     await _broadcast(job_id)
 
 async def _job_total(job_id: str) -> int:
@@ -240,6 +350,9 @@ async def _mark_success(job_id: str) -> None:
             record.processed = record.total
             record.artifact_path = _ensure_artifact(record.payload, job_id, record.total)
             record.message = None
+            record.last_error = None
+            artifact_full = (STORAGE_ROOT / record.artifact_path).resolve()
+            record.artifact_hash = _hash_file(artifact_full)
     await _broadcast(job_id)
 
 
@@ -249,6 +362,7 @@ async def _mark_failed(job_id: str, message: str) -> None:
         if record:
             record.status = "FAILED"
             record.message = message
+            record.last_error = message
     await _broadcast(job_id)
 
 
@@ -311,6 +425,14 @@ def _build_state(job_id: str, record: JobRecord) -> JobState:
         total=record.total,
         artifact_path=record.artifact_path,
         message=record.message,
+        retries=record.retries,
+        last_error=record.last_error,
+        artifact_hash=record.artifact_hash,
+        params=record.payload.params,
+        metadata={
+            "title": record.payload.title,
+            "volume": record.payload.volume,
+        },
     )
 
 
@@ -330,6 +452,16 @@ def _ensure_artifact(payload: JobCreate, job_id: str, processed: int) -> str:
             archive.writestr("SUMMARY.txt", summary)
 
     return artifact_path.relative_to(STORAGE_ROOT).as_posix()
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8192), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _slug(value: str) -> str:
