@@ -39,6 +39,7 @@ walkdir = "2"
 tempfile = "3.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff", "webp", "ico"] }
 imageproc = { version = "0.24", default-features = false }
+opencv = "0.94" 
 
 [dev-dependencies]
 httpmock = "0.7"

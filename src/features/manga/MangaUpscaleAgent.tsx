@@ -32,6 +32,28 @@ type RenameSplitSummary = {
 
 type SplitMode = "skip" | "cover-trim" | "split" | "fallback-center";
 
+type SplitBoundingBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type SplitMetadata = {
+  foreground_ratio?: number;
+  bbox?: SplitBoundingBox;
+  projection_imbalance?: number;
+  projection_edge_margin?: number;
+  projection_total_mass?: number;
+  splitMode?: SplitMode;
+  split_x?: number;
+  confidence?: number;
+  content_width_ratio?: number;
+  bbox_height_ratio?: number;
+  reason?: string;
+  split_clamped?: boolean;
+};
+
 type SplitItemReport = {
   source: string;
   mode: SplitMode;
@@ -39,7 +61,7 @@ type SplitItemReport = {
   confidence: number;
   contentWidthRatio: number;
   outputs: string[];
-  metadata: Record<string, unknown>;
+  metadata: SplitMetadata;
 };
 
 type SplitCommandOutcome = {

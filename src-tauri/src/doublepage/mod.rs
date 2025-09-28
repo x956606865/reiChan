@@ -8,8 +8,20 @@ use std::thread;
 
 use chrono::{SecondsFormat, Utc};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Luma};
-use imageproc::contrast::{equalize_histogram, otsu_level};
 use serde::{Deserialize, Serialize};
+
+mod config;
+pub use config::SplitConfig;
+
+mod mask;
+pub use mask::build_foreground_mask;
+use mask::BoundingBox;
+
+mod projection;
+use projection::analyze_projection;
+
+mod regions;
+use regions::{compute_region_bbox, crop_region_with_padding, RegionBounds};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +48,8 @@ pub struct SplitThresholdOverrides {
     pub min_foreground_ratio: Option<f32>,
     #[serde(default)]
     pub padding_ratio: Option<f32>,
+    #[serde(default)]
+    pub max_center_offset_ratio: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,10 +108,10 @@ pub struct SplitItemReport {
     pub confidence: f32,
     pub content_width_ratio: f32,
     pub outputs: Vec<PathBuf>,
-    pub metadata: serde_json::Value,
+    pub metadata: SplitMetadata,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SplitMode {
     Skip,
@@ -106,47 +120,70 @@ pub enum SplitMode {
     FallbackCenter,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SplitThresholds {
-    pub min_aspect_ratio: f32,
-    pub padding_ratio: f32,
-    pub confidence_threshold: f32,
-    pub cover_content_ratio: f32,
-    pub edge_exclusion_ratio: f32,
-    pub min_foreground_ratio: f32,
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitBoundingBox {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
-impl Default for SplitThresholds {
-    fn default() -> Self {
+impl From<BoundingBox> for SplitBoundingBox {
+    fn from(bbox: BoundingBox) -> Self {
         Self {
-            min_aspect_ratio: 1.2,
-            padding_ratio: 0.015,
-            confidence_threshold: 0.1,
-            cover_content_ratio: 0.45,
-            edge_exclusion_ratio: 0.12,
-            min_foreground_ratio: 0.01,
+            x: bbox.x0,
+            y: bbox.y0,
+            width: bbox.width(),
+            height: bbox.height(),
         }
     }
 }
 
-impl SplitThresholds {
-    pub fn with_overrides(self, overrides: &SplitThresholdOverrides) -> Self {
-        Self {
-            cover_content_ratio: overrides
-                .cover_content_ratio
-                .unwrap_or(self.cover_content_ratio),
-            confidence_threshold: overrides
-                .confidence_threshold
-                .unwrap_or(self.confidence_threshold),
-            edge_exclusion_ratio: overrides
-                .edge_exclusion_ratio
-                .unwrap_or(self.edge_exclusion_ratio),
-            min_foreground_ratio: overrides
-                .min_foreground_ratio
-                .unwrap_or(self.min_foreground_ratio),
-            padding_ratio: overrides.padding_ratio.unwrap_or(self.padding_ratio),
-            ..self
-        }
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SplitMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<SplitBoundingBox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_imbalance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_edge_margin: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_total_mass: Option<f32>,
+    #[serde(rename = "splitMode", skip_serializing_if = "Option::is_none")]
+    pub split_mode: Option<SplitMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_x: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_width_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox_height_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_clamped: Option<bool>,
+}
+
+impl SplitMetadata {
+    fn with_reason(reason: &'static str) -> Self {
+        let mut metadata = SplitMetadata::default();
+        metadata.reason = Some(reason.to_string());
+        metadata
+    }
+
+    fn with_foreground(mut self, ratio: f32) -> Self {
+        self.foreground_ratio = Some(ratio);
+        self
+    }
+
+    fn with_bbox(mut self, bbox: BoundingBox) -> Self {
+        self.bbox = Some(bbox.into());
+        self
     }
 }
 
@@ -219,10 +256,10 @@ fn prepare_split_internal<'a>(
         return Err(SplitError::DirectoryNotFound(directory));
     }
 
-    let thresholds = if let Some(overrides) = thresholds_override.as_ref() {
-        SplitThresholds::default().with_overrides(overrides)
+    let config = if let Some(overrides) = thresholds_override.as_ref() {
+        SplitConfig::default().with_overrides(overrides)
     } else {
-        SplitThresholds::default()
+        SplitConfig::default()
     };
 
     let mut entries: Vec<PathBuf> = Vec::new();
@@ -269,7 +306,7 @@ fn prepare_split_internal<'a>(
         Arc::new(Mutex::new(Vec::with_capacity(total_files)));
     let progress_state: Arc<(Mutex<BTreeMap<usize, PathBuf>>, Condvar)> =
         Arc::new((Mutex::new(BTreeMap::new()), Condvar::new()));
-    let thresholds_for_workers = thresholds;
+    let config_for_workers = config;
     let workspace_for_workers = workspace_directory.clone();
     let results_handle = Arc::clone(&results);
     let progress_handle = Arc::clone(&progress_state);
@@ -295,7 +332,7 @@ fn prepare_split_internal<'a>(
 
                 let path = entries[index].clone();
                 let workspace_entry = worker_workspace.as_ref().map(Arc::clone);
-                let outcome = process_entry(index, path, thresholds_for_workers, workspace_entry);
+                let outcome = process_entry(index, path, config_for_workers, workspace_entry);
 
                 {
                     let (lock, cvar) = &*progress_tracker;
@@ -428,7 +465,7 @@ fn emit_progress(callback: &mut Option<&mut dyn FnMut(SplitProgress)>, payload: 
 fn process_entry(
     index: usize,
     path: PathBuf,
-    thresholds: SplitThresholds,
+    config: SplitConfig,
     workspace: Option<Arc<PathBuf>>,
 ) -> FileOutcome {
     let mut warnings: Vec<String> = Vec::new();
@@ -460,8 +497,11 @@ fn process_entry(
         }
     };
 
-    match process_image(&image, &path, thresholds) {
-        ProcessResult::Skip(meta) => {
+    match process_image(&image, &path, config) {
+        ProcessResult::Skip {
+            content_width_ratio,
+            metadata,
+        } => {
             skipped_files += 1;
             let outputs = if let Some(dir) = workspace_path {
                 let target = dir.join(path.file_name().unwrap());
@@ -488,12 +528,16 @@ fn process_entry(
                 mode: SplitMode::Skip,
                 split_x: None,
                 confidence: 0.0,
-                content_width_ratio: meta.content_width_ratio,
+                content_width_ratio,
                 outputs,
-                metadata: meta.into_metadata_json(),
+                metadata,
             });
         }
-        ProcessResult::CoverTrim { image: cover, meta } => {
+        ProcessResult::CoverTrim {
+            image: cover,
+            content_width_ratio,
+            meta,
+        } => {
             cover_trims += 1;
             let (outputs, emitted) = if let Some(dir) = workspace_path {
                 let filename = format!(
@@ -520,9 +564,9 @@ fn process_entry(
                 mode: SplitMode::CoverTrim,
                 split_x: None,
                 confidence: 1.0,
-                content_width_ratio: meta.content_width_ratio,
+                content_width_ratio,
                 outputs,
-                metadata: meta.into_metadata_json(),
+                metadata: meta,
             });
         }
         ProcessResult::Split {
@@ -612,24 +656,15 @@ fn create_workspace(directory: &Path, overwrite: bool) -> Result<PathBuf, SplitE
     Ok(workspace)
 }
 
-struct SkipMeta {
-    content_width_ratio: f32,
-}
-
-impl SkipMeta {
-    fn into_metadata_json(self) -> serde_json::Value {
-        serde_json::json!({
-            "contentWidthRatio": self.content_width_ratio,
-            "splitMode": "skip",
-        })
-    }
-}
-
 enum ProcessResult {
-    Skip(SkipMeta),
+    Skip {
+        content_width_ratio: f32,
+        metadata: SplitMetadata,
+    },
     CoverTrim {
         image: DynamicImage,
-        meta: CoverMeta,
+        content_width_ratio: f32,
+        meta: SplitMetadata,
     },
     Split {
         left: DynamicImage,
@@ -637,260 +672,185 @@ enum ProcessResult {
         split_x: u32,
         confidence: f32,
         content_width_ratio: f32,
-        meta: serde_json::Value,
+        meta: SplitMetadata,
         fallback: bool,
     },
 }
 
-struct CoverMeta {
-    content_width_ratio: f32,
-    bbox_height_ratio: f32,
-}
-
-impl CoverMeta {
-    fn into_metadata_json(self) -> serde_json::Value {
-        serde_json::json!({
-            "splitMode": "cover-trim",
-            "contentWidthRatio": self.content_width_ratio,
-            "bboxHeightRatio": self.bbox_height_ratio,
-        })
-    }
-}
-
-#[allow(unused_variables)]
-fn process_image(image: &DynamicImage, path: &Path, thresholds: SplitThresholds) -> ProcessResult {
+fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> ProcessResult {
     let (width, height) = image.dimensions();
     if width < height {
-        return ProcessResult::Skip(SkipMeta {
+        return ProcessResult::Skip {
             content_width_ratio: 0.0,
-        });
-    }
-
-    let aspect_ratio = width as f32 / height as f32;
-    if aspect_ratio < thresholds.min_aspect_ratio {
-        return ProcessResult::Skip(SkipMeta {
-            content_width_ratio: 0.0,
-        });
-    }
-
-    let gray = image.to_luma8();
-    let equalized = equalize_histogram(&gray);
-    let threshold_level = otsu_level(&equalized);
-
-    let binary: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
-        if equalized.get_pixel(x, y)[0] <= threshold_level {
-            Luma([255])
-        } else {
-            Luma([0])
-        }
-    });
-
-    let mut bbox: Option<(u32, u32, u32, u32)> = None;
-    let mut foreground_pixels = 0usize;
-    for (x, y, pixel) in binary.enumerate_pixels() {
-        if pixel[0] > 0 {
-            foreground_pixels += 1;
-            bbox = Some(match bbox {
-                None => (x, y, x, y),
-                Some((min_x, min_y, max_x, max_y)) => {
-                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
-                }
-            });
-        }
-    }
-
-    if foreground_pixels == 0 {
-        return ProcessResult::Skip(SkipMeta {
-            content_width_ratio: 0.0,
-        });
-    }
-
-    let content_width_ratio;
-    let bbox_height_ratio;
-    let bbox_cast;
-    if let Some((min_x, min_y, max_x, max_y)) = bbox {
-        let bbox_width = (max_x - min_x + 1) as f32;
-        content_width_ratio = bbox_width / width as f32;
-        bbox_height_ratio = (max_y - min_y + 1) as f32 / height as f32;
-        bbox_cast = (min_x, min_y, max_x, max_y);
-    } else {
-        return ProcessResult::Skip(SkipMeta {
-            content_width_ratio: 0.0,
-        });
-    }
-
-    let foreground_ratio = foreground_pixels as f32 / (width * height) as f32;
-    if foreground_ratio < thresholds.min_foreground_ratio {
-        return ProcessResult::Skip(SkipMeta {
-            content_width_ratio,
-        });
-    }
-
-    if content_width_ratio < thresholds.cover_content_ratio && bbox_height_ratio > 0.8 {
-        let padding_x = (thresholds.padding_ratio * width as f32).max(1.0) as u32;
-        let padding_y = (thresholds.padding_ratio * height as f32).max(1.0) as u32;
-        let crop = crop_with_padding(image, bbox_cast, padding_x, padding_y);
-
-        return ProcessResult::CoverTrim {
-            image: crop,
-            meta: CoverMeta {
-                content_width_ratio,
-                bbox_height_ratio,
-            },
+            metadata: SplitMetadata::with_reason("aspect_ratio"),
         };
     }
 
-    let split_info = locate_split(&binary, thresholds);
-    let (split_x, confidence, fallback, projection_meta) = split_info;
-    let padding_x = (thresholds.padding_ratio * width as f32).max(1.0) as u32;
+    let aspect_ratio = width as f32 / height as f32;
+    if aspect_ratio < config.min_aspect_ratio {
+        return ProcessResult::Skip {
+            content_width_ratio: 0.0,
+            metadata: SplitMetadata::with_reason("aspect_ratio"),
+        };
+    }
 
-    let actual_split_x = split_x.unwrap_or(width / 2).clamp(1, width - 1);
+    let mask_result = match build_foreground_mask(image) {
+        Ok(result) => result,
+        Err(_err) => {
+            return ProcessResult::Skip {
+                content_width_ratio: 0.0,
+                metadata: SplitMetadata::with_reason("mask_error"),
+            };
+        }
+    };
 
-    let (right, left) = extract_pages(image, actual_split_x, padding_x);
+    let mask = mask_result.mask;
+    let foreground_ratio = mask_result.foreground_ratio;
+
+    let bbox = match mask_result.bounding_box {
+        Some(value) => value,
+        None => {
+            return ProcessResult::Skip {
+                content_width_ratio: 0.0,
+                metadata: SplitMetadata::with_reason("no_foreground")
+                    .with_foreground(foreground_ratio),
+            };
+        }
+    };
+
+    let content_width_ratio = bbox.width() as f32 / width as f32;
+    let bbox_height_ratio = bbox.height() as f32 / height as f32;
+
+    if foreground_ratio < config.min_foreground_ratio {
+        return ProcessResult::Skip {
+            content_width_ratio,
+            metadata: SplitMetadata::with_reason("no_foreground").with_foreground(foreground_ratio),
+        };
+    }
+
+    let padding_x = (config.padding_ratio * width as f32).max(1.0) as u32;
+    let padding_y = (config.padding_ratio * height as f32).max(1.0) as u32;
+
+    let mut base_metadata = SplitMetadata::default()
+        .with_foreground(foreground_ratio)
+        .with_bbox(bbox);
+    base_metadata.content_width_ratio = Some(content_width_ratio);
+
+    if content_width_ratio < config.cover_content_ratio && bbox_height_ratio > 0.8 {
+        let region_bounds = RegionBounds { bbox };
+        let crop = crop_region_with_padding(image, &region_bounds, padding_x, padding_y);
+
+        let mut cover_metadata = base_metadata.clone();
+        cover_metadata.split_mode = Some(SplitMode::CoverTrim);
+        cover_metadata.bbox_height_ratio = Some(bbox_height_ratio);
+
+        return ProcessResult::CoverTrim {
+            image: crop,
+            content_width_ratio,
+            meta: cover_metadata,
+        };
+    }
+
+    let (split_x, confidence, fallback, projection_stats) = locate_split(&mask, config);
+
+    let mut fallback_required = fallback || split_x.is_none();
+    let normalized_split_x = split_x.unwrap_or(width / 2);
+    let safe_split_x = normalized_split_x.clamp(1, width.saturating_sub(1).max(1));
+
+    let (clamped_candidate, clamped) =
+        clamp_split_to_center(safe_split_x, width, config.max_center_offset_ratio);
+
+    let mut final_split_x = if clamped {
+        (width / 2).clamp(1, width.saturating_sub(1).max(1))
+    } else {
+        clamped_candidate
+    };
+
+    final_split_x = final_split_x.clamp(1, width.saturating_sub(1).max(1));
+    if clamped {
+        fallback_required = true;
+    }
+
+    let effective_confidence = if fallback_required { 0.0 } else { confidence };
+
+    let mut split_metadata = base_metadata;
+    split_metadata.split_mode = Some(if fallback_required {
+        SplitMode::FallbackCenter
+    } else {
+        SplitMode::Split
+    });
+    split_metadata.confidence = Some(effective_confidence);
+    split_metadata.projection_imbalance = Some(projection_stats.imbalance);
+    split_metadata.projection_edge_margin = Some(projection_stats.edge_margin);
+    split_metadata.projection_total_mass = Some(projection_stats.total_mass);
+    if clamped {
+        split_metadata.split_clamped = Some(true);
+    }
+    split_metadata.split_x = Some(final_split_x);
+
+    let right_region = compute_region_bbox(&mask, final_split_x, width);
+    let left_region = compute_region_bbox(&mask, 0, final_split_x);
+
+    let right = crop_region_with_padding(image, &right_region, padding_x, padding_y);
+    let left = crop_region_with_padding(image, &left_region, padding_x, padding_y);
 
     ProcessResult::Split {
         left,
         right,
-        split_x: actual_split_x,
-        confidence,
+        split_x: final_split_x,
+        confidence: effective_confidence,
         content_width_ratio,
-        meta: projection_meta,
-        fallback,
+        meta: split_metadata,
+        fallback: fallback_required,
     }
-}
-
-fn crop_with_padding(
-    image: &DynamicImage,
-    bbox: (u32, u32, u32, u32),
-    padding_x: u32,
-    padding_y: u32,
-) -> DynamicImage {
-    let (width, height) = image.dimensions();
-    let (min_x, min_y, max_x, max_y) = bbox;
-
-    let x0 = min_x.saturating_sub(padding_x).min(width - 1);
-    let y0 = min_y.saturating_sub(padding_y).min(height - 1);
-    let x1 = (max_x + padding_x + 1).min(width);
-    let y1 = (max_y + padding_y + 1).min(height);
-
-    image.crop_imm(x0, y0, x1 - x0, y1 - y0)
 }
 
 fn locate_split(
     mask: &ImageBuffer<Luma<u8>, Vec<u8>>,
-    thresholds: SplitThresholds,
-) -> (Option<u32>, f32, bool, serde_json::Value) {
-    let (width, _height) = mask.dimensions();
-    let width_usize = width as usize;
+    config: SplitConfig,
+) -> (Option<u32>, f32, bool, ProjectionStats) {
+    let outcome = analyze_projection(mask, config);
+    let fallback = outcome.split_x.is_none() || outcome.confidence < config.confidence_threshold;
 
-    let mut projection: Vec<f32> = vec![0.0; width_usize];
-    for (x, _, pixel) in mask.enumerate_pixels() {
-        if pixel[0] > 0 {
-            projection[x as usize] += 1.0;
-        }
+    (
+        outcome.split_x,
+        outcome.confidence,
+        fallback,
+        ProjectionStats {
+            imbalance: outcome.imbalance,
+            edge_margin: outcome.edge_margin,
+            total_mass: outcome.total_mass,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionStats {
+    imbalance: f32,
+    edge_margin: u32,
+    total_mass: f32,
+}
+
+fn clamp_split_to_center(split_x: u32, width: u32, max_ratio: f32) -> (u32, bool) {
+    if width <= 1 {
+        return (0, false);
     }
 
-    if projection.iter().all(|&value| value == 0.0) {
-        return (
-            None,
-            0.0,
-            true,
-            serde_json::json!({ "splitMode": "no-foreground" }),
-        );
-    }
+    let normalized_ratio = max_ratio.clamp(0.0, 0.5);
+    let center = width as f32 / 2.0;
+    let max_offset = (width as f32 * normalized_ratio).max(1.0);
+    let offset = split_x as f32 - center;
 
-    let kernel_radius = (width as f32 * 0.01).max(3.0) as usize;
-    let smooth = smooth_projection(&projection, kernel_radius);
-    let total: f32 = smooth.iter().sum();
-    let mean = total / width as f32;
-
-    let edge_margin = (width as f32 * thresholds.edge_exclusion_ratio).max(4.0) as usize;
-    let start = edge_margin.min(width_usize - 2);
-    let end = width_usize.saturating_sub(edge_margin).max(start + 2);
-
-    let mut prefix: Vec<f32> = Vec::with_capacity(width_usize + 1);
-    prefix.push(0.0);
-    for value in smooth.iter() {
-        let last = *prefix.last().unwrap();
-        prefix.push(last + value);
-    }
-
-    let mut best_index = None;
-    let mut best_score = f32::MAX;
-    let mut best_value = 0.0f32;
-
-    for idx in start..end {
-        let left = prefix[idx];
-        let right = total - left;
-        if left == 0.0 || right == 0.0 {
-            continue;
-        }
-        let balance = (left - right).abs() / total.max(f32::EPSILON);
-        let valley = smooth[idx];
-        let score = valley * (1.0 + balance * 1.8);
-        if score < best_score {
-            best_score = score;
-            best_index = Some(idx);
-            best_value = valley;
-        }
-    }
-
-    let split_index = best_index.map(|idx| idx as u32);
-    let confidence = if mean == 0.0 {
-        0.0
+    if offset.abs() > max_offset {
+        let candidate = center + offset.signum() * max_offset;
+        let clamped = candidate
+            .round()
+            .clamp(1.0, (width.saturating_sub(1).max(1)) as f32) as u32;
+        (clamped, true)
     } else {
-        ((mean - best_value).max(0.0) / mean.max(f32::EPSILON)).clamp(0.0, 1.0)
-    };
-
-    let fallback = confidence < thresholds.confidence_threshold;
-    let meta = serde_json::json!({
-        "splitMode": if fallback { "fallback-center" } else { "content-aware" },
-        "confidence": confidence,
-        "projectionMean": mean,
-        "projectionValue": best_value,
-        "edgeMargin": edge_margin,
-        "index": split_index,
-    });
-
-    (split_index, confidence, fallback, meta)
-}
-
-fn smooth_projection(projection: &[f32], radius: usize) -> Vec<f32> {
-    let len = projection.len();
-    if len == 0 || radius == 0 {
-        return projection.to_vec();
+        let clamped = split_x.clamp(1, width.saturating_sub(1).max(1));
+        (clamped, false)
     }
-    let window = radius * 2 + 1;
-    let mut output = vec![0.0f32; len];
-    let mut sum = 0.0f32;
-    for i in 0..len + radius {
-        if i < len {
-            sum += projection[i];
-        }
-        if i >= window {
-            sum -= projection[i - window];
-        }
-        if i >= radius {
-            let idx = i - radius;
-            if idx < len {
-                output[idx] = sum / window as f32;
-            }
-        }
-    }
-    output
-}
-
-fn extract_pages(
-    image: &DynamicImage,
-    split_x: u32,
-    padding_x: u32,
-) -> (DynamicImage, DynamicImage) {
-    let (width, height) = image.dimensions();
-    let right_start = split_x.saturating_sub(padding_x).min(width - 1);
-    let left_end = split_x + padding_x;
-    let right = image.crop_imm(right_start, 0, width - right_start, height);
-    let left = image.crop_imm(0, 0, left_end.min(width), height);
-    (right, left)
 }
 
 fn save_image(image: &DynamicImage, target: &Path) -> Result<(), SplitError> {
@@ -926,7 +886,7 @@ pub fn estimate_split_candidates(directory: &Path) -> Result<SplitDetectionSumma
             continue;
         };
         let (width, height) = dimensions;
-        if width as f32 >= height as f32 * SplitThresholds::default().min_aspect_ratio {
+        if width as f32 >= height as f32 * SplitConfig::default().min_aspect_ratio {
             candidates += 1;
         }
     }
@@ -944,8 +904,9 @@ pub struct SplitDetectionSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::DynamicImage;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -988,6 +949,19 @@ mod tests {
         if let Some(report_path) = &outcome.report_path {
             assert!(report_path.exists());
         }
+
+        let split_item = outcome
+            .items
+            .iter()
+            .find(|item| item.mode == SplitMode::Split)
+            .expect("split item expected");
+        assert_eq!(split_item.metadata.split_mode, Some(SplitMode::Split));
+        assert!(split_item.metadata.bbox.is_some());
+        let metadata_ratio = split_item
+            .metadata
+            .content_width_ratio
+            .expect("metadata content width ratio");
+        assert!((metadata_ratio - split_item.content_width_ratio).abs() < 1e-5);
     }
 
     #[test]
@@ -1073,6 +1047,14 @@ mod tests {
         assert_eq!(outcome.cover_trims, 1);
         assert_eq!(outcome.emitted_files, 1);
         assert!(workspace.join("cover_layout_cover.png").exists());
+
+        let cover_item = outcome
+            .items
+            .iter()
+            .find(|item| item.mode == SplitMode::CoverTrim)
+            .expect("cover trim item expected");
+        assert_eq!(cover_item.metadata.split_mode, Some(SplitMode::CoverTrim));
+        assert!(cover_item.metadata.bbox_height_ratio.unwrap_or_default() > 0.8);
     }
 
     #[test]
@@ -1092,5 +1074,86 @@ mod tests {
         let summary = estimate_split_candidates(temp.path()).expect("estimate");
         assert_eq!(summary.total, fixtures.len());
         assert!(summary.candidates >= 2);
+    }
+
+    #[test]
+    fn projection_aligns_with_python_reference_for_story_sample() {
+        let fixture = image::open(fixture_path("double_page_story.png")).expect("load fixture");
+        let mask = build_foreground_mask(&fixture).expect("mask computation");
+
+        let (split_x, confidence, fallback, stats) =
+            locate_split(&mask.mask, SplitConfig::default());
+
+        let split_x = split_x.expect("content-aware split expected");
+        assert!(!fallback, "double page story should not fallback");
+        assert!(
+            (split_x as i32 - 460).abs() <= 5,
+            "unexpected split position"
+        );
+        assert!(
+            confidence >= 0.9,
+            "confidence should be high for aligned sample"
+        );
+        assert!(stats.imbalance >= 0.0);
+        assert_eq!(stats.edge_margin, 115);
+        assert!(stats.total_mass > 0.0);
+    }
+
+    #[test]
+    fn projection_signals_fallback_for_dense_panorama() {
+        let fixture = image::open(fixture_path("panorama_dense.png")).expect("load fixture");
+        let mask = build_foreground_mask(&fixture).expect("mask computation");
+
+        let (split_x, confidence, fallback, _stats) =
+            locate_split(&mask.mask, SplitConfig::default());
+
+        let split_x_val = split_x.unwrap_or(0);
+        assert!(fallback, "dense panorama should fallback to center");
+        assert!(
+            (split_x_val as i32 - 500).abs() <= 5,
+            "fallback split should be near center"
+        );
+        assert!(confidence <= 0.1, "confidence should stay low on fallback");
+    }
+
+    #[test]
+    fn skip_metadata_serializes_without_split_mode() {
+        let metadata = SplitMetadata::with_reason("aspect_ratio");
+        let value = serde_json::to_value(&metadata).expect("serialize skip metadata");
+        assert!(value.get("splitMode").is_none());
+        assert_eq!(
+            value.get("reason").and_then(|val| val.as_str()),
+            Some("aspect_ratio")
+        );
+    }
+
+    #[test]
+    fn tall_image_skip_has_reason_aspect_ratio() {
+        let buffer = image::ImageBuffer::from_pixel(400, 900, image::Rgb([255u8, 255, 255]));
+        let image = DynamicImage::ImageRgb8(buffer);
+        let outcome = super::process_image(&image, Path::new("dummy.png"), SplitConfig::default());
+
+        match outcome {
+            super::ProcessResult::Skip { metadata, .. } => {
+                assert_eq!(metadata.reason.as_deref(), Some("aspect_ratio"));
+                assert!(metadata.split_mode.is_none());
+            }
+            _ => panic!("expected skip outcome for tall image"),
+        }
+    }
+
+    #[test]
+    fn clamp_split_to_center_enforces_max_offset() {
+        let width = 1920;
+        let (clamped, was_clamped) = super::clamp_split_to_center(500, width, 0.12);
+        assert!(was_clamped);
+        let center = width as f32 / 2.0;
+        let max_offset = width as f32 * 0.12;
+        let offset = clamped as f32 - center;
+        assert!(offset.abs() <= max_offset + 1.0);
+
+        let (unchanged, not_clamped) = super::clamp_split_to_center(900, width, 0.12);
+        assert!(!not_clamped);
+        assert_eq!(unchanged, 900);
     }
 }
