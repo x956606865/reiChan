@@ -3,12 +3,20 @@ name = "manga-upscale-service"
 version = "0.1.0"
 description = "Prototype FastAPI backend for reiChan Manga Upscale agent"
 authors = [{ name = "reiChan" }]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "pydantic>=2.7",
-  "python-multipart>=0.0.9"
+  "python-multipart>=0.0.9",
+  "torch==2.6.0",
+  "torchvision==0.21.0",
+  "torchaudio==2.6.0",
+  "realesrgan>=0.3.0",
+  "opencv-python-headless>=4.10",
+  "numpy>=1.26",
+  "basicsr==1.4.2",
+  "facexlib>=0.3.0"
 ]
 
 [project.optional-dependencies]

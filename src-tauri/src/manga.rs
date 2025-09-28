@@ -29,6 +29,7 @@ use walkdir::WalkDir;
 use zip::write::FileOptions;
 use zip::CompressionMethod;
 use zip::ZipArchive;
+use zip::ZipWriter;
 
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] =
     &["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"];
@@ -678,6 +679,8 @@ pub struct ArtifactDownloadRequest {
     pub manifest_path: Option<PathBuf>,
     #[serde(default)]
     pub expected_hash: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<JobMetadataSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -812,6 +815,20 @@ pub struct ArtifactReport {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub report_path: Option<PathBuf>,
+    #[serde(default)]
+    pub archive_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactDownloadSummary {
+    pub job_id: String,
+    pub archive_path: PathBuf,
+    pub extract_path: PathBuf,
+    pub hash: String,
+    pub file_count: usize,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -857,7 +874,12 @@ impl fmt::Display for ArtifactError {
                 write!(f, "failed to write report {}: {}", path.display(), err)
             }
             ArtifactError::CachedReportRead(path, err) => {
-                write!(f, "failed to read cached report {}: {}", path.display(), err)
+                write!(
+                    f,
+                    "failed to read cached report {}: {}",
+                    path.display(),
+                    err
+                )
             }
             ArtifactError::NotModifiedWithoutCache(path) => {
                 write!(
@@ -1110,7 +1132,239 @@ pub fn cancel_remote_job(request: JobControlRequest) -> Result<JobStatusSnapshot
     Ok(snapshot)
 }
 
-pub fn download_and_validate_artifact(
+fn sanitize_filename_component(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    trimmed
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn parse_volume_number(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+
+    digits
+        .parse::<u32>()
+        .ok()
+        .map(|number| format!("{number:04}"))
+}
+
+fn build_archive_filename(
+    metadata: Option<&JobMetadataSnapshot>,
+    job_id: &str,
+) -> (String, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    if let Some(meta) = metadata {
+        if let (Some(title), Some(volume)) = (meta.title.as_deref(), meta.volume.as_deref()) {
+            let normalized_title = sanitize_filename_component(title);
+            if normalized_title.is_empty() {
+                warnings.push("作品名为空，使用 jobId 命名 zip。".to_string());
+            } else if let Some(normalized_volume) = parse_volume_number(volume) {
+                let filename = format!("{}_{}.zip", normalized_volume, normalized_title);
+                return (filename, warnings);
+            } else {
+                warnings.push("卷号非数字，使用 jobId 命名 zip。".to_string());
+            }
+        } else {
+            warnings.push("缺少作品名或卷号，使用 jobId 命名 zip。".to_string());
+        }
+    } else {
+        warnings.push("缺少作业元数据，使用 jobId 命名 zip。".to_string());
+    }
+
+    let fallback = sanitize_filename_component(job_id);
+    let final_name = if fallback.is_empty() {
+        "artifact.zip".to_string()
+    } else {
+        format!("{}.zip", fallback)
+    };
+    (final_name, warnings)
+}
+
+struct PreparedArtifact {
+    extract_root: PathBuf,
+    archive_path: PathBuf,
+    artifact_hash: String,
+    warnings: Vec<String>,
+    image_count: usize,
+}
+
+fn is_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            SUPPORTED_IMAGE_EXTENSIONS
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_zip_path(path: &Path) -> Option<String> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    Some(path.to_string_lossy().replace('\\', "/"))
+}
+
+fn finalize_artifact(
+    temp_file: &NamedTempFile,
+    request: &ArtifactDownloadRequest,
+    archive_path: PathBuf,
+    artifact_hash: String,
+    mut warnings: Vec<String>,
+) -> Result<PreparedArtifact, ArtifactError> {
+    if let Some(parent) = archive_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| ArtifactError::TargetDir(parent.to_path_buf(), err))?;
+    }
+
+    if archive_path.exists() {
+        fs::remove_file(&archive_path)
+            .map_err(|err| ArtifactError::TargetDir(archive_path.clone(), err))?;
+    }
+
+    fs::create_dir_all(&request.target_dir)
+        .map_err(|err| ArtifactError::TargetDir(request.target_dir.clone(), err))?;
+
+    let extract_root = request.target_dir.join(&request.job_id);
+    if extract_root.exists() {
+        fs::remove_dir_all(&extract_root)
+            .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
+    }
+    fs::create_dir_all(&extract_root)
+        .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
+
+    let mut archive_reader = File::open(temp_file.path())?;
+    let mut archive = ZipArchive::new(&mut archive_reader)?;
+
+    let mut image_entries: Vec<(PathBuf, String)> = Vec::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let relative = entry.mangled_name();
+        let out_path = extract_root.join(&relative);
+
+        if entry.name().ends_with('/') {
+            fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut outfile = File::create(&out_path)?;
+        io::copy(&mut entry, &mut outfile)?;
+
+        if is_image_extension(&out_path) {
+            if let Some(zip_name) = normalize_zip_path(&relative) {
+                image_entries.push((out_path.clone(), zip_name));
+            }
+        }
+    }
+
+    let file = File::create(&archive_path)
+        .map_err(|err| ArtifactError::TargetDir(archive_path.clone(), err))?;
+    let mut writer = ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+    for (path, zip_name) in &image_entries {
+        writer.start_file(zip_name, options)?;
+        let mut source = File::open(path)?;
+        io::copy(&mut source, &mut writer)?;
+    }
+    writer.finish()?;
+
+    if image_entries.is_empty() {
+        warnings.push("压缩包中未找到图片文件。".to_string());
+    }
+
+    Ok(PreparedArtifact {
+        extract_root,
+        archive_path,
+        artifact_hash,
+        warnings,
+        image_count: image_entries.len(),
+    })
+}
+
+pub fn download_artifact(
+    request: ArtifactDownloadRequest,
+) -> Result<ArtifactDownloadSummary, ArtifactError> {
+    if request.service_url.trim().is_empty() {
+        return Err(ArtifactError::InvalidServiceUrl);
+    }
+
+    let (archive_filename, warnings) =
+        build_archive_filename(request.metadata.as_ref(), &request.job_id);
+    let archive_path = request.target_dir.join(&archive_filename);
+    let artifact_url = build_service_endpoint(
+        &request.service_url,
+        &format!("jobs/{}/artifact", request.job_id),
+    )
+    .map_err(|_| ArtifactError::InvalidServiceUrl)?;
+
+    let client = Client::new();
+    let mut http_request = client.get(artifact_url);
+    if let Some(token) = request.bearer_token.as_deref() {
+        http_request = http_request.bearer_auth(token);
+    }
+
+    let mut response = http_request.send()?;
+
+    if !response.status().is_success() {
+        return Err(ArtifactError::UnexpectedStatus(response.status()));
+    }
+
+    let mut temp_file = NamedTempFile::new()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        temp_file.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+
+    temp_file.flush()?;
+    let artifact_hash = hex::encode(hasher.finalize());
+
+    let prepared = finalize_artifact(&temp_file, &request, archive_path, artifact_hash, warnings)?;
+
+    Ok(ArtifactDownloadSummary {
+        job_id: request.job_id,
+        archive_path: prepared.archive_path,
+        extract_path: prepared.extract_root,
+        hash: prepared.artifact_hash,
+        file_count: prepared.image_count,
+        warnings: prepared.warnings,
+    })
+}
+
+pub fn validate_artifact(
     request: ArtifactDownloadRequest,
 ) -> Result<ArtifactReport, ArtifactError> {
     if request.service_url.trim().is_empty() {
@@ -1118,6 +1372,9 @@ pub fn download_and_validate_artifact(
     }
 
     let extract_root = request.target_dir.join(&request.job_id);
+    let (archive_filename, warnings) =
+        build_archive_filename(request.metadata.as_ref(), &request.job_id);
+    let archive_path = request.target_dir.join(&archive_filename);
     let cache_report_path = extract_root.join("artifact-report.json");
     let artifact_url = build_service_endpoint(
         &request.service_url,
@@ -1133,7 +1390,6 @@ pub fn download_and_validate_artifact(
     let has_cached_report = cache_report_path.exists();
     if let Some(hash) = request.expected_hash.as_deref() {
         if has_cached_report {
-            // Only send an ETag when the previous report exists locally so a 304 can reuse it.
             http_request = http_request.header("If-None-Match", hash);
         }
     }
@@ -1158,13 +1414,6 @@ pub fn download_and_validate_artifact(
         return Err(ArtifactError::UnexpectedStatus(response.status()));
     }
 
-    if extract_root.exists() {
-        fs::remove_dir_all(&extract_root)
-            .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
-    }
-    fs::create_dir_all(&extract_root)
-        .map_err(|err| ArtifactError::TargetDir(extract_root.clone(), err))?;
-
     let mut temp_file = NamedTempFile::new()?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];
@@ -1181,27 +1430,7 @@ pub fn download_and_validate_artifact(
     temp_file.flush()?;
     let artifact_hash = hex::encode(hasher.finalize());
 
-    let mut archive_reader = File::open(temp_file.path())?;
-    let mut archive = ZipArchive::new(&mut archive_reader)?;
-
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let out_path = extract_root.join(entry.mangled_name());
-
-        if entry.name().ends_with('/') {
-            fs::create_dir_all(&out_path)?;
-            continue;
-        }
-
-        if let Some(parent) = out_path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-
-        let mut outfile = File::create(&out_path)?;
-        io::copy(&mut entry, &mut outfile)?;
-    }
+    let prepared = finalize_artifact(&temp_file, &request, archive_path, artifact_hash, warnings)?;
 
     let expected_map = if let Some(path) = request.manifest_path.as_ref() {
         Some(read_manifest_expectations(path)?)
@@ -1209,9 +1438,9 @@ pub fn download_and_validate_artifact(
         None
     };
 
-    let mut actual_map = collect_directory_digests(&extract_root)?;
+    let mut actual_map = collect_directory_digests(&prepared.extract_root)?;
 
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = prepared.warnings;
     if request.manifest_path.is_none() {
         warnings.push("未提供 manifest，按实际文件生成报告。".to_string());
     }
@@ -1311,24 +1540,25 @@ pub fn download_and_validate_artifact(
     let report = ArtifactReport {
         job_id: request.job_id.clone(),
         artifact_path: PathBuf::from(request.artifact_path.clone()),
-        extract_path: extract_root.clone(),
+        extract_path: prepared.extract_root.clone(),
         manifest_path: request.manifest_path.clone(),
-        hash: artifact_hash,
+        hash: prepared.artifact_hash.clone(),
         created_at,
         summary,
         items: items.clone(),
         warnings: warnings.clone(),
         report_path: None,
+        archive_path: Some(prepared.archive_path.clone()),
     };
 
-    let report_path = extract_root.join("artifact-report.json");
-    let mut file = File::create(&report_path)?;
+    let mut file = File::create(&cache_report_path)?;
     serde_json::to_writer_pretty(&mut file, &report)
-        .map_err(|err| ArtifactError::ReportWrite(report_path.clone(), err))?;
+        .map_err(|err| ArtifactError::ReportWrite(cache_report_path.clone(), err))?;
     file.write_all(b"\n")?;
 
     let mut final_report = report;
-    final_report.report_path = Some(report_path);
+    final_report.report_path = Some(cache_report_path);
+    final_report.archive_path = Some(prepared.archive_path);
 
     Ok(final_report)
 }
@@ -1647,7 +1877,7 @@ mod artifact_tests {
     }
 
     #[test]
-    fn download_and_validate_artifact_matches_manifest() {
+    fn validate_artifact_matches_manifest() {
         let temp = tempdir().unwrap();
         let manifest_dir = temp.path().join("manifest");
         fs::create_dir_all(&manifest_dir).unwrap();
@@ -1662,7 +1892,11 @@ mod artifact_tests {
             ],
             "skipped": []
         });
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let zip_bytes = build_zip_archive(vec![("0001.jpg", b"expected")]);
 
@@ -1683,17 +1917,24 @@ mod artifact_tests {
             bearer_token: None,
             manifest_path: Some(manifest_path.clone()),
             expected_hash: None,
+            metadata: Some(JobMetadataSnapshot {
+                title: Some("MyTitle".to_string()),
+                volume: Some("1".to_string()),
+            }),
         };
 
-        let report = download_and_validate_artifact(request).expect("report");
+        let report = validate_artifact(request).expect("report");
         assert_eq!(report.summary.matched, 1);
         assert_eq!(report.summary.mismatched, 0);
         assert_eq!(report.summary.missing, 0);
         assert_eq!(report.summary.extra, 0);
+        let expected_archive = temp.path().join("output").join("0001_MyTitle.zip");
+        assert_eq!(report.archive_path.as_ref(), Some(&expected_archive));
+        assert!(expected_archive.exists());
     }
 
     #[test]
-    fn download_and_validate_artifact_detects_mismatch() {
+    fn validate_artifact_detects_mismatch() {
         let temp = tempdir().unwrap();
         let manifest_dir = temp.path().join("manifest");
         fs::create_dir_all(&manifest_dir).unwrap();
@@ -1708,7 +1949,11 @@ mod artifact_tests {
             ],
             "skipped": []
         });
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let zip_bytes = build_zip_archive(vec![("0001.jpg", b"different")]);
 
@@ -1729,15 +1974,22 @@ mod artifact_tests {
             bearer_token: None,
             manifest_path: Some(manifest_path.clone()),
             expected_hash: None,
+            metadata: Some(JobMetadataSnapshot {
+                title: Some("MyTitle".to_string()),
+                volume: Some("1".to_string()),
+            }),
         };
 
-        let report = download_and_validate_artifact(request).expect("report");
+        let report = validate_artifact(request).expect("report");
         assert_eq!(report.summary.mismatched, 1);
         assert_eq!(report.summary.matched, 0);
+        let expected_archive = temp.path().join("output").join("0001_MyTitle.zip");
+        assert_eq!(report.archive_path.as_ref(), Some(&expected_archive));
+        assert!(expected_archive.exists());
     }
 
     #[test]
-    fn download_and_validate_artifact_ignores_etag_without_cache() {
+    fn validate_artifact_ignores_etag_without_cache() {
         let temp = tempdir().unwrap();
 
         let zip_bytes = build_zip_archive(vec![("0001.jpg", b"payload")]);
@@ -1766,16 +2018,81 @@ mod artifact_tests {
             bearer_token: None,
             manifest_path: None,
             expected_hash: Some("abc123".to_string()),
+            metadata: Some(JobMetadataSnapshot {
+                title: Some("Sample".to_string()),
+                volume: Some("2".to_string()),
+            }),
         };
 
-        let report = download_and_validate_artifact(request).expect("report");
+        let report = validate_artifact(request).expect("report");
         assert_eq!(report.summary.matched, 1);
+        let expected_archive = temp.path().join("output").join("0002_Sample.zip");
+        assert_eq!(report.archive_path.as_ref(), Some(&expected_archive));
+        assert!(expected_archive.exists());
         assert_eq!(etag_mock.hits(), 0);
         success_mock.assert();
     }
 
     #[test]
-    fn download_and_validate_artifact_uses_cache_on_not_modified() {
+    fn download_artifact_filters_non_images() {
+        let temp = tempdir().unwrap();
+        let output_dir = temp.path().join("output");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let zip_bytes = build_zip_archive(vec![
+            ("0001.jpg", b"image"),
+            ("notes.txt", b"text"),
+            ("nested/0002.png", b"image2"),
+        ]);
+
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/jobs/test/artifact");
+            then.status(200)
+                .header("content-type", "application/zip")
+                .body(zip_bytes.clone());
+        });
+
+        let request = ArtifactDownloadRequest {
+            service_url: server.base_url(),
+            job_id: "test".to_string(),
+            artifact_path: "artifacts/test.zip".to_string(),
+            target_dir: output_dir.clone(),
+            bearer_token: None,
+            manifest_path: None,
+            expected_hash: None,
+            metadata: Some(JobMetadataSnapshot {
+                title: Some("Title".to_string()),
+                volume: Some("3".to_string()),
+            }),
+        };
+
+        let summary = download_artifact(request).expect("summary");
+        assert_eq!(summary.file_count, 2);
+        let expected_archive = output_dir.join("0003_Title.zip");
+        assert_eq!(summary.archive_path, expected_archive);
+        assert!(expected_archive.exists());
+
+        let file = File::open(&summary.archive_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).unwrap();
+            if entry.name().ends_with('/') {
+                continue;
+            }
+            names.push(entry.name().to_string());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["0001.jpg".to_string(), "nested/0002.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_artifact_uses_cache_on_not_modified() {
         let temp = tempdir().unwrap();
         let manifest_dir = temp.path().join("manifest");
         fs::create_dir_all(&manifest_dir).unwrap();
@@ -1790,7 +2107,11 @@ mod artifact_tests {
             ],
             "skipped": []
         });
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let zip_bytes = build_zip_archive(vec![("0001.jpg", b"expected")]);
 
@@ -1813,11 +2134,18 @@ mod artifact_tests {
             bearer_token: None,
             manifest_path: Some(manifest_path.clone()),
             expected_hash: None,
+            metadata: Some(JobMetadataSnapshot {
+                title: Some("Another".to_string()),
+                volume: Some("12".to_string()),
+            }),
         };
 
-        let first_report = download_and_validate_artifact(request.clone()).expect("first report");
+        let first_report = validate_artifact(request.clone()).expect("first report");
         assert_eq!(first_report.summary.matched, 1);
         first_mock.assert();
+        let expected_archive = target_dir.join("0012_Another.zip");
+        assert_eq!(first_report.archive_path.as_ref(), Some(&expected_archive));
+        assert!(expected_archive.exists());
 
         let second_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1828,15 +2156,19 @@ mod artifact_tests {
         let mut cached_request = request.clone();
         cached_request.expected_hash = Some(first_report.hash.clone());
 
-        let cached_report = download_and_validate_artifact(cached_request).expect("cached report");
+        let cached_report = validate_artifact(cached_request).expect("cached report");
         assert_eq!(cached_report.summary.matched, 1);
         assert!(cached_report
             .warnings
             .iter()
             .any(|warning| warning.contains("未变更")));
         let expected_report_path = target_dir.join("test").join("artifact-report.json");
-        assert_eq!(cached_report.report_path.as_ref(), Some(&expected_report_path));
+        assert_eq!(
+            cached_report.report_path.as_ref(),
+            Some(&expected_report_path)
+        );
         assert!(cached_report.extract_path.exists());
+        assert_eq!(cached_report.archive_path.as_ref(), Some(&expected_archive));
         second_mock.assert();
     }
     #[test]
@@ -1900,7 +2232,6 @@ mod artifact_tests {
         assert_eq!(snapshot.job_id, "xyz");
         mock.assert();
     }
-
 }
 
 fn upload_as_zip(

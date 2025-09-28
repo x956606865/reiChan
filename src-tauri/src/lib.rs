@@ -190,8 +190,15 @@ fn cancel_manga_job(request: manga::JobControlRequest) -> Result<manga::JobStatu
 #[tauri::command]
 fn download_manga_artifact(
     request: manga::ArtifactDownloadRequest,
+) -> Result<manga::ArtifactDownloadSummary, String> {
+    manga::download_artifact(request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn validate_manga_artifact(
+    request: manga::ArtifactDownloadRequest,
 ) -> Result<manga::ArtifactReport, String> {
-    manga::download_and_validate_artifact(request).map_err(|err| err.to_string())
+    manga::validate_artifact(request).map_err(|err| err.to_string())
 }
 
 fn collect_ports() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
@@ -750,7 +757,8 @@ pub fn run() {
             watch_manga_job,
             resume_manga_job,
             cancel_manga_job,
-            download_manga_artifact
+            download_manga_artifact,
+            validate_manga_artifact
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

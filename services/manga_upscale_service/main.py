@@ -1,21 +1,10 @@
-"""FastAPI backend prototype for the Manga Upscale agent (M1).
-
-This service accepts folder inputs coming from Copyparty, enqueues a mock
-Real-ESRGAN job, and streams progress updates via polling endpoints.
-
-The implementation intentionally keeps the processing step lightweight: it
-simulates GPU work with asyncio sleeps and prepares deterministic metadata for
-the artifact path. Real model invocation (PyTorch / ONNX / NCNN) will replace
-``simulate_execution`` in later milestones.
-"""
+"""FastAPI backend for the Manga Upscale agent powered by Real-ESRGAN."""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import uuid
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Literal, Optional, Set
@@ -23,6 +12,14 @@ from typing import Dict, Literal, Optional, Set
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+from executor import (
+    MODEL_DEFINITIONS,
+    JobExecutionResult,
+    ServicePaths,
+    execute_job,
+    default_engine_factory,
+)
 
 JobStatus = Literal["PENDING", "RUNNING", "SUCCESS", "FAILED"]
 
@@ -123,9 +120,19 @@ INCOMING_DIR = STORAGE_ROOT / "incoming"
 STAGING_DIR = STORAGE_ROOT / "staging"
 OUTPUTS_DIR = STORAGE_ROOT / "outputs"
 ARTIFACTS_DIR = STORAGE_ROOT / "artifacts"
+MODEL_ROOT = Path(os.getenv("REICHAN_MODEL_ROOT", STORAGE_ROOT / "models")).resolve()
 
-for directory in (STORAGE_ROOT, INCOMING_DIR, STAGING_DIR, OUTPUTS_DIR, ARTIFACTS_DIR):
+for directory in (STORAGE_ROOT, INCOMING_DIR, STAGING_DIR, OUTPUTS_DIR, ARTIFACTS_DIR, MODEL_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
+
+SERVICE_PATHS = ServicePaths(
+    storage_root=STORAGE_ROOT,
+    incoming_dir=INCOMING_DIR,
+    staging_dir=STAGING_DIR,
+    outputs_dir=OUTPUTS_DIR,
+    artifacts_dir=ARTIFACTS_DIR,
+    models_dir=MODEL_ROOT,
+)
 
 MAX_CONCURRENCY = max(1, int(os.getenv("REICHAN_MAX_CONCURRENCY", "1")))
 worker_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -150,16 +157,18 @@ async def healthcheck() -> dict[str, object]:
 
 @app.get("/models")
 async def list_models() -> dict[str, list[dict[str, object]]]:
-    return {
-        "models": [
+    models: list[dict[str, object]] = []
+    for definition in MODEL_DEFINITIONS.values():
+        models.append(
             {
-                "name": "RealESRGAN_x4plus_anime_6B",
-                "scale": 4,
-                "recommended_scale": 2,
-                "notes": "Anime-focused Real-ESRGAN weights",
+                "name": definition.name,
+                "scale": definition.scale,
+                "recommended_scale": definition.default_outscale,
+                "weights": definition.weights,
+                "download_url": definition.download_url,
             }
-        ]
-    }
+        )
+    return {"models": models}
 
 
 @app.post("/jobs", response_model=JobSubmitted, status_code=202)
@@ -200,6 +209,7 @@ async def resume_job(job_id: str, payload: JobResumePayload | None = None) -> Jo
         record.message = None
         record.last_error = None
         record.processed = 0
+        record.total = 0
         record.artifact_path = None
         record.artifact_hash = None
         record.report_path = None
@@ -314,35 +324,38 @@ async def job_events(websocket: WebSocket, job_id: str) -> None:
 
 
 async def _run_job(job_id: str) -> None:
+    loop = asyncio.get_running_loop()
     try:
         async with worker_semaphore:
-            await _mark_running(job_id)
+            record = await _mark_running(job_id)
+            if record is None:
+                return
 
-            total = await _job_total(job_id)
-            for step in range(1, total + 1):
-                async with jobs_lock:
-                    record = jobs.get(job_id)
-                    if record is None or record.status != "RUNNING":
-                        return
-                await simulate_execution(job_id, step)
+            def progress(processed: int, total: int) -> None:
+                asyncio.run_coroutine_threadsafe(
+                    _update_progress(job_id, processed, total), loop
+                )
 
-            await _mark_success(job_id)
+            result = await execute_job(
+                job_id,
+                record,
+                SERVICE_PATHS,
+                engine_factory=default_engine_factory,
+                progress_callback=progress,
+            )
+
+            await _store_success(job_id, result)
     except Exception as exc:  # pragma: no cover - defensive
         await _mark_failed(job_id, str(exc))
 
 
-async def simulate_execution(job_id: str, step: int) -> None:
-    await asyncio.sleep(0.4)
-    await _update_progress(job_id, step)
-
-
-async def _mark_running(job_id: str) -> None:
+async def _mark_running(job_id: str) -> Optional[JobRecord]:
     async with jobs_lock:
         record = jobs.get(job_id)
         if record is None:
-            raise RuntimeError(f"Job {job_id} disappeared")
+            return None
         record.status = "RUNNING"
-        record.total = max(record.total, 8)
+        record.total = 0
         record.message = None
         record.last_error = None
         record.processed = 0
@@ -350,26 +363,31 @@ async def _mark_running(job_id: str) -> None:
         record.artifact_hash = None
         record.report_path = None
     await _broadcast(job_id)
-
-async def _job_total(job_id: str) -> int:
-    async with jobs_lock:
-        record = jobs.get(job_id)
-        if record is None:
-            raise RuntimeError(f"Job {job_id} disappeared")
-        return record.total
+    return record
 
 
-async def _mark_success(job_id: str) -> None:
+async def _store_success(job_id: str, result: JobExecutionResult) -> None:
+    try:
+        artifact_relative = result.artifact_path.resolve().relative_to(STORAGE_ROOT).as_posix()
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise RuntimeError("Artifact escaped storage root") from exc
+
+    try:
+        report_relative = result.report_path.resolve().relative_to(STORAGE_ROOT)
+    except ValueError:
+        report_relative = None
+
     async with jobs_lock:
         record = jobs.get(job_id)
         if record:
             record.status = "SUCCESS"
-            record.processed = record.total
-            record.artifact_path = _ensure_artifact(record.payload, job_id, record.total)
+            record.processed = result.processed
+            record.total = result.total
+            record.artifact_path = artifact_relative
+            record.artifact_hash = result.artifact_hash
             record.message = None
             record.last_error = None
-            artifact_full = (STORAGE_ROOT / record.artifact_path).resolve()
-            record.artifact_hash = _hash_file(artifact_full)
+            record.report_path = report_relative
     await _broadcast(job_id)
 
 
@@ -383,11 +401,13 @@ async def _mark_failed(job_id: str, message: str) -> None:
     await _broadcast(job_id)
 
 
-async def _update_progress(job_id: str, processed: int) -> None:
+async def _update_progress(job_id: str, processed: int, total: Optional[int] = None) -> None:
     async with jobs_lock:
         record = jobs.get(job_id)
         if record:
             record.processed = processed
+            if total is not None:
+                record.total = total
     await _broadcast(job_id)
 
 
@@ -451,41 +471,6 @@ def _build_state(job_id: str, record: JobRecord) -> JobState:
             "volume": record.payload.volume,
         },
     )
-
-
-def _ensure_artifact(payload: JobCreate, job_id: str, processed: int) -> str:
-    artifact_name = f"{_slug(payload.title)}-{_slug(payload.volume)}-{job_id}.zip"
-    artifact_path = ARTIFACTS_DIR / artifact_name
-
-    if not artifact_path.exists():
-        with zipfile.ZipFile(artifact_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            summary = (
-                f"Job {job_id}\n"
-                f"Title: {payload.title}\n"
-                f"Volume: {payload.volume}\n"
-                f"Processed frames: {processed}\n"
-                "This is a placeholder artifact generated during M2.\n"
-            )
-            archive.writestr("SUMMARY.txt", summary)
-
-    return artifact_path.relative_to(STORAGE_ROOT).as_posix()
-
-
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8192), b""):
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _slug(value: str) -> str:
-    safe = value.strip().lower().replace(" ", "-")
-    return "".join(ch for ch in safe if ch.isalnum() or ch in {"-", "_"}) or "unknown"
-
-
 def _estimate_total_frames(payload: JobCreate) -> int:
     if payload.input.type == "zip":
         return 24

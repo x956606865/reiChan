@@ -108,6 +108,16 @@ type ArtifactReport = {
   items: ArtifactValidationItem[];
   warnings: string[];
   reportPath?: string | null;
+  archivePath?: string | null;
+};
+
+type ArtifactDownloadSummary = {
+  jobId: string;
+  archivePath: string;
+  extractPath: string;
+  hash: string;
+  fileCount: number;
+  warnings: string[];
 };
 
 type JobEventPayload = {
@@ -273,8 +283,10 @@ const MangaUpscaleAgent = () => {
   const [jobSearch, setJobSearch] = useState("");
   const [selectedJobIds, setSelectedJobIds] = useState<string[]>([]);
   const [artifactReports, setArtifactReports] = useState<ArtifactReport[]>([]);
+  const [artifactDownloads, setArtifactDownloads] = useState<ArtifactDownloadSummary[]>([]);
   const [artifactError, setArtifactError] = useState<string | null>(null);
-  const [artifactBusyJob, setArtifactBusyJob] = useState<string | null>(null);
+  const [artifactDownloadBusyJob, setArtifactDownloadBusyJob] = useState<string | null>(null);
+  const [artifactValidateBusyJob, setArtifactValidateBusyJob] = useState<string | null>(null);
   const [artifactTargetRoot, setArtifactTargetRoot] = useState<string>("");
   const [currentStep, setCurrentStep] = useState<StepId>("source");
 
@@ -1193,6 +1205,9 @@ const MangaUpscaleAgent = () => {
     if (job.artifactPath) {
       request.artifactPath = job.artifactPath;
     }
+    if (job.metadata) {
+      request.metadata = job.metadata;
+    }
     return request;
   }, []);
 
@@ -1379,11 +1394,8 @@ const MangaUpscaleAgent = () => {
     return typeof first === "string" && first.length > 0 ? first : null;
   }, []);
 
-  const downloadArtifact = useCallback(
-    async (
-      job: JobRecord,
-      options?: { silent?: boolean; targetDir?: string | null; manifestPathOverride?: string | null },
-    ) => {
+  const downloadArtifactZip = useCallback(
+    async (job: JobRecord, options?: { silent?: boolean; targetDir?: string | null }) => {
       const silent = options?.silent ?? false;
 
       if (!job.serviceUrl || !job.jobId) {
@@ -1412,6 +1424,92 @@ const MangaUpscaleAgent = () => {
         targetDir = picked;
       }
 
+      setArtifactDownloadBusyJob(job.jobId);
+      if (!silent) {
+        setArtifactError(null);
+      }
+
+      try {
+        const request: Record<string, unknown> = {
+          ...buildJobRequest(job),
+          targetDir,
+        };
+
+        const summary = await invoke<ArtifactDownloadSummary>("download_manga_artifact", {
+          request,
+        });
+
+        setArtifactTargetRoot(targetDir);
+
+        setArtifactDownloads((prev) => {
+          const next = [summary, ...prev.filter((item) => item.jobId !== summary.jobId)];
+          return next.slice(0, 10);
+        });
+
+        setJobs((prev) =>
+          prev.map((item) =>
+            item.jobId === job.jobId ? { ...item, artifactHash: summary.hash } : item,
+          ),
+        );
+
+        if (!silent) {
+          const warningNote =
+            summary.warnings.length > 0 ? `；注意：${summary.warnings[0]}` : "";
+          setJobStatus(
+            `ZIP 下载完成（${summary.jobId}），共 ${summary.fileCount} 张，输出：${summary.archivePath}${warningNote}`,
+          );
+          if (summary.warnings.length > 0) {
+            setArtifactError(summary.warnings[0]);
+          }
+        }
+
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!silent) {
+          setArtifactError(message);
+        }
+        return false;
+      } finally {
+        setArtifactDownloadBusyJob(null);
+      }
+    },
+    [artifactTargetRoot, buildJobRequest, promptForDirectory],
+  );
+
+  const validateArtifact = useCallback(
+    async (
+      job: JobRecord,
+      options?: { silent?: boolean; targetDir?: string | null; manifestPathOverride?: string | null },
+    ) => {
+      const silent = options?.silent ?? false;
+
+      if (!job.serviceUrl || !job.jobId) {
+        if (!silent) {
+          setArtifactError("缺少必要信息，无法校验产物。");
+        }
+        return false;
+      }
+
+      if (!job.artifactPath) {
+        if (!silent) {
+          setArtifactError("远端尚未提供产物路径。");
+        }
+        return false;
+      }
+
+      let targetDir = options?.targetDir ?? null;
+      if (!targetDir) {
+        const picked = await promptForDirectory("选择校验输出目录", artifactTargetRoot);
+        if (!picked) {
+          if (!silent) {
+            setArtifactError("已取消选择输出目录。");
+          }
+          return false;
+        }
+        targetDir = picked;
+      }
+
       let manifestPath =
         options?.manifestPathOverride ??
         job.manifestPath ??
@@ -1421,7 +1519,7 @@ const MangaUpscaleAgent = () => {
         manifestPath = await promptForManifest();
       }
 
-      setArtifactBusyJob(job.jobId);
+      setArtifactValidateBusyJob(job.jobId);
       if (!silent) {
         setArtifactError(null);
       }
@@ -1439,7 +1537,7 @@ const MangaUpscaleAgent = () => {
           request.expectedHash = job.artifactHash;
         }
 
-        const report = await invoke<ArtifactReport>("download_manga_artifact", { request });
+        const report = await invoke<ArtifactReport>("validate_manga_artifact", { request });
 
         setArtifactReports((prev) => {
           const next = [report, ...prev.filter((item) => item.jobId !== report.jobId)];
@@ -1448,14 +1546,28 @@ const MangaUpscaleAgent = () => {
 
         setArtifactTargetRoot(targetDir);
 
-        if (manifestPath) {
-          setJobs((prev) =>
-            prev.map((item) => (item.jobId === job.jobId ? { ...item, manifestPath } : item)),
-          );
-        }
+        setJobs((prev) =>
+          prev.map((item) => {
+            if (item.jobId !== job.jobId) {
+              return item;
+            }
+            return {
+              ...item,
+              manifestPath: manifestPath ?? item.manifestPath,
+              artifactHash: report.hash,
+            };
+          }),
+        );
 
         if (!silent) {
-          setJobStatus(`产物下载完成（${report.jobId}）`);
+          const warningNote =
+            report.warnings.length > 0 ? `；注意：${report.warnings[0]}` : "";
+          setJobStatus(
+            `校验完成（${report.jobId}）：匹配 ${report.summary.matched} / ${report.summary.totalManifest}${warningNote}`,
+          );
+          if (report.warnings.length > 0) {
+            setArtifactError(report.warnings[0]);
+          }
         }
 
         return true;
@@ -1466,17 +1578,30 @@ const MangaUpscaleAgent = () => {
         }
         return false;
       } finally {
-        setArtifactBusyJob(null);
+        setArtifactValidateBusyJob(null);
       }
     },
-    [artifactTargetRoot, buildJobRequest, inferManifestForVolume, promptForDirectory, promptForManifest],
+    [
+      artifactTargetRoot,
+      buildJobRequest,
+      inferManifestForVolume,
+      promptForDirectory,
+      promptForManifest,
+    ],
   );
 
   const handleDownloadArtifact = useCallback(
     (job: JobRecord) => {
-      void downloadArtifact(job);
+      void downloadArtifactZip(job);
     },
-    [downloadArtifact],
+    [downloadArtifactZip],
+  );
+
+  const handleValidateArtifact = useCallback(
+    (job: JobRecord) => {
+      void validateArtifact(job);
+    },
+    [validateArtifact],
   );
 
   const handleBatchResume = useCallback(async () => {
@@ -1514,7 +1639,7 @@ const MangaUpscaleAgent = () => {
 
     let success = 0;
     for (const job of ready) {
-      const ok = await downloadArtifact(job, { silent: true, targetDir });
+      const ok = await downloadArtifactZip(job, { silent: true, targetDir });
       if (ok) {
         success += 1;
       }
@@ -1526,12 +1651,50 @@ const MangaUpscaleAgent = () => {
     }
 
     const skipped = selected.length - ready.length;
-    const summaryParts = [`已触发 ${success} 项下载/校验。`];
+    const summaryParts = [`已触发 ${success} 项 ZIP 下载。`];
     if (skipped > 0) {
       summaryParts.push(`跳过 ${skipped} 项尚未生成产物的作业。`);
     }
     setJobStatus(summaryParts.join(' '));
-  }, [artifactTargetRoot, downloadArtifact, jobs, promptForDirectory, selectedJobIds]);
+  }, [artifactTargetRoot, downloadArtifactZip, jobs, promptForDirectory, selectedJobIds]);
+
+  const handleBatchValidate = useCallback(async () => {
+    const selected = jobs.filter((job) => selectedJobIds.includes(job.jobId));
+    const ready = selected.filter((job) => !!job.artifactPath);
+
+    if (ready.length === 0) {
+      setJobStatus("选中的作业暂无可校验的产物。");
+      return;
+    }
+
+    let targetDir = artifactTargetRoot;
+    if (!targetDir) {
+      targetDir = await promptForDirectory("选择批量校验目录", artifactTargetRoot);
+      if (!targetDir) {
+        return;
+      }
+    }
+
+    let success = 0;
+    for (const job of ready) {
+      const ok = await validateArtifact(job, { silent: true, targetDir });
+      if (ok) {
+        success += 1;
+      }
+    }
+
+    if (success === 0) {
+      setJobStatus("批量校验未成功，请检查作业状态。");
+      return;
+    }
+
+    const skipped = selected.length - ready.length;
+    const summaryParts = [`已触发 ${success} 项校验。`];
+    if (skipped > 0) {
+      summaryParts.push(`跳过 ${skipped} 项尚未生成产物的作业。`);
+    }
+    setJobStatus(summaryParts.join(' '));
+  }, [artifactTargetRoot, jobs, promptForDirectory, selectedJobIds, validateArtifact]);
 
   const handleUpload = useCallback(async () => {
     if (!renameForm.directory) {
@@ -2801,10 +2964,25 @@ const MangaUpscaleAgent = () => {
                         </button>
                         <button
                           type="button"
-                          disabled={!job.artifactPath || artifactBusyJob === job.jobId}
+                          disabled={
+                            !job.artifactPath ||
+                            artifactDownloadBusyJob === job.jobId ||
+                            artifactValidateBusyJob === job.jobId
+                          }
                           onClick={() => handleDownloadArtifact(job)}
                         >
-                          {artifactBusyJob === job.jobId ? "处理中…" : "下载校验"}
+                          {artifactDownloadBusyJob === job.jobId ? "下载中…" : "下载 ZIP"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            !job.artifactPath ||
+                            artifactValidateBusyJob === job.jobId ||
+                            artifactDownloadBusyJob === job.jobId
+                          }
+                          onClick={() => handleValidateArtifact(job)}
+                        >
+                          {artifactValidateBusyJob === job.jobId ? "校验中…" : "校验"}
                         </button>
                       </td>
                     </tr>
@@ -2828,9 +3006,35 @@ const MangaUpscaleAgent = () => {
                 批量终止
               </button>
               <button type="button" onClick={handleBatchDownload}>
-                批量下载校验
+                批量下载 ZIP
+              </button>
+              <button type="button" onClick={handleBatchValidate}>
+                批量校验
               </button>
             </div>
+          </div>
+        )}
+
+        {artifactDownloads.length > 0 && (
+          <div className="artifact-downloads">
+            <h4>最近下载</h4>
+            <ul>
+              {artifactDownloads.map((summary) => (
+                <li key={`${summary.jobId}-${summary.hash}`}>
+                  <div className="report-header">
+                    <span className="job-id monospace">{summary.jobId}</span>
+                    <span className="report-status">文件数：{summary.fileCount}</span>
+                    <span className="report-path">ZIP：{summary.archivePath}</span>
+                  </div>
+                  <div className="report-details">
+                    <span>解压目录：{summary.extractPath}</span>
+                    {summary.warnings.length > 0 && (
+                      <span className="report-warning">{summary.warnings[0]}</span>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 
@@ -2846,6 +3050,9 @@ const MangaUpscaleAgent = () => {
                       匹配 {report.summary.matched} / {report.summary.totalManifest}
                     </span>
                     <span className="report-path">输出：{report.extractPath}</span>
+                    {report.archivePath && (
+                      <span className="report-archive">ZIP：{report.archivePath}</span>
+                    )}
                   </div>
                   <div className="report-details">
                     <span>缺失 {report.summary.missing}</span>
