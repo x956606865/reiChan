@@ -22,6 +22,7 @@ use projection::analyze_projection;
 
 mod regions;
 use regions::{compute_region_bbox, crop_region_with_padding, RegionBounds};
+use walkdir::{DirEntry, WalkDir};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -234,6 +235,89 @@ impl From<serde_json::Error> for SplitError {
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"];
 
+fn is_supported_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn should_descend(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+
+    if entry.file_type().is_dir() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name == ".rei_cache" {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn collect_supported_entries(path: &Path) -> Result<(Vec<PathBuf>, PathBuf), SplitError> {
+    if !path.exists() {
+        return Err(SplitError::DirectoryNotFound(path.to_path_buf()));
+    }
+
+    if path.is_file() {
+        if is_supported_image(path) {
+            let parent = path
+                .parent()
+                .and_then(|dir| {
+                    let os_str = dir.as_os_str();
+                    if os_str.is_empty() {
+                        None
+                    } else {
+                        Some(dir.to_path_buf())
+                    }
+                })
+                .unwrap_or_else(|| PathBuf::from("."));
+            return Ok((vec![path.to_path_buf()], parent));
+        }
+
+        return Err(SplitError::EmptyDirectory(path.to_path_buf()));
+    }
+
+    if !path.is_dir() {
+        return Err(SplitError::DirectoryNotFound(path.to_path_buf()));
+    }
+
+    let mut entries: Vec<PathBuf> = Vec::new();
+
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(should_descend)
+    {
+        let entry = entry.map_err(|err| {
+            if let Some(io_err) = err.io_error() {
+                SplitError::Io(io::Error::new(io_err.kind(), io_err.to_string()))
+            } else {
+                SplitError::Io(io::Error::new(io::ErrorKind::Other, err.to_string()))
+            }
+        })?;
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        if is_supported_image(entry.path()) {
+            entries.push(entry.into_path());
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(SplitError::EmptyDirectory(path.to_path_buf()));
+    }
+
+    entries.sort();
+    Ok((entries, path.to_path_buf()))
+}
+
 pub fn prepare_split<'a>(
     options: SplitCommandOptions,
     progress: Option<&'a mut dyn FnMut(SplitProgress)>,
@@ -252,42 +336,20 @@ fn prepare_split_internal<'a>(
         thresholds: thresholds_override,
     } = options;
 
-    if !directory.exists() || !directory.is_dir() {
-        return Err(SplitError::DirectoryNotFound(directory));
-    }
-
     let config = if let Some(overrides) = thresholds_override.as_ref() {
         SplitConfig::default().with_overrides(overrides)
     } else {
         SplitConfig::default()
     };
 
-    let mut entries: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(&directory)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
-            if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
-                entries.push(path);
-            }
-        }
-    }
+    let (collected_entries, workspace_root) = collect_supported_entries(&directory)?;
 
-    if entries.is_empty() {
-        return Err(SplitError::EmptyDirectory(directory));
-    }
-
-    entries.sort();
-
-    let entries = Arc::new(entries);
+    let entries = Arc::new(collected_entries);
     let total_files = entries.len();
     let workspace_directory = if dry_run {
         None
     } else {
-        Some(Arc::new(create_workspace(&directory, overwrite)?))
+        Some(Arc::new(create_workspace(&workspace_root, overwrite)?))
     };
 
     let mut processed_files = 0usize;
@@ -859,30 +921,11 @@ fn save_image(image: &DynamicImage, target: &Path) -> Result<(), SplitError> {
 }
 
 pub fn estimate_split_candidates(directory: &Path) -> Result<SplitDetectionSummary, SplitError> {
-    if !directory.exists() || !directory.is_dir() {
-        return Err(SplitError::DirectoryNotFound(directory.to_path_buf()));
-    }
+    let (entries, _) = collect_supported_entries(directory)?;
 
     let mut candidates = 0usize;
-    let mut total = 0usize;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let supported = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|value| value.to_ascii_lowercase())
-            .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.as_str()))
-            .unwrap_or(false);
-        if !supported {
-            continue;
-        }
-        total += 1;
-
-        let Ok(dimensions) = image::image_dimensions(&path) else {
+    for path in entries.iter() {
+        let Ok(dimensions) = image::image_dimensions(path) else {
             continue;
         };
         let (width, height) = dimensions;
@@ -891,7 +934,10 @@ pub fn estimate_split_candidates(directory: &Path) -> Result<SplitDetectionSumma
         }
     }
 
-    Ok(SplitDetectionSummary { total, candidates })
+    Ok(SplitDetectionSummary {
+        total: entries.len(),
+        candidates,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1074,6 +1120,72 @@ mod tests {
         let summary = estimate_split_candidates(temp.path()).expect("estimate");
         assert_eq!(summary.total, fixtures.len());
         assert!(summary.candidates >= 2);
+    }
+
+    #[test]
+    fn recursive_directory_traversal_processes_nested_files() {
+        let temp = TempDir::new().expect("temp dir");
+        let nested_dir = temp.path().join("nested");
+        fs::create_dir(&nested_dir).expect("create nested dir");
+
+        let fixture = fixture_path("double_page_story.png");
+        let nested_file = nested_dir.join("double_page_story.png");
+        fs::copy(&fixture, &nested_file).expect("copy nested fixture");
+
+        let outcome = prepare_split(
+            SplitCommandOptions {
+                directory: temp.path().to_path_buf(),
+                dry_run: false,
+                overwrite: true,
+                thresholds: None,
+            },
+            None,
+        )
+        .expect("split outcome");
+
+        assert_eq!(outcome.analyzed_files, 1);
+        let workspace = outcome
+            .workspace_directory
+            .clone()
+            .expect("workspace directory");
+        assert!(workspace.join("double_page_story_R.png").exists());
+        assert!(workspace.join("double_page_story_L.png").exists());
+    }
+
+    #[test]
+    fn existing_cache_directories_are_skipped() {
+        let temp = TempDir::new().expect("temp dir");
+        let cache_dir = temp
+            .path()
+            .join(".rei_cache")
+            .join("doublepage")
+            .join("session-keep");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+        let cache_fixture = fixture_path("cover_layout.png");
+        fs::copy(&cache_fixture, cache_dir.join("cover_layout.png")).expect("copy cache fixture");
+
+        let fixture = fixture_path("double_page_story.png");
+        let target = temp.path().join("double_page_story.png");
+        fs::copy(&fixture, &target).expect("copy primary fixture");
+
+        let outcome = prepare_split(
+            SplitCommandOptions {
+                directory: temp.path().to_path_buf(),
+                dry_run: true,
+                overwrite: true,
+                thresholds: None,
+            },
+            None,
+        )
+        .expect("split outcome");
+
+        assert_eq!(outcome.analyzed_files, 1);
+        assert_eq!(outcome.split_pages, 1);
+        assert!(outcome
+            .items
+            .iter()
+            .all(|item| !item.source.to_string_lossy().contains(".rei_cache")));
     }
 
     #[test]
