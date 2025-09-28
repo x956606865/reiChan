@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::doublepage::SplitDetectionSummary;
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use hex;
@@ -51,6 +52,27 @@ pub struct RenameOutcome {
     pub entries: Vec<RenameEntry>,
     pub dry_run: bool,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub split_applied: bool,
+    #[serde(default)]
+    pub split_workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub split_report_path: Option<PathBuf>,
+    #[serde(default)]
+    pub split_summary: Option<RenameSplitSummary>,
+    #[serde(default)]
+    pub source_directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSplitSummary {
+    pub analyzed_files: usize,
+    pub emitted_files: usize,
+    pub skipped_files: usize,
+    pub split_pages: usize,
+    pub cover_trims: usize,
+    pub fallback_splits: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +101,8 @@ pub struct MangaSourceAnalysis {
     pub total_images: usize,
     pub volume_candidates: Vec<VolumeCandidate>,
     pub skipped_entries: Vec<String>,
+    #[serde(default)]
+    pub split_detection: Option<SplitDetectionSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +115,23 @@ pub struct RenameOptions {
     pub target_extension: String,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
+    pub split: RenameSplitOptions,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSplitOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub report_path: Option<PathBuf>,
+    #[serde(default)]
+    pub summary: Option<RenameSplitSummary>,
+    #[serde(default)]
+    pub warnings: Option<Vec<String>>,
 }
 
 fn default_pad() -> usize {
@@ -108,6 +149,7 @@ pub enum RenameError {
     EmptyDirectory(PathBuf),
     NonUtf8Path(PathBuf),
     Serialization(serde_json::Error),
+    SplitWorkspaceMissing(PathBuf),
 }
 
 impl fmt::Display for RenameError {
@@ -124,6 +166,9 @@ impl fmt::Display for RenameError {
                 write!(f, "path is not valid UTF-8: {}", path.display())
             }
             RenameError::Serialization(err) => write!(f, "failed to write manifest: {}", err),
+            RenameError::SplitWorkspaceMissing(path) => {
+                write!(f, "split workspace not found: {}", path.display())
+            }
         }
     }
 }
@@ -220,6 +265,8 @@ pub fn analyze_manga_directory(directory: PathBuf) -> Result<MangaSourceAnalysis
         root_image_count + total_volume_images
     };
 
+    let split_detection = crate::doublepage::estimate_split_candidates(&directory).ok();
+
     Ok(MangaSourceAnalysis {
         root: directory,
         mode,
@@ -227,6 +274,7 @@ pub fn analyze_manga_directory(directory: PathBuf) -> Result<MangaSourceAnalysis
         total_images,
         volume_candidates,
         skipped_entries,
+        split_detection,
     })
 }
 
@@ -297,6 +345,9 @@ struct ManifestFile {
     target_extension: String,
     files: Vec<ManifestEntryData>,
     skipped: Vec<String>,
+    split_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split: Option<ManifestSplitSection>,
 }
 
 #[derive(Serialize)]
@@ -305,25 +356,64 @@ struct ManifestEntryData {
     target: String,
 }
 
+struct FileCandidate {
+    path: PathBuf,
+    file_name: String,
+    numeric_hint: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ManifestSplitSection {
+    workspace: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_path: Option<PathBuf>,
+    summary: RenameSplitSummary,
+}
+
 pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameError> {
     let RenameOptions {
         directory,
         pad,
         target_extension,
         dry_run,
+        split,
     } = options;
 
     if !directory.exists() || !directory.is_dir() {
-        return Err(RenameError::DirectoryNotFound(directory));
+        return Err(RenameError::DirectoryNotFound(directory.clone()));
+    }
+
+    let mut working_directory = directory.clone();
+    let mut split_applied = false;
+    let mut split_workspace = None;
+    let split_report_path = split.report_path.clone();
+    let split_summary = split.summary.clone();
+    let split_warnings = split.warnings.clone().unwrap_or_default();
+    let mut source_directory = None;
+
+    if split.enabled {
+        let workspace_path = split
+            .workspace
+            .clone()
+            .ok_or_else(|| RenameError::SplitWorkspaceMissing(directory.clone()))?;
+
+        if !workspace_path.exists() || !workspace_path.is_dir() {
+            return Err(RenameError::SplitWorkspaceMissing(workspace_path));
+        }
+
+        split_applied = true;
+        working_directory = workspace_path.clone();
+        split_workspace = Some(workspace_path);
+        source_directory = Some(directory.clone());
     }
 
     let normalized_pad = pad.max(1);
     let normalized_extension = target_extension.to_ascii_lowercase();
 
-    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    let mut candidates: Vec<FileCandidate> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
-    for entry in fs::read_dir(&directory)? {
+    for entry in fs::read_dir(&working_directory)? {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
@@ -344,56 +434,92 @@ pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameErr
 
         match extension {
             Some(ref ext) if SUPPORTED_IMAGE_EXTENSIONS.contains(&ext.as_str()) => {
-                candidates.push((path.clone(), file_name));
+                let numeric_hint = extract_numeric_suffix(&file_name);
+                candidates.push(FileCandidate {
+                    path: path.clone(),
+                    file_name,
+                    numeric_hint,
+                });
             }
             _ => skipped.push(file_name),
         }
     }
 
     if candidates.is_empty() {
-        return Err(RenameError::EmptyDirectory(directory));
+        return Err(RenameError::EmptyDirectory(working_directory.clone()));
     }
 
-    candidates.sort_by(|a, b| compare(&a.1, &b.1));
+    candidates.sort_by(|a, b| compare(&a.file_name, &b.file_name));
 
     let mut entries = Vec::with_capacity(candidates.len());
-    for (index, (_, original)) in candidates.iter().enumerate() {
+    let mut used_numbers: HashSet<u64> = HashSet::new();
+    let mut next_sequence = 1u64;
+
+    for candidate in candidates.iter() {
+        let mut assigned_number = candidate.numeric_hint.and_then(|value| {
+            if value == 0 || used_numbers.contains(&value) {
+                None
+            } else {
+                Some(value)
+            }
+        });
+
+        if assigned_number.is_none() {
+            while used_numbers.contains(&next_sequence) {
+                next_sequence += 1;
+            }
+            assigned_number = Some(next_sequence);
+            next_sequence += 1;
+        }
+
+        let number = assigned_number.expect("assigned numbering");
+        used_numbers.insert(number);
+
         let renamed = format!(
             "{:0width$}.{}",
-            index + 1,
+            number,
             normalized_extension,
             width = normalized_pad
         );
+
         entries.push(RenameEntry {
-            original_name: original.clone(),
+            original_name: candidate.file_name.clone(),
             renamed_name: renamed,
         });
     }
 
-    let warnings = build_warnings(&skipped);
+    let mut warnings = build_warnings(&skipped);
+    if !split_warnings.is_empty() {
+        warnings.extend(split_warnings);
+    }
 
     if dry_run {
         return Ok(RenameOutcome {
-            directory,
+            directory: working_directory,
             manifest_path: None,
             entries,
             dry_run: true,
             warnings,
+            split_applied,
+            split_workspace,
+            split_report_path,
+            split_summary,
+            source_directory,
         });
     }
 
     let temp_prefix = format!(".rei_tmp_{}", std::process::id());
     let mut temp_paths = Vec::with_capacity(candidates.len());
 
-    for (index, (original_path, _)) in candidates.iter().enumerate() {
+    for (index, candidate) in candidates.iter().enumerate() {
         let temp_name = format!("{}_{:04}", temp_prefix, index);
-        let temp_path = directory.join(&temp_name);
-        fs::rename(original_path, &temp_path)?;
+        let temp_path = working_directory.join(&temp_name);
+        fs::rename(&candidate.path, &temp_path)?;
         temp_paths.push(temp_path);
     }
 
     for (index, temp_path) in temp_paths.iter().enumerate() {
-        let final_path = directory.join(&entries[index].renamed_name);
+        let final_path = working_directory.join(&entries[index].renamed_name);
         fs::rename(temp_path, &final_path)?;
     }
 
@@ -410,19 +536,34 @@ pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameErr
             })
             .collect(),
         skipped: skipped.clone(),
+        split_applied,
+        split: if split_applied {
+            split_summary.as_ref().map(|summary| ManifestSplitSection {
+                workspace: working_directory.clone(),
+                report_path: split_report_path.clone(),
+                summary: summary.clone(),
+            })
+        } else {
+            None
+        },
     };
 
-    let manifest_path = directory.join("manifest.json");
+    let manifest_path = working_directory.join("manifest.json");
     let mut manifest_file = File::create(&manifest_path)?;
     serde_json::to_writer_pretty(&mut manifest_file, &manifest)?;
     manifest_file.write_all(b"\n")?;
 
     Ok(RenameOutcome {
-        directory,
+        directory: working_directory,
         manifest_path: Some(manifest_path),
         entries,
         dry_run: false,
         warnings,
+        split_applied,
+        split_workspace,
+        split_report_path,
+        split_summary,
+        source_directory,
     })
 }
 
@@ -443,6 +584,25 @@ fn build_warnings(skipped: &[String]) -> Vec<String> {
             suffix
         )]
     }
+}
+
+fn extract_numeric_suffix(name: &str) -> Option<u64> {
+    let mut digits = String::new();
+    for ch in name.chars().rev() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if digits.is_empty() {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    digits.chars().rev().collect::<String>().parse::<u64>().ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -541,9 +701,15 @@ pub struct JobParamsPayload {
     pub model: String,
     #[serde(default = "default_denoise")]
     pub denoise: String,
-    #[serde(default = "default_output_format")]
+    #[serde(
+        default = "default_output_format",
+        skip_serializing_if = "is_default_output_format"
+    )]
     pub output_format: String,
-    #[serde(default = "default_jpeg_quality")]
+    #[serde(
+        default = "default_jpeg_quality",
+        skip_serializing_if = "is_default_jpeg_quality"
+    )]
     pub jpeg_quality: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile_size: Option<u32>,
@@ -551,7 +717,7 @@ pub struct JobParamsPayload {
     pub tile_pad: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<u32>,
-    #[serde(default = "default_device")]
+    #[serde(default = "default_device", skip_serializing_if = "is_default_device")]
     pub device: String,
 }
 
@@ -583,6 +749,18 @@ fn default_denoise() -> String {
     "medium".to_string()
 }
 
+fn is_default_output_format(value: &String) -> bool {
+    value == &default_output_format()
+}
+
+fn is_default_jpeg_quality(value: &u8) -> bool {
+    *value == default_jpeg_quality()
+}
+
+fn is_default_device(value: &String) -> bool {
+    value == &default_device()
+}
+
 fn default_output_format() -> String {
     "jpg".to_string()
 }
@@ -598,6 +776,7 @@ fn default_device() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSubmission {
+    #[serde(alias = "job_id")]
     pub job_id: String,
 }
 
@@ -613,11 +792,13 @@ pub struct JobStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStatusSnapshot {
+    #[serde(alias = "job_id")]
     pub job_id: String,
     pub status: String,
     pub processed: u32,
     pub total: u32,
     #[serde(default)]
+    #[serde(alias = "artifact_path")]
     pub artifact_path: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
@@ -626,6 +807,7 @@ pub struct JobStatusSnapshot {
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
+    #[serde(alias = "artifact_hash")]
     pub artifact_hash: Option<String>,
     #[serde(default)]
     pub params: Option<JobParamsPayload>,
@@ -1302,14 +1484,8 @@ fn finalize_artifact(
 
     if cleanup_extract {
         match fs::remove_dir_all(&extract_root) {
-            Ok(_) => warnings.push(format!(
-                "已清理临时目录 {}",
-                extract_root.display()
-            )),
-            Err(err) => warnings.push(format!(
-                "清理临时目录失败: {}",
-                err
-            )),
+            Ok(_) => warnings.push(format!("已清理临时目录 {}", extract_root.display())),
+            Err(err) => warnings.push(format!("清理临时目录失败: {}", err)),
         }
     }
 
@@ -1423,9 +1599,15 @@ pub fn validate_artifact(
             let mut report: ArtifactReport = serde_json::from_reader(BufReader::new(file))
                 .map_err(|err| ArtifactError::CachedReportRead(cache_report_path.clone(), err))?;
             report.report_path = Some(cache_report_path.clone());
-            report
+            if !report
                 .warnings
-                .push("远端产物未变更，返回本地缓存结果。".to_string());
+                .iter()
+                .any(|warning| warning.contains("未变更"))
+            {
+                report
+                    .warnings
+                    .insert(0, "远端产物未变更，返回本地缓存结果。".to_string());
+            }
             return Ok(report);
         }
         return Err(ArtifactError::NotModifiedWithoutCache(extract_root.clone()));
@@ -2102,12 +2284,10 @@ mod artifact_tests {
         assert_eq!(summary.archive_path, expected_archive);
         assert!(expected_archive.exists());
         assert!(!summary.extract_path.exists());
-        assert!(
-            summary
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("已清理临时目录"))
-        );
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("已清理临时目录")));
 
         let file = File::open(&summary.archive_path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -2573,6 +2753,7 @@ mod tests {
             pad: 4,
             target_extension: "jpg".to_string(),
             dry_run: true,
+            split: RenameSplitOptions::default(),
         })
         .expect("rename result");
 
@@ -2581,6 +2762,8 @@ mod tests {
         assert!(result.manifest_path.is_none());
         assert_eq!(result.entries[0].renamed_name, "0001.jpg");
         assert_eq!(result.entries[1].renamed_name, "0002.jpg");
+        assert!(!result.split_applied);
+        assert!(result.split_workspace.is_none());
         assert!(temp.path().join("page10.png").exists());
         assert!(temp.path().join("page1.jpg").exists());
         assert!(temp.path().join("page02.jpeg").exists());
@@ -2597,6 +2780,7 @@ mod tests {
             pad: 4,
             target_extension: "jpg".to_string(),
             dry_run: false,
+            split: RenameSplitOptions::default(),
         })
         .expect("rename result");
 
@@ -2606,12 +2790,39 @@ mod tests {
         assert!(temp.path().join("0001.jpg").exists());
         assert!(temp.path().join("0002.jpg").exists());
         assert!(!temp.path().join("p1.png").exists());
+        assert!(!result.split_applied);
+        assert!(result.split_workspace.is_none());
 
         let manifest_text = fs::read_to_string(manifest_path).expect("read manifest");
         let manifest_json: serde_json::Value =
             serde_json::from_str(&manifest_text).expect("parse json");
         assert_eq!(manifest_json["files"].as_array().unwrap().len(), 2);
         assert_eq!(manifest_json["files"][0]["target"], "0001.jpg");
+    }
+
+    #[test]
+    fn rename_prefers_numeric_suffix_when_available() {
+        let temp = TempDir::new().expect("temp dir");
+        write_file(temp.path(), "Dl-Raw.net-01.jpg");
+        write_file(temp.path(), "Dl-Raw.net-010.jpg");
+        write_file(temp.path(), "Dl-Raw.net-0100.jpg");
+
+        let result = perform_rename(RenameOptions {
+            directory: temp.path().to_path_buf(),
+            pad: 4,
+            target_extension: "jpg".to_string(),
+            dry_run: true,
+            split: RenameSplitOptions::default(),
+        })
+        .expect("rename result");
+
+        let mut targets: Vec<String> = result
+            .entries
+            .iter()
+            .map(|entry| entry.renamed_name.clone())
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec!["0001.jpg", "0010.jpg", "0100.jpg"]);
     }
 
     #[test]

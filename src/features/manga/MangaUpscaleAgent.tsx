@@ -14,6 +14,53 @@ type RenameOutcome = {
   entries: RenameEntry[];
   dryRun: boolean;
   warnings: string[];
+  splitApplied?: boolean;
+  splitWorkspace?: string | null;
+  splitReportPath?: string | null;
+  splitSummary?: RenameSplitSummary | null;
+  sourceDirectory?: string | null;
+};
+
+type RenameSplitSummary = {
+  analyzedFiles: number;
+  emittedFiles: number;
+  skippedFiles: number;
+  splitPages: number;
+  coverTrims: number;
+  fallbackSplits: number;
+};
+
+type SplitMode = "skip" | "cover-trim" | "split" | "fallback-center";
+
+type SplitItemReport = {
+  source: string;
+  mode: SplitMode;
+  splitX?: number | null;
+  confidence: number;
+  contentWidthRatio: number;
+  outputs: string[];
+  metadata: Record<string, unknown>;
+};
+
+type SplitCommandOutcome = {
+  analyzedFiles: number;
+  emittedFiles: number;
+  skippedFiles: number;
+  splitPages: number;
+  coverTrims: number;
+  fallbackSplits: number;
+  workspaceDirectory?: string | null;
+  reportPath?: string | null;
+  items: SplitItemReport[];
+  warnings: string[];
+};
+
+type RenameSplitPayload = {
+  enabled: boolean;
+  workspace?: string | null;
+  reportPath?: string | null;
+  summary?: RenameSplitSummary | null;
+  warnings?: string[];
 };
 
 type UploadMode = "zip" | "folder";
@@ -250,6 +297,20 @@ type VolumeCandidate = {
   detectedNumber?: number | null;
 };
 
+type SplitDetectionSummary = {
+  total: number;
+  candidates: number;
+};
+
+type SplitProgressStage = "initializing" | "processing" | "completed";
+
+type SplitProgressPayload = {
+  totalFiles: number;
+  processedFiles: number;
+  currentFile?: string | null;
+  stage: SplitProgressStage;
+};
+
 type MangaSourceAnalysis = {
   root: string;
   mode: MangaSourceMode;
@@ -257,6 +318,7 @@ type MangaSourceAnalysis = {
   totalImages: number;
   volumeCandidates: VolumeCandidate[];
   skippedEntries: string[];
+  splitDetection?: SplitDetectionSummary | null;
 };
 
 type VolumeMapping = {
@@ -365,6 +427,66 @@ const MangaUpscaleAgent = () => {
     pollIntervalMs: DEFAULT_POLL_INTERVAL,
   });
   const [jobParams, setJobParams] = useState<JobParamsConfig>(DEFAULT_JOB_PARAMS);
+  const [contentSplitEnabled, setContentSplitEnabled] = useState(false);
+  const [splitWorkspace, setSplitWorkspace] = useState<string | null>(null);
+  const [splitSummaryState, setSplitSummaryState] = useState<RenameSplitSummary | null>(null);
+  const [splitWarningsState, setSplitWarningsState] = useState<string[]>([]);
+  const [splitReportPath, setSplitReportPath] = useState<string | null>(null);
+  const [splitSourceRoot, setSplitSourceRoot] = useState<string | null>(null);
+  const [splitPreparing, setSplitPreparing] = useState(false);
+  const [splitError, setSplitError] = useState<string | null>(null);
+  const [splitEstimate, setSplitEstimate] = useState<SplitDetectionSummary | null>(null);
+  const [splitProgress, setSplitProgress] = useState<SplitProgressPayload | null>(null);
+
+  const splitProgressPercent = useMemo(() => {
+    if (!splitProgress) {
+      return 0;
+    }
+    if (splitProgress.totalFiles <= 0) {
+      return splitProgress.stage === "completed" ? 100 : 0;
+    }
+    const percent =
+      (splitProgress.processedFiles / Math.max(splitProgress.totalFiles, 1)) * 100;
+    return Math.min(100, Math.max(0, Math.round(percent)));
+  }, [splitProgress]);
+
+  const splitProgressStatus = useMemo(() => {
+    if (!splitProgress) {
+      return splitPreparing ? "正在初始化拆分…" : null;
+    }
+
+    if (splitProgress.stage === "completed") {
+      return "拆分完成";
+    }
+
+    if (splitProgress.stage === "processing") {
+      if (splitProgress.totalFiles > 0) {
+        return `处理中 ${splitProgress.processedFiles}/${splitProgress.totalFiles}`;
+      }
+      return "处理中…";
+    }
+
+    return "正在初始化拆分…";
+  }, [splitPreparing, splitProgress]);
+
+  const splitProgressFileName = useMemo(() => {
+    if (!splitProgress?.currentFile) {
+      return null;
+    }
+    const fragments = splitProgress.currentFile.split(/[\\/]/);
+    const last = fragments[fragments.length - 1];
+    return last && last.trim().length > 0 ? last : splitProgress.currentFile;
+  }, [splitProgress]);
+
+  const resetSplitState = useCallback(() => {
+    setSplitWorkspace(null);
+    setSplitSummaryState(null);
+    setSplitWarningsState([]);
+    setSplitReportPath(null);
+    setSplitSourceRoot(null);
+    setSplitError(null);
+    setSplitProgress(null);
+  }, []);
   const [jobParamFavorites, setJobParamFavorites] = useState<JobParamFavorite[]>([]);
   const [jobParamsRestored, setJobParamsRestored] = useState(false);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
@@ -450,6 +572,7 @@ const MangaUpscaleAgent = () => {
         });
 
         setSourceAnalysis(analysis);
+        setSplitEstimate(analysis.splitDetection ?? null);
 
         if (analysis.mode === "multiVolume") {
           const mappings = buildInitialMappings(analysis);
@@ -467,6 +590,7 @@ const MangaUpscaleAgent = () => {
         setMappingConfirmed(false);
         setSelectedVolumeKey(null);
         setAnalysisError(error instanceof Error ? error.message : String(error));
+        setSplitEstimate(null);
       } finally {
         setAnalysisLoading(false);
       }
@@ -736,87 +860,6 @@ const MangaUpscaleAgent = () => {
   }, [jobForm.inputPath, lastUploadRemotePath]);
 
   useEffect(() => {
-    let disposed = false;
-    const disposers: UnlistenFn[] = [];
-
-    const bind = async () => {
-      try {
-        const uploadUnlisten = await listen<UploadProgressPayload>(
-          "manga-upload-progress",
-          (event) => {
-            const payload = event.payload;
-            if (!payload) {
-              return;
-            }
-
-            setUploadProgress(payload);
-
-            switch (payload.stage) {
-              case "preparing":
-                setUploadError(null);
-                setUploadStatus(null);
-                break;
-              case "failed":
-                setUploadError(payload.message ?? "上传失败");
-                setUploadStatus(null);
-                break;
-              case "completed":
-                setUploadError(null);
-                setUploadStatus((prev) => payload.message ?? prev ?? "上传完成");
-                break;
-              default:
-                break;
-            }
-          },
-        );
-
-        if (disposed) {
-          uploadUnlisten();
-          return;
-        }
-        disposers.push(uploadUnlisten);
-
-        const jobUnlisten = await listen<JobEventPayload>("manga-job-event", (event) => {
-          const payload = event.payload;
-          if (!payload) {
-            return;
-          }
-
-          setJobs((prev) => {
-            const existing = prev.find((item) => item.jobId === payload.jobId);
-            const record = mapPayloadToRecord(payload, undefined, existing ?? undefined);
-            const next = prev.filter((item) => item.jobId !== record.jobId);
-            next.push(record);
-            next.sort((a, b) => b.lastUpdated - a.lastUpdated);
-            return next;
-          });
-        });
-
-        if (disposed) {
-          jobUnlisten();
-          return;
-        }
-        disposers.push(jobUnlisten);
-      } catch (bindingError) {
-        console.warn("Failed to bind manga upscale events", bindingError);
-      }
-    };
-
-    void bind();
-
-    return () => {
-      disposed = true;
-      disposers.forEach((dispose) => {
-        try {
-          dispose();
-        } catch {
-          /* ignore */
-        }
-      });
-    };
-  }, []);
-
-  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -849,6 +892,36 @@ const MangaUpscaleAgent = () => {
       setSelectedVolumeKey(volumeMappings[0].directory);
     }
   }, [isMultiVolumeSource, selectedVolumeKey, volumeMappings]);
+
+  useEffect(() => {
+    if (isMultiVolumeSource && contentSplitEnabled) {
+      setContentSplitEnabled(false);
+      resetSplitState();
+    }
+  }, [contentSplitEnabled, isMultiVolumeSource, resetSplitState]);
+
+  useEffect(() => {
+    if (splitPreparing) {
+      return;
+    }
+
+    if (!splitProgress) {
+      return;
+    }
+
+    if (typeof window === "undefined") {
+      setSplitProgress(null);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setSplitProgress(null);
+    }, 600);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [splitPreparing, splitProgress]);
 
   useEffect(() => {
     const directoryCandidate =
@@ -1026,6 +1099,107 @@ const MangaUpscaleAgent = () => {
     }
   }, [analyzeDirectory]);
 
+  const resolveRenameRoot = useCallback(() => {
+    if (sourceAnalysis?.root && sourceAnalysis.root.length > 0) {
+      return sourceAnalysis.root;
+    }
+    return renameForm.directory;
+  }, [renameForm.directory, sourceAnalysis]);
+
+  const ensureSplitWorkspace = useCallback(
+    async (overwrite = false): Promise<RenameSplitPayload | null> => {
+      const root = resolveRenameRoot().trim();
+      if (!root) {
+        setSplitError("请先选择有效的漫画目录。");
+        return null;
+      }
+
+      if (!overwrite && splitWorkspace && splitSourceRoot === root) {
+        return {
+          enabled: true,
+          workspace: splitWorkspace,
+          reportPath: splitReportPath ?? undefined,
+          summary: splitSummaryState ?? null,
+          warnings: splitWarningsState.length > 0 ? [...splitWarningsState] : undefined,
+        };
+      }
+
+      setSplitProgress(null);
+      setSplitPreparing(true);
+      setSplitError(null);
+      try {
+        const outcome = await invoke<SplitCommandOutcome>("prepare_doublepage_split", {
+          options: {
+            directory: root,
+            dryRun: false,
+            overwrite,
+          },
+        });
+
+        if (!outcome.workspaceDirectory) {
+          throw new Error("拆分命令未返回工作目录。");
+        }
+
+        const summary: RenameSplitSummary = {
+          analyzedFiles: outcome.analyzedFiles,
+          emittedFiles: outcome.emittedFiles,
+          skippedFiles: outcome.skippedFiles,
+          splitPages: outcome.splitPages,
+          coverTrims: outcome.coverTrims,
+          fallbackSplits: outcome.fallbackSplits,
+        };
+
+        setSplitWorkspace(outcome.workspaceDirectory);
+        setSplitSummaryState(summary);
+        setSplitWarningsState(outcome.warnings ?? []);
+        setSplitReportPath(outcome.reportPath ?? null);
+        setSplitSourceRoot(root);
+
+        return {
+          enabled: true,
+          workspace: outcome.workspaceDirectory,
+          reportPath: outcome.reportPath ?? null,
+          summary,
+          warnings: outcome.warnings && outcome.warnings.length > 0 ? [...outcome.warnings] : undefined,
+        };
+      } catch (error) {
+        setSplitError(error instanceof Error ? error.message : String(error));
+        return null;
+      } finally {
+        setSplitPreparing(false);
+      }
+    },
+    [
+      resolveRenameRoot,
+      splitWorkspace,
+      splitSourceRoot,
+      splitSummaryState,
+      splitReportPath,
+      splitWarningsState,
+    ],
+  );
+
+  const handlePrepareSplit = useCallback(async () => {
+    if (!contentSplitEnabled) {
+      setSplitError("请先启用内容感知拆分开关。");
+      return;
+    }
+    await ensureSplitWorkspace(true);
+  }, [contentSplitEnabled, ensureSplitWorkspace]);
+
+  const handleToggleSplit = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const enabled = event.currentTarget.checked;
+      setContentSplitEnabled(enabled);
+      if (!enabled) {
+        resetSplitState();
+      } else {
+        setSplitError(null);
+      }
+    },
+    [resetSplitState],
+  );
+
   const runRename = useCallback(
     async (dryRun: boolean) => {
       if (!renameForm.directory) {
@@ -1041,12 +1215,13 @@ const MangaUpscaleAgent = () => {
       setRenameLoading(true);
       setRenameError(null);
       try {
+        const resolvedRoot = resolveRenameRoot();
         const padValue = Number.isFinite(renameForm.pad)
           ? Math.max(1, Math.floor(renameForm.pad))
           : DEFAULT_PAD;
 
         const payload = {
-          directory: renameForm.directory,
+          directory: resolvedRoot,
           pad: padValue,
           targetExtension:
             renameForm.targetExtension.trim().toLowerCase() || "jpg",
@@ -1074,19 +1249,49 @@ const MangaUpscaleAgent = () => {
 
           setRenameSummary({ mode: "multi", volumes: outcomes, dryRun });
         } else {
-          const targetDirectory =
-            (sourceAnalysis?.root && sourceAnalysis.root.length > 0
-              ? sourceAnalysis.root
-              : undefined) ?? renameForm.directory;
+          const targetDirectory = resolvedRoot;
+          let splitPayload: RenameSplitPayload | undefined;
+
+          if (contentSplitEnabled) {
+            const ensured = await ensureSplitWorkspace(false);
+            if (!ensured) {
+              return;
+            }
+            splitPayload = ensured;
+          }
 
           const result = await invoke<RenameOutcome>("rename_manga_sequence", {
             options: {
               ...payload,
               directory: targetDirectory,
+              split: splitPayload ?? { enabled: false },
             },
           });
 
+          if (result.splitApplied) {
+            if (typeof result.splitWorkspace !== "undefined") {
+              setSplitWorkspace(result.splitWorkspace ?? null);
+            }
+            if (typeof result.splitSummary !== "undefined") {
+              setSplitSummaryState(result.splitSummary ?? null);
+            }
+            if (typeof result.splitReportPath !== "undefined") {
+              setSplitReportPath(result.splitReportPath ?? null);
+            }
+            setSplitSourceRoot(result.sourceDirectory ?? targetDirectory);
+          } else if (splitPayload?.workspace) {
+            setSplitWorkspace(splitPayload.workspace);
+            setSplitSummaryState(splitPayload.summary ?? null);
+            setSplitReportPath(splitPayload.reportPath ?? null);
+            setSplitSourceRoot(targetDirectory);
+          }
+
+          if (splitPayload?.warnings) {
+            setSplitWarningsState(splitPayload.warnings);
+          }
+
           setRenameSummary({ mode: "single", outcome: result });
+          setSplitError(null);
         }
 
         if (dryRun) {
@@ -1099,10 +1304,12 @@ const MangaUpscaleAgent = () => {
       }
     },
     [
+      contentSplitEnabled,
+      ensureSplitWorkspace,
       isMultiVolumeSource,
       mappingConfirmed,
       renameForm,
-      sourceAnalysis?.root,
+      resolveRenameRoot,
       volumeMappings,
     ],
   );
@@ -1113,6 +1320,9 @@ const MangaUpscaleAgent = () => {
         const value = event.currentTarget.value;
 
         if (field === "directory") {
+          resetSplitState();
+          setContentSplitEnabled(false);
+          setSplitEstimate(null);
           setSourceAnalysis(null);
           setVolumeMappings([]);
           setMappingConfirmed(false);
@@ -1133,7 +1343,7 @@ const MangaUpscaleAgent = () => {
           return { ...prev, [field]: value } as RenameFormState;
         });
       },
-    [],
+    [resetSplitState],
   );
 
   const handleUploadInput = useCallback(
@@ -1394,6 +1604,103 @@ const MangaUpscaleAgent = () => {
     },
     [inferManifestForVolume, jobForm.bearerToken, jobForm.inputPath, jobForm.inputType, jobForm.serviceUrl],
   );
+
+  useEffect(() => {
+    let disposed = false;
+    const disposers: UnlistenFn[] = [];
+
+    const bind = async () => {
+      try {
+        const uploadUnlisten = await listen<UploadProgressPayload>(
+          "manga-upload-progress",
+          (event) => {
+            const payload = event.payload;
+            if (!payload) {
+              return;
+            }
+
+            setUploadProgress(payload);
+
+            switch (payload.stage) {
+              case "preparing":
+                setUploadError(null);
+                setUploadStatus(null);
+                break;
+              case "failed":
+                setUploadError(payload.message ?? "上传失败");
+                setUploadStatus(null);
+                break;
+              case "completed":
+                setUploadError(null);
+                setUploadStatus((prev) => payload.message ?? prev ?? "上传完成");
+                break;
+              default:
+                break;
+            }
+          },
+        );
+
+        if (disposed) {
+          uploadUnlisten();
+          return;
+        }
+        disposers.push(uploadUnlisten);
+
+        const jobUnlisten = await listen<JobEventPayload>("manga-job-event", (event) => {
+          const payload = event.payload;
+          if (!payload) {
+            return;
+          }
+
+          setJobs((prev) => {
+            const existing = prev.find((item) => item.jobId === payload.jobId);
+            const record = mapPayloadToRecord(payload, undefined, existing ?? undefined);
+            const next = prev.filter((item) => item.jobId !== record.jobId);
+            next.push(record);
+            next.sort((a, b) => b.lastUpdated - a.lastUpdated);
+            return next;
+          });
+        });
+
+        if (disposed) {
+          jobUnlisten();
+          return;
+        }
+        disposers.push(jobUnlisten);
+
+        const splitUnlisten = await listen<SplitProgressPayload>(
+          "doublepage-split-progress",
+          (event) => {
+            if (!event.payload) {
+              return;
+            }
+            setSplitProgress(event.payload);
+          },
+        );
+
+        if (disposed) {
+          splitUnlisten();
+          return;
+        }
+        disposers.push(splitUnlisten);
+      } catch (bindingError) {
+        console.warn("Failed to bind manga upscale events", bindingError);
+      }
+    };
+
+    void bind();
+
+    return () => {
+      disposed = true;
+      disposers.forEach((dispose) => {
+        try {
+          dispose();
+        } catch {
+          /* ignore */
+        }
+      });
+    };
+  }, [mapPayloadToRecord]);
 
   const handleToggleJobSelection = useCallback(
     (jobId: string) => {
@@ -2623,6 +2930,105 @@ const MangaUpscaleAgent = () => {
             </label>
           </div>
 
+          <div className="split-controls">
+            <div className="split-toggle-row">
+              <label className="form-field checkbox">
+                <input
+                  type="checkbox"
+                  checked={contentSplitEnabled}
+                  onChange={handleToggleSplit}
+                  disabled={isMultiVolumeSource}
+                />
+                <span>内容感知双页拆分（实验性）</span>
+              </label>
+
+              {contentSplitEnabled && !isMultiVolumeSource && (
+                <button
+                  type="button"
+                  className="split-action-button"
+                  onClick={handlePrepareSplit}
+                  disabled={splitPreparing}
+                >
+                  {splitPreparing ? "准备中…" : "开始内容拆分"}
+                </button>
+              )}
+            </div>
+
+            {splitEstimate && (
+              <p className="status status-tip">
+                预估拆分候选：{splitEstimate.candidates} / {splitEstimate.total}
+              </p>
+            )}
+
+            {isMultiVolumeSource && (
+              <p className="status status-tip">多卷目录暂不支持内容感知拆分，请在单卷模式或逐卷操作中使用。</p>
+            )}
+
+            {contentSplitEnabled && !isMultiVolumeSource && (
+              <div className="split-summary">
+                {(splitPreparing || splitProgress) && (
+                  <div className="split-progress" role="status" aria-live="polite">
+                    <div
+                      className="split-progress-bar"
+                      role="progressbar"
+                      aria-valuenow={splitProgress ? splitProgressPercent : 0}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                    >
+                      <span style={{ width: `${splitProgress ? splitProgressPercent : 0}%` }} />
+                    </div>
+
+                    <div className="split-progress-meta">
+                      <span className="split-progress-status">{splitProgressStatus ?? ""}</span>
+                      <span className="split-progress-percent">
+                        {splitProgress ? `${splitProgressPercent}%` : "--%"}
+                      </span>
+                      {splitProgress?.totalFiles ? (
+                        <span className="split-progress-count">
+                          {splitProgress.processedFiles}/{splitProgress.totalFiles}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    {splitProgressFileName && (
+                      <div
+                        className="split-progress-file"
+                        title={splitProgress?.currentFile ?? undefined}
+                      >
+                        {splitProgressFileName}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {splitWorkspace && (
+                  <p className="status">
+                    工作目录：{splitWorkspace}
+                    {splitSummaryState && (
+                      <span>
+                        ，输出 {splitSummaryState.emittedFiles} 文件，拆分 {splitSummaryState.splitPages} 页
+                      </span>
+                    )}
+                  </p>
+                )}
+
+                {splitReportPath && (
+                  <p className="status status-tip">拆分报告：{splitReportPath}</p>
+                )}
+
+                {splitError && <p className="status status-error">{splitError}</p>}
+
+                {splitWarningsState.length > 0 && (
+                  <ul className="status status-warning">
+                    {splitWarningsState.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className="button-row">
             <button
               type="button"
@@ -2662,6 +3068,16 @@ const MangaUpscaleAgent = () => {
                     <li key={warning}>{warning}</li>
                   ))}
                 </ul>
+              )}
+
+              {renameSummary.outcome.splitApplied && renameSummary.outcome.splitSummary && (
+                <p className="status status-tip">
+                  内容感知拆分：输出 {renameSummary.outcome.splitSummary.emittedFiles} 文件，
+                  拆分 {renameSummary.outcome.splitSummary.splitPages} 页。
+                  {renameSummary.outcome.splitWorkspace && (
+                    <span> 工作目录：{renameSummary.outcome.splitWorkspace}</span>
+                  )}
+                </p>
               )}
 
               <table className="preview-table">

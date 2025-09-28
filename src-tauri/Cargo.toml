@@ -37,6 +37,8 @@ sha2 = "0.10"
 hex = "0.4"
 walkdir = "2"
 tempfile = "3.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff", "webp", "ico"] }
+imageproc = { version = "0.24", default-features = false }
 
 [dev-dependencies]
 httpmock = "0.7"

@@ -1,3 +1,4 @@
+mod doublepage;
 mod manga;
 
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,25 @@ fn update_port_favorite(
 #[tauri::command]
 fn rename_manga_sequence(options: manga::RenameOptions) -> Result<manga::RenameOutcome, String> {
     manga::perform_rename(options).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn prepare_doublepage_split(
+    app: tauri::AppHandle,
+    options: doublepage::SplitCommandOptions,
+) -> Result<doublepage::SplitCommandOutcome, String> {
+    let handle = app.clone();
+
+    async_runtime::spawn_blocking(move || {
+        let mut progress = move |payload: doublepage::SplitProgress| {
+            let _ = handle.emit(doublepage::SPLIT_PROGRESS_EVENT, payload);
+        };
+
+        doublepage::prepare_split(options, Some(&mut progress))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -750,6 +770,7 @@ pub fn run() {
             list_port_favorites,
             update_port_favorite,
             analyze_manga_directory,
+            prepare_doublepage_split,
             rename_manga_sequence,
             upload_copyparty,
             create_manga_job,
