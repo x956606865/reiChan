@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use chrono::{SecondsFormat, Utc};
 use image::{DynamicImage, GenericImageView, ImageBuffer, Luma};
@@ -58,6 +62,19 @@ pub struct SplitProgress {
     pub processed_files: usize,
     pub current_file: Option<PathBuf>,
     pub stage: SplitProgressStage,
+}
+
+#[derive(Debug)]
+struct FileOutcome {
+    index: usize,
+    source: PathBuf,
+    items: Vec<SplitItemReport>,
+    warnings: Vec<String>,
+    emitted_files: usize,
+    skipped_files: usize,
+    split_pages: usize,
+    cover_trims: usize,
+    fallback_splits: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -228,21 +245,14 @@ fn prepare_split_internal<'a>(
 
     entries.sort();
 
+    let entries = Arc::new(entries);
     let total_files = entries.len();
     let workspace_directory = if dry_run {
         None
     } else {
-        Some(create_workspace(&directory, overwrite)?)
+        Some(Arc::new(create_workspace(&directory, overwrite)?))
     };
 
-    let mut analyzed_files = 0usize;
-    let mut emitted_files = 0usize;
-    let mut skipped_files = 0usize;
-    let mut split_pages = 0usize;
-    let mut cover_trims = 0usize;
-    let mut fallback_splits = 0usize;
-    let mut warnings: Vec<String> = Vec::new();
-    let mut items: Vec<SplitItemReport> = Vec::new();
     let mut processed_files = 0usize;
 
     emit_progress(
@@ -255,165 +265,105 @@ fn prepare_split_internal<'a>(
         },
     );
 
-    for path in entries.iter() {
-        analyzed_files += 1;
+    let results: Arc<Mutex<Vec<FileOutcome>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(total_files)));
+    let progress_state: Arc<(Mutex<BTreeMap<usize, PathBuf>>, Condvar)> =
+        Arc::new((Mutex::new(BTreeMap::new()), Condvar::new()));
+    let thresholds_for_workers = thresholds;
+    let workspace_for_workers = workspace_directory.clone();
+    let results_handle = Arc::clone(&results);
+    let progress_handle = Arc::clone(&progress_state);
+    let worker_count = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(total_files.max(1));
+    let task_cursor = Arc::new(AtomicUsize::new(0));
 
-        let image = match image::open(path) {
-            Ok(img) => img,
-            Err(err) => {
-                warnings.push(format!("failed to read {}: {}", path.display(), err));
-                skipped_files += 1;
-                processed_files += 1;
-                emit_progress(
-                    &mut progress,
-                    SplitProgress {
-                        total_files,
-                        processed_files,
-                        current_file: Some(path.clone()),
-                        stage: SplitProgressStage::Processing,
-                    },
-                );
-                continue;
-            }
-        };
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let entries = Arc::clone(&entries);
+            let results_collector = Arc::clone(&results_handle);
+            let progress_tracker = Arc::clone(&progress_handle);
+            let cursor = Arc::clone(&task_cursor);
+            let worker_workspace = workspace_for_workers.clone();
 
-        match process_image(&image, path, thresholds) {
-            ProcessResult::Skip(meta) => {
-                skipped_files += 1;
-                let outputs = if let Some(workspace) = &workspace_directory {
-                    let target = workspace.join(path.file_name().unwrap());
-                    if let Err(err) = fs::copy(path, &target) {
-                        warnings.push(format!(
-                            "failed to copy {} into workspace: {}",
-                            path.display(),
-                            err
-                        ));
-                    } else {
-                        emitted_files += 1;
-                    }
-                    vec![target]
-                } else {
-                    Vec::new()
-                };
-
-                items.push(SplitItemReport {
-                    source: path.clone(),
-                    mode: SplitMode::Skip,
-                    split_x: None,
-                    confidence: 0.0,
-                    content_width_ratio: meta.content_width_ratio,
-                    outputs,
-                    metadata: meta.into_metadata_json(),
-                });
-            }
-            ProcessResult::CoverTrim { image: cover, meta } => {
-                cover_trims += 1;
-                let (outputs, emitted) = if let Some(workspace) = &workspace_directory {
-                    let filename = format!(
-                        "{}_cover{}",
-                        path.file_stem().unwrap().to_string_lossy(),
-                        path.extension()
-                            .map(|ext| format!(".{}", ext.to_string_lossy()))
-                            .unwrap_or_else(String::new)
-                    );
-                    let target = workspace.join(&filename);
-                    if let Err(err) = save_image(&cover, &target) {
-                        warnings.push(format!("failed to write {}: {}", target.display(), err));
-                        (Vec::new(), 0)
-                    } else {
-                        (vec![target], 1)
-                    }
-                } else {
-                    (Vec::new(), 0)
-                };
-                emitted_files += emitted;
-
-                items.push(SplitItemReport {
-                    source: path.clone(),
-                    mode: SplitMode::CoverTrim,
-                    split_x: None,
-                    confidence: 1.0,
-                    content_width_ratio: meta.content_width_ratio,
-                    outputs,
-                    metadata: meta.into_metadata_json(),
-                });
-            }
-            ProcessResult::Split {
-                left,
-                right,
-                split_x,
-                confidence,
-                content_width_ratio,
-                meta,
-                fallback,
-            } => {
-                split_pages += 1;
-                if fallback {
-                    fallback_splits += 1;
+            scope.spawn(move || loop {
+                let index = cursor.fetch_add(1, Ordering::SeqCst);
+                if index >= entries.len() {
+                    break;
                 }
 
-                let (outputs, emitted) = if let Some(workspace) = &workspace_directory {
-                    let stem = path.file_stem().unwrap().to_string_lossy();
-                    let suffix = path
-                        .extension()
-                        .map(|ext| format!(".{}", ext.to_string_lossy()))
-                        .unwrap_or_else(String::new);
-                    let right_name = format!("{}_R{}", stem, suffix);
-                    let left_name = format!("{}_L{}", stem, suffix);
-                    let right_path = workspace.join(&right_name);
-                    let left_path = workspace.join(&left_name);
-                    let mut emitted_local = 0;
-                    if let Err(err) = save_image(&right, &right_path) {
-                        warnings.push(format!(
-                            "failed to write {}: {}",
-                            right_path.display(),
-                            err
-                        ));
-                    } else {
-                        emitted_local += 1;
-                    }
-                    if let Err(err) = save_image(&left, &left_path) {
-                        warnings.push(format!(
-                            "failed to write {}: {}",
-                            left_path.display(),
-                            err
-                        ));
-                    } else {
-                        emitted_local += 1;
-                    }
-                    (vec![right_path, left_path], emitted_local)
-                } else {
-                    (Vec::new(), 0)
-                };
+                let path = entries[index].clone();
+                let workspace_entry = worker_workspace.as_ref().map(Arc::clone);
+                let outcome = process_entry(index, path, thresholds_for_workers, workspace_entry);
 
-                emitted_files += emitted;
+                {
+                    let (lock, cvar) = &*progress_tracker;
+                    let mut pending = lock.lock().expect("progress tracker lock poisoned");
+                    pending.insert(outcome.index, outcome.source.clone());
+                    cvar.notify_one();
+                }
 
-                items.push(SplitItemReport {
-                    source: path.clone(),
-                    mode: if fallback {
-                        SplitMode::FallbackCenter
-                    } else {
-                        SplitMode::Split
-                    },
-                    split_x: Some(split_x),
-                    confidence,
-                    content_width_ratio,
-                    outputs,
-                    metadata: meta,
-                });
-            }
+                let mut guard = results_collector
+                    .lock()
+                    .expect("results collector poisoned");
+                guard.push(outcome);
+            });
         }
 
-        processed_files += 1;
-        emit_progress(
-            &mut progress,
-            SplitProgress {
-                total_files,
-                processed_files,
-                current_file: Some(path.clone()),
-                stage: SplitProgressStage::Processing,
-            },
-        );
+        let (lock, cvar) = &*progress_handle;
+        while processed_files < total_files {
+            let path = {
+                let mut pending = lock.lock().expect("progress tracker lock poisoned");
+                while !pending.contains_key(&processed_files) {
+                    pending = cvar
+                        .wait(pending)
+                        .expect("progress tracker condvar poisoned");
+                }
+                pending
+                    .remove(&processed_files)
+                    .expect("missing progress entry")
+            };
+
+            processed_files += 1;
+            emit_progress(
+                &mut progress,
+                SplitProgress {
+                    total_files,
+                    processed_files,
+                    current_file: Some(path),
+                    stage: SplitProgressStage::Processing,
+                },
+            );
+        }
+    });
+
+    drop(results_handle);
+    drop(progress_handle);
+
+    let mut results = Arc::try_unwrap(results)
+        .expect("dangling references to results collector")
+        .into_inner()
+        .expect("results collector poisoned");
+
+    results.sort_by_key(|outcome| outcome.index);
+
+    let mut emitted_files = 0usize;
+    let mut skipped_files = 0usize;
+    let mut split_pages = 0usize;
+    let mut cover_trims = 0usize;
+    let mut fallback_splits = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut items: Vec<SplitItemReport> = Vec::new();
+
+    for outcome in results.into_iter() {
+        emitted_files += outcome.emitted_files;
+        skipped_files += outcome.skipped_files;
+        split_pages += outcome.split_pages;
+        cover_trims += outcome.cover_trims;
+        fallback_splits += outcome.fallback_splits;
+        warnings.extend(outcome.warnings);
+        items.extend(outcome.items);
     }
 
     let report_path = if dry_run {
@@ -454,25 +404,195 @@ fn prepare_split_internal<'a>(
     );
 
     Ok(SplitCommandOutcome {
-        analyzed_files,
+        analyzed_files: total_files,
         emitted_files,
         skipped_files,
         split_pages,
         cover_trims,
         fallback_splits,
-        workspace_directory,
+        workspace_directory: workspace_directory
+            .as_ref()
+            .map(|dir| dir.as_path().to_path_buf()),
         report_path,
         items,
         warnings,
     })
 }
 
-fn emit_progress(
-    callback: &mut Option<&mut dyn FnMut(SplitProgress)>,
-    payload: SplitProgress,
-) {
+fn emit_progress(callback: &mut Option<&mut dyn FnMut(SplitProgress)>, payload: SplitProgress) {
     if let Some(listener) = callback.as_mut() {
         listener(payload);
+    }
+}
+
+fn process_entry(
+    index: usize,
+    path: PathBuf,
+    thresholds: SplitThresholds,
+    workspace: Option<Arc<PathBuf>>,
+) -> FileOutcome {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut items: Vec<SplitItemReport> = Vec::new();
+    let mut emitted_files = 0usize;
+    let mut skipped_files = 0usize;
+    let mut split_pages = 0usize;
+    let mut cover_trims = 0usize;
+    let mut fallback_splits = 0usize;
+
+    let workspace_path = workspace.as_ref().map(|dir| dir.as_path());
+
+    let image = match image::open(&path) {
+        Ok(img) => img,
+        Err(err) => {
+            warnings.push(format!("failed to read {}: {}", path.display(), err));
+            skipped_files = 1;
+            return FileOutcome {
+                index,
+                source: path,
+                items,
+                warnings,
+                emitted_files,
+                skipped_files,
+                split_pages,
+                cover_trims,
+                fallback_splits,
+            };
+        }
+    };
+
+    match process_image(&image, &path, thresholds) {
+        ProcessResult::Skip(meta) => {
+            skipped_files += 1;
+            let outputs = if let Some(dir) = workspace_path {
+                let target = dir.join(path.file_name().unwrap());
+                match fs::copy(&path, &target) {
+                    Ok(_) => {
+                        emitted_files += 1;
+                        vec![target]
+                    }
+                    Err(err) => {
+                        warnings.push(format!(
+                            "failed to copy {} into workspace: {}",
+                            path.display(),
+                            err
+                        ));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            items.push(SplitItemReport {
+                source: path.clone(),
+                mode: SplitMode::Skip,
+                split_x: None,
+                confidence: 0.0,
+                content_width_ratio: meta.content_width_ratio,
+                outputs,
+                metadata: meta.into_metadata_json(),
+            });
+        }
+        ProcessResult::CoverTrim { image: cover, meta } => {
+            cover_trims += 1;
+            let (outputs, emitted) = if let Some(dir) = workspace_path {
+                let filename = format!(
+                    "{}_cover{}",
+                    path.file_stem().unwrap().to_string_lossy(),
+                    path.extension()
+                        .map(|ext| format!(".{}", ext.to_string_lossy()))
+                        .unwrap_or_else(String::new)
+                );
+                let target = dir.join(&filename);
+                if let Err(err) = save_image(&cover, &target) {
+                    warnings.push(format!("failed to write {}: {}", target.display(), err));
+                    (Vec::new(), 0)
+                } else {
+                    (vec![target], 1)
+                }
+            } else {
+                (Vec::new(), 0)
+            };
+            emitted_files += emitted;
+
+            items.push(SplitItemReport {
+                source: path.clone(),
+                mode: SplitMode::CoverTrim,
+                split_x: None,
+                confidence: 1.0,
+                content_width_ratio: meta.content_width_ratio,
+                outputs,
+                metadata: meta.into_metadata_json(),
+            });
+        }
+        ProcessResult::Split {
+            left,
+            right,
+            split_x,
+            confidence,
+            content_width_ratio,
+            meta,
+            fallback,
+        } => {
+            split_pages += 1;
+            if fallback {
+                fallback_splits += 1;
+            }
+
+            let (outputs, emitted) = if let Some(dir) = workspace_path {
+                let stem = path.file_stem().unwrap().to_string_lossy();
+                let suffix = path
+                    .extension()
+                    .map(|ext| format!(".{}", ext.to_string_lossy()))
+                    .unwrap_or_else(String::new);
+                let right_name = format!("{}_R{}", stem, suffix);
+                let left_name = format!("{}_L{}", stem, suffix);
+                let right_path = dir.join(&right_name);
+                let left_path = dir.join(&left_name);
+                let mut emitted_local = 0usize;
+                if let Err(err) = save_image(&right, &right_path) {
+                    warnings.push(format!("failed to write {}: {}", right_path.display(), err));
+                } else {
+                    emitted_local += 1;
+                }
+                if let Err(err) = save_image(&left, &left_path) {
+                    warnings.push(format!("failed to write {}: {}", left_path.display(), err));
+                } else {
+                    emitted_local += 1;
+                }
+                (vec![right_path, left_path], emitted_local)
+            } else {
+                (Vec::new(), 0)
+            };
+
+            emitted_files += emitted;
+
+            items.push(SplitItemReport {
+                source: path.clone(),
+                mode: if fallback {
+                    SplitMode::FallbackCenter
+                } else {
+                    SplitMode::Split
+                },
+                split_x: Some(split_x),
+                confidence,
+                content_width_ratio,
+                outputs,
+                metadata: meta,
+            });
+        }
+    }
+
+    FileOutcome {
+        index,
+        source: path,
+        items,
+        warnings,
+        emitted_files,
+        skipped_files,
+        split_pages,
+        cover_trims,
+        fallback_splits,
     }
 }
 
@@ -900,7 +1020,10 @@ mod tests {
             .expect("progress run");
         }
 
-        assert!(events.len() >= 3, "expected init, per-file, and completion events");
+        assert!(
+            events.len() >= 3,
+            "expected init, per-file, and completion events"
+        );
         let total_files = fixtures.len();
 
         let first = &events[0];
