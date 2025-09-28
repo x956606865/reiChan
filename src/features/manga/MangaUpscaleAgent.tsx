@@ -2291,6 +2291,7 @@ const MangaUpscaleAgent = () => {
       }
 
       let localPath = renameForm.directory;
+      let splitSourceAnchor: string | null = null;
 
       if (isMultiVolumeSource) {
         if (!selectedVolume) {
@@ -2308,8 +2309,33 @@ const MangaUpscaleAgent = () => {
         }
 
         localPath = selectedVolume.directory;
+        splitSourceAnchor = selectedVolume.directory;
       } else if (renameSummary?.mode === "single") {
-        localPath = renameSummary.outcome.directory;
+        const outcome = renameSummary.outcome;
+        splitSourceAnchor = outcome.sourceDirectory ?? renameForm.directory;
+
+        if (outcome.splitApplied) {
+          const workspaceCandidate = outcome.splitWorkspace ?? splitWorkspace;
+          if (workspaceCandidate) {
+            localPath = workspaceCandidate;
+          } else {
+            localPath = outcome.directory;
+          }
+        } else {
+          localPath = outcome.directory;
+        }
+      } else {
+        splitSourceAnchor = renameForm.directory;
+      }
+
+      if (
+        !isMultiVolumeSource &&
+        splitWorkspace &&
+        splitSourceRoot &&
+        splitSourceAnchor &&
+        splitSourceRoot === splitSourceAnchor
+      ) {
+        localPath = splitWorkspace;
       }
 
       const request: Record<string, unknown> = {
@@ -2357,6 +2383,8 @@ const MangaUpscaleAgent = () => {
     renameForm.directory,
     renameSummary,
     selectedVolume,
+    splitSourceRoot,
+    splitWorkspace,
     uploadForm,
   ]);
 
