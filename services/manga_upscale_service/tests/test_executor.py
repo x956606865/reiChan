@@ -144,3 +144,17 @@ def test_execute_zip_input_unpacks_then_processes(tmp_path: Path) -> None:
 def test_anime_model_definition_uses_six_blocks() -> None:
     definition = executor.MODEL_DEFINITIONS["realesrgan_x4plus_anime_6b"]
     assert definition.network_args["num_block"] == 6
+
+
+def test_write_image_supports_unicode_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+
+    def _fail_imwrite(*args, **kwargs):
+        raise UnicodeEncodeError("utf-8", b"", 0, 1, "mock failure")
+
+    monkeypatch.setattr(cv2, "imwrite", _fail_imwrite)
+
+    destination = tmp_path / "ブルーピリオド" / "第1巻" / "0001.jpg"
+    executor._write_image(image, destination, JobParams())
+
+    assert destination.exists()

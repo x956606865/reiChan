@@ -382,18 +382,25 @@ def _determine_extension(output_format: str) -> str:
 
 def _write_image(image: np.ndarray, path: Path, params: "JobParams") -> None:
     ext = path.suffix.lower()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    encode_ext = ".jpg"
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, params.jpeg_quality]
 
     if ext == ".png":
-        cv2.imwrite(str(path), image, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        encode_ext = ".png"
+        encode_params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
     elif ext == ".webp":
-        cv2.imwrite(str(path), image, [cv2.IMWRITE_WEBP_QUALITY, params.jpeg_quality])
-    else:
-        cv2.imwrite(
-            str(path),
-            image,
-            [cv2.IMWRITE_JPEG_QUALITY, params.jpeg_quality],
-        )
+        encode_ext = ".webp"
+        encode_params = [cv2.IMWRITE_WEBP_QUALITY, params.jpeg_quality]
+    elif ext in {".jpeg", ".jpg"}:
+        encode_ext = ".jpg"
+
+    # Encode in-memory so that the subsequent write uses Python IO, which tolerates Unicode paths on Windows.
+    success, buffer = cv2.imencode(encode_ext, image, encode_params)
+    if not success:
+        raise RuntimeError(f"Failed to encode image '{path.name}' with format '{encode_ext}'")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(buffer.tobytes())
 
 
 def _digest_file(path: Path) -> dict[str, object]:
