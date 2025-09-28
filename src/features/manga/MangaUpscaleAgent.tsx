@@ -380,6 +380,10 @@ const DEFAULT_POLL_INTERVAL = 1000;
 const SETTINGS_KEY = "manga-upscale-agent:v1";
 const UPLOAD_DEFAULTS_KEY = `${SETTINGS_KEY}:upload-defaults`;
 const SERVICE_ADDRESS_BOOK_KEY = `${SETTINGS_KEY}:service-addresses`;
+
+const LEGACY_SETTINGS_KEY = "manga-upscale-agent";
+const LEGACY_UPLOAD_DEFAULTS_KEY = `${LEGACY_SETTINGS_KEY}:upload-defaults`;
+const LEGACY_SERVICE_ADDRESS_BOOK_KEY = `${LEGACY_SETTINGS_KEY}:service-addresses`;
 const PARAM_DEFAULTS_KEY = `${SETTINGS_KEY}:job-params`;
 const PARAM_FAVORITES_KEY = `${SETTINGS_KEY}:job-param-favorites`;
 
@@ -523,7 +527,7 @@ const MangaUpscaleAgent = () => {
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const [artifactDownloadBusyJob, setArtifactDownloadBusyJob] = useState<string | null>(null);
   const [artifactValidateBusyJob, setArtifactValidateBusyJob] = useState<string | null>(null);
-  const [artifactTargetRoot, setArtifactTargetRoot] = useState<string>("");
+  const [artifactTargetRoot, setArtifactTargetRoot] = useState<string | null>(null);
   const [currentStep, setCurrentStep] = useState<StepId>("source");
 
   const sanitizeVolumeName = useCallback((folderName: string) => {
@@ -635,13 +639,17 @@ const MangaUpscaleAgent = () => {
 
     try {
       const stored = window.localStorage.getItem(SETTINGS_KEY);
+      const legacyStored = window.localStorage.getItem(LEGACY_SETTINGS_KEY);
       const storedDefaults = window.localStorage.getItem(UPLOAD_DEFAULTS_KEY);
+      const legacyDefaults = window.localStorage.getItem(LEGACY_UPLOAD_DEFAULTS_KEY);
       const storedAddressBookRaw = window.localStorage.getItem(SERVICE_ADDRESS_BOOK_KEY);
+      const legacyAddressBookRaw = window.localStorage.getItem(LEGACY_SERVICE_ADDRESS_BOOK_KEY);
 
       let uploadPatch: Partial<UploadFormState> | null = null;
       let jobPatch: Partial<JobFormState> | null = null;
       let defaultsServiceUrl: string | null = null;
       let storedAddressBook: ServiceAddressBook | null = null;
+      let legacyAddressBook: ServiceAddressBook | null = null;
 
       if (stored) {
         const parsed = JSON.parse(stored) as {
@@ -660,6 +668,27 @@ const MangaUpscaleAgent = () => {
         }
       }
 
+      if (!uploadPatch && legacyStored) {
+        try {
+          const legacyParsed = JSON.parse(legacyStored) as {
+            uploadForm?: Partial<UploadFormState>;
+            jobForm?: Partial<JobFormState>;
+          };
+
+          if (legacyParsed.uploadForm) {
+            uploadPatch = { ...legacyParsed.uploadForm };
+            if (uploadPatch && "remotePath" in uploadPatch) {
+              delete (uploadPatch as Record<string, unknown>).remotePath;
+            }
+          }
+          if (legacyParsed.jobForm) {
+            jobPatch = { ...legacyParsed.jobForm, ...(jobPatch ?? {}) };
+          }
+        } catch (legacyError) {
+          console.warn("Failed to restore legacy manga agent settings", legacyError);
+        }
+      }
+
       if (storedDefaults) {
         const defaults = JSON.parse(storedDefaults) as Partial<Pick<UploadFormState, "serviceUrl" >>;
         if (defaults?.serviceUrl) {
@@ -670,6 +699,23 @@ const MangaUpscaleAgent = () => {
               serviceUrl: defaults.serviceUrl,
             };
           }
+        }
+      }
+
+      if (!defaultsServiceUrl && legacyDefaults) {
+        try {
+          const defaults = JSON.parse(legacyDefaults) as Partial<Pick<UploadFormState, "serviceUrl" >>;
+          if (defaults?.serviceUrl) {
+            defaultsServiceUrl = defaults.serviceUrl;
+            if (!(uploadPatch?.serviceUrl)) {
+              uploadPatch = {
+                ...(uploadPatch ?? {}),
+                serviceUrl: defaults.serviceUrl,
+              };
+            }
+          }
+        } catch (legacyDefaultsError) {
+          console.warn("Failed to restore legacy upload defaults", legacyDefaultsError);
         }
       }
 
@@ -690,12 +736,34 @@ const MangaUpscaleAgent = () => {
         }
       }
 
+      if (legacyAddressBookRaw) {
+        try {
+          const parsedAddressBook = JSON.parse(legacyAddressBookRaw) as Partial<ServiceAddressBook> | null;
+          if (parsedAddressBook && typeof parsedAddressBook === "object") {
+            const upload = Array.isArray(parsedAddressBook.upload)
+              ? parsedAddressBook.upload.filter((item): item is string => typeof item === "string")
+              : [];
+            const job = Array.isArray(parsedAddressBook.job)
+              ? parsedAddressBook.job.filter((item): item is string => typeof item === "string")
+              : [];
+            legacyAddressBook = { upload, job };
+          }
+        } catch (legacyAddressError) {
+          console.warn("Failed to restore legacy service address book", legacyAddressError);
+        }
+      }
+
       const uploadCandidates = mergeServiceAddresses(
         storedAddressBook?.upload ?? [],
+        legacyAddressBook?.upload ?? [],
         uploadPatch?.serviceUrl,
         defaultsServiceUrl,
       );
-      const jobCandidates = mergeServiceAddresses(storedAddressBook?.job ?? [], jobPatch?.serviceUrl);
+      const jobCandidates = mergeServiceAddresses(
+        storedAddressBook?.job ?? [],
+        legacyAddressBook?.job ?? [],
+        jobPatch?.serviceUrl,
+      );
 
       setUploadServiceOptions(uploadCandidates);
       setJobServiceOptions(jobCandidates);
@@ -2194,12 +2262,13 @@ const MangaUpscaleAgent = () => {
       return;
     }
 
-    let targetDir = artifactTargetRoot;
+    let targetDir = artifactTargetRoot ?? null;
     if (!targetDir) {
-      targetDir = await promptForDirectory("选择批量下载目录", artifactTargetRoot);
-      if (!targetDir) {
+      const picked = await promptForDirectory("选择批量下载目录", artifactTargetRoot);
+      if (!picked) {
         return;
       }
+      targetDir = picked;
     }
 
     let success = 0;
@@ -2232,12 +2301,13 @@ const MangaUpscaleAgent = () => {
       return;
     }
 
-    let targetDir = artifactTargetRoot;
+    let targetDir = artifactTargetRoot ?? null;
     if (!targetDir) {
-      targetDir = await promptForDirectory("选择批量校验目录", artifactTargetRoot);
-      if (!targetDir) {
+      const picked = await promptForDirectory("选择批量校验目录", artifactTargetRoot);
+      if (!picked) {
         return;
       }
+      targetDir = picked;
     }
 
     let success = 0;
@@ -2466,15 +2536,6 @@ const MangaUpscaleAgent = () => {
       setCurrentStep(stepOrder[0] ?? "source");
     }
   }, [currentStep, stepOrder]);
-
-  const goToStep = useCallback(
-    (step: StepId) => {
-      if (stepOrder.includes(step)) {
-        setCurrentStep(step);
-      }
-    },
-    [stepOrder],
-  );
 
   const goToNextStep = useCallback(() => {
     const index = stepOrder.indexOf(currentStep);

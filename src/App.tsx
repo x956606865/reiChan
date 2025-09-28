@@ -1,4 +1,5 @@
 import type { ChangeEvent } from "react";
+import type { JSX } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";

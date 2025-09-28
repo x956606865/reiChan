@@ -578,10 +578,14 @@ body {
   align-items: center;
   gap: 8px;
   margin-right: 8px;
+  width: 100%;
+  min-width: 0;
 }
 
 .select-with-button select {
   flex: 1;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .select-with-button button {
