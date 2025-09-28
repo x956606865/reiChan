@@ -1,0 +1,80 @@
+{
+  "items": [
+    {
+      "source": "/Users/natsurei/self-work/ai/reiChan/docs/assets/manga-content-aware-split/phase1_input/cover_layout.png",
+      "mode": "cover-trim",
+      "split_x": null,
+      "confidence": 1.0,
+      "content_width_ratio": 0.12604166666666666,
+      "outputs": [
+        "cover_layout_cover.png"
+      ],
+      "metadata": {
+        "foreground_ratio": 0.10125,
+        "bbox": {
+          "x": 420,
+          "y": 40,
+          "width": 121,
+          "height": 401
+        },
+        "splitMode": "cover-trim",
+        "content_width_ratio": 0.12604166666666666,
+        "bbox_height_ratio": 0.8354166666666667
+      }
+    },
+    {
+      "source": "/Users/natsurei/self-work/ai/reiChan/docs/assets/manga-content-aware-split/phase1_input/double_page_story.png",
+      "mode": "split",
+      "split_x": 460,
+      "confidence": 1.0,
+      "content_width_ratio": 0.8760416666666667,
+      "outputs": [
+        "double_page_story_R.png",
+        "double_page_story_L.png"
+      ],
+      "metadata": {
+        "foreground_ratio": 0.5814908854166667,
+        "bbox": {
+          "x": 60,
+          "y": 60,
+          "width": 841,
+          "height": 361
+        },
+        "projection_imbalance": 0.005101329181343317,
+        "projection_edge_margin": 115,
+        "projection_total_mass": 267951.0,
+        "splitMode": "split",
+        "split_x": 460,
+        "confidence": 1.0,
+        "content_width_ratio": 0.8760416666666667
+      }
+    },
+    {
+      "source": "/Users/natsurei/self-work/ai/reiChan/docs/assets/manga-content-aware-split/phase1_input/panorama_dense.png",
+      "mode": "fallback-center",
+      "split_x": 500,
+      "confidence": 0.0,
+      "content_width_ratio": 0.841,
+      "outputs": [
+        "panorama_dense_R.png",
+        "panorama_dense_L.png"
+      ],
+      "metadata": {
+        "foreground_ratio": 0.5264895833333333,
+        "bbox": {
+          "x": 80,
+          "y": 60,
+          "width": 841,
+          "height": 361
+        },
+        "projection_imbalance": 0.0014281150652095675,
+        "projection_edge_margin": 120,
+        "projection_total_mass": 252715.109375,
+        "splitMode": "fallback-center",
+        "split_x": 500,
+        "confidence": 0.0,
+        "content_width_ratio": 0.841
+      }
+    }
+  ]
+}
