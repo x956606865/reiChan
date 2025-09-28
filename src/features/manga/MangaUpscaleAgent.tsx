@@ -399,12 +399,34 @@ const DEFAULT_JOB_PARAMS: JobParamsConfig = {
   device: "auto",
 };
 
+const createInitialRenameForm = (): RenameFormState => ({
+  directory: "",
+  pad: DEFAULT_PAD,
+  targetExtension: "jpg",
+});
+
+const createInitialUploadForm = (): UploadFormState => ({
+  serviceUrl: "",
+  bearerToken: "",
+  title: "",
+  volume: "",
+  mode: "zip",
+});
+
+const createInitialJobForm = (): JobFormState => ({
+  serviceUrl: "",
+  bearerToken: "",
+  title: "",
+  volume: "",
+  inputType: "zip",
+  inputPath: "",
+  pollIntervalMs: DEFAULT_POLL_INTERVAL,
+});
+
 const MangaUpscaleAgent = () => {
-  const [renameForm, setRenameForm] = useState<RenameFormState>({
-    directory: "",
-    pad: DEFAULT_PAD,
-    targetExtension: "jpg",
-  });
+  const [renameForm, setRenameForm] = useState<RenameFormState>(() =>
+    createInitialRenameForm(),
+  );
   const [renameSummary, setRenameSummary] = useState<RenameSummary | null>(null);
   const [renameLoading, setRenameLoading] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -420,13 +442,9 @@ const MangaUpscaleAgent = () => {
 
   const isMultiVolumeSource = sourceAnalysis?.mode === "multiVolume";
 
-  const [uploadForm, setUploadForm] = useState<UploadFormState>({
-    serviceUrl: "",
-    bearerToken: "",
-    title: "",
-    volume: "",
-    mode: "zip",
-  });
+  const [uploadForm, setUploadForm] = useState<UploadFormState>(() =>
+    createInitialUploadForm(),
+  );
   const [uploadLoading, setUploadLoading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
@@ -443,15 +461,9 @@ const MangaUpscaleAgent = () => {
   const [jobAddressDraft, setJobAddressDraft] = useState("");
   const [jobAddressError, setJobAddressError] = useState<string | null>(null);
 
-  const [jobForm, setJobForm] = useState<JobFormState>({
-    serviceUrl: "",
-    bearerToken: "",
-    title: "",
-    volume: "",
-    inputType: "zip",
-    inputPath: "",
-    pollIntervalMs: DEFAULT_POLL_INTERVAL,
-  });
+  const [jobForm, setJobForm] = useState<JobFormState>(() =>
+    createInitialJobForm(),
+  );
   const [jobParams, setJobParams] = useState<JobParamsConfig>(DEFAULT_JOB_PARAMS);
   const [contentSplitEnabled, setContentSplitEnabled] = useState(false);
   const [splitWorkspace, setSplitWorkspace] = useState<string | null>(null);
@@ -463,6 +475,8 @@ const MangaUpscaleAgent = () => {
   const [splitError, setSplitError] = useState<string | null>(null);
   const [splitEstimate, setSplitEstimate] = useState<SplitDetectionSummary | null>(null);
   const [splitProgress, setSplitProgress] = useState<SplitProgressPayload | null>(null);
+
+  const [currentStep, setCurrentStep] = useState<StepId>("source");
 
   const splitProgressPercent = useMemo(() => {
     if (!splitProgress) {
@@ -513,6 +527,65 @@ const MangaUpscaleAgent = () => {
     setSplitError(null);
     setSplitProgress(null);
   }, []);
+
+  const resetWizardState = useCallback(() => {
+    setCurrentStep("source");
+    setRenameForm(createInitialRenameForm());
+    setRenameSummary(null);
+    setRenameLoading(false);
+    setRenameError(null);
+    setAnalysisLoading(false);
+    setAnalysisError(null);
+    setSourceAnalysis(null);
+    setVolumeMappings([]);
+    setVolumeMappingError(null);
+    setMappingConfirmed(false);
+    setSelectedVolumeKey(null);
+    setUploadForm((prev) => ({
+      ...createInitialUploadForm(),
+      serviceUrl: prev.serviceUrl,
+      bearerToken: prev.bearerToken,
+      mode: prev.mode,
+      title: prev.title,
+    }));
+    setUploadLoading(false);
+    setUploadError(null);
+    setUploadStatus(null);
+    setUploadProgress(null);
+    setRemotePathSeed(Date.now());
+    setLastUploadRemotePath("");
+    setIsAddingUploadService(false);
+    setUploadAddressDraft("");
+    setUploadAddressError(null);
+    setContentSplitEnabled(false);
+    resetSplitState();
+    setSplitPreparing(false);
+    setSplitEstimate(null);
+    setJobForm((prev) => ({
+      ...createInitialJobForm(),
+      serviceUrl: prev.serviceUrl,
+      bearerToken: prev.bearerToken,
+      pollIntervalMs: prev.pollIntervalMs,
+      inputType: prev.inputType,
+      title: prev.title,
+    }));
+    setJobLoading(false);
+    setJobError(null);
+    setJobStatus(null);
+    setJobStatusFilter("all");
+    setJobSearch("");
+    setSelectedJobIds([]);
+    setJobs([]);
+    setIsAddingJobService(false);
+    setJobAddressDraft("");
+    setJobAddressError(null);
+    setArtifactReports([]);
+    setArtifactDownloads([]);
+    setArtifactError(null);
+    setArtifactDownloadBusyJob(null);
+    setArtifactValidateBusyJob(null);
+    setArtifactTargetRoot(null);
+  }, [resetSplitState]);
   const [jobParamFavorites, setJobParamFavorites] = useState<JobParamFavorite[]>([]);
   const [jobParamsRestored, setJobParamsRestored] = useState(false);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
@@ -528,8 +601,6 @@ const MangaUpscaleAgent = () => {
   const [artifactDownloadBusyJob, setArtifactDownloadBusyJob] = useState<string | null>(null);
   const [artifactValidateBusyJob, setArtifactValidateBusyJob] = useState<string | null>(null);
   const [artifactTargetRoot, setArtifactTargetRoot] = useState<string | null>(null);
-  const [currentStep, setCurrentStep] = useState<StepId>("source");
-
   const sanitizeVolumeName = useCallback((folderName: string) => {
     const replaced = folderName.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
     return replaced.length > 0 ? replaced : folderName;
@@ -2432,7 +2503,7 @@ const MangaUpscaleAgent = () => {
       setLastUploadRemotePath(remotePath);
       setJobForm((prev) => ({
         ...prev,
-        serviceUrl: serviceUrl || prev.serviceUrl,
+        serviceUrl: prev.serviceUrl || serviceUrl,
         bearerToken: trimmedToken || prev.bearerToken,
         title: trimmedTitle || prev.title,
         volume: trimmedVolume || prev.volume,
@@ -2657,7 +2728,7 @@ const MangaUpscaleAgent = () => {
 
     setJobForm((prev) => ({
       ...prev,
-      serviceUrl: trimmedService || prev.serviceUrl,
+      serviceUrl: prev.serviceUrl || trimmedService,
       bearerToken: trimmedToken || prev.bearerToken,
       title: trimmedTitle || prev.title,
       volume: trimmedVolume || prev.volume,
@@ -3952,6 +4023,9 @@ const MangaUpscaleAgent = () => {
         <div className="wizard-controls">
           <button type="button" onClick={goToPreviousStep}>
             上一步
+          </button>
+          <button type="button" className="ghost" onClick={resetWizardState}>
+            开始新任务
           </button>
         </div>
       </section>
