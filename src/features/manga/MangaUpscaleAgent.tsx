@@ -55,6 +55,11 @@ type UploadFormState = {
   mode: UploadMode;
 };
 
+type ServiceAddressBook = {
+  upload: string[];
+  job: string[];
+};
+
 const REMOTE_ROOT = "incoming";
 
 const normalizeSegment = (input: string): string => {
@@ -96,6 +101,40 @@ const buildRemotePath = (options: { title?: string; volume?: string; seed: numbe
   const extension = mode === "zip" ? ".zip" : "";
 
   return `${REMOTE_ROOT}/${stem}${extension}`;
+};
+
+const mergeServiceAddresses = (...sources: (string | string[] | null | undefined)[]): string[] => {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const source of sources) {
+    if (!source) {
+      continue;
+    }
+
+    if (Array.isArray(source)) {
+      for (const entry of source) {
+        const trimmed = entry.trim();
+        if (!trimmed || seen.has(trimmed)) {
+          continue;
+        }
+        seen.add(trimmed);
+        result.push(trimmed);
+      }
+      continue;
+    }
+
+    if (typeof source === "string") {
+      const trimmed = source.trim();
+      if (!trimmed || seen.has(trimmed)) {
+        continue;
+      }
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+  }
+
+  return result;
 };
 
 type JobEventTransport = "websocket" | "polling" | "system";
@@ -256,6 +295,7 @@ const DEFAULT_PAD = 4;
 const DEFAULT_POLL_INTERVAL = 1000;
 const SETTINGS_KEY = "manga-upscale-agent:v1";
 const UPLOAD_DEFAULTS_KEY = `${SETTINGS_KEY}:upload-defaults`;
+const SERVICE_ADDRESS_BOOK_KEY = `${SETTINGS_KEY}:service-addresses`;
 const PARAM_DEFAULTS_KEY = `${SETTINGS_KEY}:job-params`;
 const PARAM_FAVORITES_KEY = `${SETTINGS_KEY}:job-param-favorites`;
 
@@ -305,6 +345,15 @@ const MangaUpscaleAgent = () => {
   const [uploadProgress, setUploadProgress] = useState<UploadProgressPayload | null>(null);
   const [remotePathSeed, setRemotePathSeed] = useState(() => Date.now());
   const [lastUploadRemotePath, setLastUploadRemotePath] = useState<string>("");
+  const [uploadServiceOptions, setUploadServiceOptions] = useState<string[]>([]);
+  const [isAddingUploadService, setIsAddingUploadService] = useState(false);
+  const [uploadAddressDraft, setUploadAddressDraft] = useState("");
+  const [uploadAddressError, setUploadAddressError] = useState<string | null>(null);
+
+  const [jobServiceOptions, setJobServiceOptions] = useState<string[]>([]);
+  const [isAddingJobService, setIsAddingJobService] = useState(false);
+  const [jobAddressDraft, setJobAddressDraft] = useState("");
+  const [jobAddressError, setJobAddressError] = useState<string | null>(null);
 
   const [jobForm, setJobForm] = useState<JobFormState>({
     serviceUrl: "",
@@ -441,9 +490,12 @@ const MangaUpscaleAgent = () => {
     try {
       const stored = window.localStorage.getItem(SETTINGS_KEY);
       const storedDefaults = window.localStorage.getItem(UPLOAD_DEFAULTS_KEY);
+      const storedAddressBookRaw = window.localStorage.getItem(SERVICE_ADDRESS_BOOK_KEY);
 
       let uploadPatch: Partial<UploadFormState> | null = null;
       let jobPatch: Partial<JobFormState> | null = null;
+      let defaultsServiceUrl: string | null = null;
+      let storedAddressBook: ServiceAddressBook | null = null;
 
       if (stored) {
         const parsed = JSON.parse(stored) as {
@@ -464,13 +516,43 @@ const MangaUpscaleAgent = () => {
 
       if (storedDefaults) {
         const defaults = JSON.parse(storedDefaults) as Partial<Pick<UploadFormState, "serviceUrl" >>;
-        if (defaults?.serviceUrl && !(uploadPatch?.serviceUrl)) {
-          uploadPatch = {
-            ...(uploadPatch ?? {}),
-            serviceUrl: defaults.serviceUrl,
-          };
+        if (defaults?.serviceUrl) {
+          defaultsServiceUrl = defaults.serviceUrl;
+          if (!(uploadPatch?.serviceUrl)) {
+            uploadPatch = {
+              ...(uploadPatch ?? {}),
+              serviceUrl: defaults.serviceUrl,
+            };
+          }
         }
       }
+
+      if (storedAddressBookRaw) {
+        try {
+          const parsedAddressBook = JSON.parse(storedAddressBookRaw) as Partial<ServiceAddressBook> | null;
+          if (parsedAddressBook && typeof parsedAddressBook === "object") {
+            const upload = Array.isArray(parsedAddressBook.upload)
+              ? parsedAddressBook.upload.filter((item): item is string => typeof item === "string")
+              : [];
+            const job = Array.isArray(parsedAddressBook.job)
+              ? parsedAddressBook.job.filter((item): item is string => typeof item === "string")
+              : [];
+            storedAddressBook = { upload, job };
+          }
+        } catch (addressError) {
+          console.warn("Failed to restore service address book", addressError);
+        }
+      }
+
+      const uploadCandidates = mergeServiceAddresses(
+        storedAddressBook?.upload ?? [],
+        uploadPatch?.serviceUrl,
+        defaultsServiceUrl,
+      );
+      const jobCandidates = mergeServiceAddresses(storedAddressBook?.job ?? [], jobPatch?.serviceUrl);
+
+      setUploadServiceOptions(uploadCandidates);
+      setJobServiceOptions(jobCandidates);
 
       if (uploadPatch && Object.keys(uploadPatch).length > 0) {
         setUploadForm((prev) => ({ ...prev, ...uploadPatch }));
@@ -600,6 +682,51 @@ const MangaUpscaleAgent = () => {
       console.warn("Failed to persist upload defaults", storageError);
     }
   }, [hasRestoredDefaults, uploadForm.serviceUrl]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const addressBook: ServiceAddressBook = {
+      upload: uploadServiceOptions,
+      job: jobServiceOptions,
+    };
+
+    try {
+      window.localStorage.setItem(SERVICE_ADDRESS_BOOK_KEY, JSON.stringify(addressBook));
+    } catch (storageError) {
+      console.warn("Failed to persist service address book", storageError);
+    }
+  }, [jobServiceOptions, uploadServiceOptions]);
+
+  useEffect(() => {
+    const trimmed = uploadForm.serviceUrl.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    setUploadServiceOptions((prev) => {
+      if (prev.includes(trimmed)) {
+        return prev;
+      }
+      return [...prev, trimmed];
+    });
+  }, [uploadForm.serviceUrl]);
+
+  useEffect(() => {
+    const trimmed = jobForm.serviceUrl.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    setJobServiceOptions((prev) => {
+      if (prev.includes(trimmed)) {
+        return prev;
+      }
+      return [...prev, trimmed];
+    });
+  }, [jobForm.serviceUrl]);
 
   useEffect(() => {
     if (lastUploadRemotePath || !jobForm.inputPath.trim()) {
@@ -1026,6 +1153,37 @@ const MangaUpscaleAgent = () => {
       },
     [],
   );
+
+  const beginAddUploadService = useCallback(() => {
+    setUploadAddressError(null);
+    setUploadAddressDraft(uploadForm.serviceUrl.trim() || "");
+    setIsAddingUploadService(true);
+  }, [uploadForm.serviceUrl]);
+
+  const cancelAddUploadService = useCallback(() => {
+    setIsAddingUploadService(false);
+    setUploadAddressDraft("");
+    setUploadAddressError(null);
+  }, []);
+
+  const confirmAddUploadService = useCallback(() => {
+    const trimmed = uploadAddressDraft.trim();
+    if (!trimmed) {
+      setUploadAddressError("请输入有效的上传服务器地址。");
+      return;
+    }
+
+    setUploadAddressError(null);
+    setUploadServiceOptions((prev) => {
+      if (prev.includes(trimmed)) {
+        return prev;
+      }
+      return [...prev, trimmed];
+    });
+    setUploadForm((prev) => ({ ...prev, serviceUrl: trimmed }));
+    setUploadAddressDraft("");
+    setIsAddingUploadService(false);
+  }, [uploadAddressDraft]);
 
   const handleParamChange = useCallback(
     (field: keyof JobParamsConfig) =>
@@ -1873,6 +2031,37 @@ const MangaUpscaleAgent = () => {
     uploadForm,
   ]);
 
+  const beginAddJobService = useCallback(() => {
+    setJobAddressError(null);
+    setJobAddressDraft(jobForm.serviceUrl.trim() || "");
+    setIsAddingJobService(true);
+  }, [jobForm.serviceUrl]);
+
+  const cancelAddJobService = useCallback(() => {
+    setIsAddingJobService(false);
+    setJobAddressDraft("");
+    setJobAddressError(null);
+  }, []);
+
+  const confirmAddJobService = useCallback(() => {
+    const trimmed = jobAddressDraft.trim();
+    if (!trimmed) {
+      setJobAddressError("请输入有效的推理服务器地址。");
+      return;
+    }
+
+    setJobAddressError(null);
+    setJobServiceOptions((prev) => {
+      if (prev.includes(trimmed)) {
+        return prev;
+      }
+      return [...prev, trimmed];
+    });
+    setJobForm((prev) => ({ ...prev, serviceUrl: trimmed }));
+    setJobAddressDraft("");
+    setIsAddingJobService(false);
+  }, [jobAddressDraft]);
+
   const handleJobInput = useCallback(
     (field: keyof JobFormState) =>
       (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
@@ -2038,6 +2227,15 @@ const MangaUpscaleAgent = () => {
     const trimmedTitle = uploadForm.title.trim();
     const trimmedVolume = uploadForm.volume.trim();
     const trimmedPath = lastUploadRemotePath.trim();
+
+    if (trimmedService) {
+      setJobServiceOptions((prev) => {
+        if (prev.includes(trimmedService)) {
+          return prev;
+        }
+        return [...prev, trimmedService];
+      });
+    }
 
     setJobForm((prev) => ({
       ...prev,
@@ -2565,12 +2763,42 @@ const MangaUpscaleAgent = () => {
         <div className="form-grid">
           <label className="form-field">
             <span className="field-label">服务地址</span>
-            <input
-              type="text"
-              value={uploadForm.serviceUrl}
-              onChange={handleUploadInput("serviceUrl")}
-              placeholder="http://192.168.0.2:3923"
-            />
+            <div className="select-with-button">
+              <select value={uploadForm.serviceUrl} onChange={handleUploadInput("serviceUrl")}>
+                <option value="">选择或新增上传地址</option>
+                {uploadServiceOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+              <button type="button" onClick={beginAddUploadService}>
+                添加
+              </button>
+            </div>
+            {isAddingUploadService && (
+              <div className="address-add-row">
+                <input
+                  type="text"
+                  value={uploadAddressDraft}
+                  onChange={(event) => {
+                    setUploadAddressDraft(event.currentTarget.value);
+                    if (uploadAddressError) {
+                      setUploadAddressError(null);
+                    }
+                  }}
+                  placeholder="http://127.0.0.1:3923"
+                  autoFocus
+                />
+                <button type="button" className="primary" onClick={confirmAddUploadService}>
+                  保存
+                </button>
+                <button type="button" className="ghost" onClick={cancelAddUploadService}>
+                  取消
+                </button>
+              </div>
+            )}
+            {uploadAddressError && <p className="field-error">{uploadAddressError}</p>}
           </label>
 
           <label className="form-field">
@@ -2876,12 +3104,42 @@ const MangaUpscaleAgent = () => {
         <div className="form-grid">
           <label className="form-field">
             <span className="field-label">服务地址</span>
-            <input
-              type="text"
-              value={jobForm.serviceUrl}
-              onChange={handleJobInput("serviceUrl")}
-              placeholder="http://192.168.0.2:9000"
-            />
+            <div className="select-with-button">
+              <select value={jobForm.serviceUrl} onChange={handleJobInput("serviceUrl")}>
+                <option value="">选择或新增推理地址</option>
+                {jobServiceOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+              <button type="button" onClick={beginAddJobService}>
+                添加
+              </button>
+            </div>
+            {isAddingJobService && (
+              <div className="address-add-row">
+                <input
+                  type="text"
+                  value={jobAddressDraft}
+                  onChange={(event) => {
+                    setJobAddressDraft(event.currentTarget.value);
+                    if (jobAddressError) {
+                      setJobAddressError(null);
+                    }
+                  }}
+                  placeholder="http://127.0.0.1:9000"
+                  autoFocus
+                />
+                <button type="button" className="primary" onClick={confirmAddJobService}>
+                  保存
+                </button>
+                <button type="button" className="ghost" onClick={cancelAddJobService}>
+                  取消
+                </button>
+              </div>
+            )}
+            {jobAddressError && <p className="field-error">{jobAddressError}</p>}
           </label>
 
           <label className="form-field">
