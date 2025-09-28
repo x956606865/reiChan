@@ -49,11 +49,53 @@ type RenameFormState = {
 
 type UploadFormState = {
   serviceUrl: string;
-  remotePath: string;
   bearerToken: string;
   title: string;
   volume: string;
   mode: UploadMode;
+};
+
+const REMOTE_ROOT = "incoming";
+
+const normalizeSegment = (input: string): string => {
+  if (!input.trim()) {
+    return "";
+  }
+
+  const normalized = input
+    .normalize("NFKD")
+    .replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+
+  return normalized.slice(0, 64);
+};
+
+const formatSeedSegment = (seed: number): string => {
+  const date = new Date(seed);
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+
+  return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+};
+
+const buildRemotePath = (options: { title?: string; volume?: string; seed: number; mode: UploadMode }): string => {
+  const { title = "", volume = "", seed, mode } = options;
+  const titleSegment = normalizeSegment(title);
+  const volumeSegment = normalizeSegment(volume);
+  const segments = [titleSegment, volumeSegment].filter(Boolean);
+  const slug = segments.length > 0 ? segments.join("-") : "manga";
+  const suffix = formatSeedSegment(seed);
+  const stem = `${slug}-${suffix}`.slice(0, 96);
+  const extension = mode === "zip" ? ".zip" : "";
+
+  return `${REMOTE_ROOT}/${stem}${extension}`;
 };
 
 type JobEventTransport = "websocket" | "polling" | "system";
@@ -252,7 +294,6 @@ const MangaUpscaleAgent = () => {
 
   const [uploadForm, setUploadForm] = useState<UploadFormState>({
     serviceUrl: "",
-    remotePath: "",
     bearerToken: "",
     title: "",
     volume: "",
@@ -262,10 +303,12 @@ const MangaUpscaleAgent = () => {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<UploadProgressPayload | null>(null);
+  const [remotePathSeed, setRemotePathSeed] = useState(() => Date.now());
+  const [lastUploadRemotePath, setLastUploadRemotePath] = useState<string>("");
 
   const [jobForm, setJobForm] = useState<JobFormState>({
     serviceUrl: "",
-   bearerToken: "",
+    bearerToken: "",
     title: "",
     volume: "",
     inputType: "zip",
@@ -410,6 +453,9 @@ const MangaUpscaleAgent = () => {
 
         if (parsed.uploadForm) {
           uploadPatch = { ...parsed.uploadForm };
+          if (uploadPatch && "remotePath" in uploadPatch) {
+            delete (uploadPatch as Record<string, unknown>).remotePath;
+          }
         }
         if (parsed.jobForm) {
           jobPatch = { ...parsed.jobForm };
@@ -417,12 +463,11 @@ const MangaUpscaleAgent = () => {
       }
 
       if (storedDefaults) {
-        const defaults = JSON.parse(storedDefaults) as Partial<Pick<UploadFormState, "serviceUrl" | "remotePath" >>;
-        if (defaults) {
+        const defaults = JSON.parse(storedDefaults) as Partial<Pick<UploadFormState, "serviceUrl" >>;
+        if (defaults?.serviceUrl && !(uploadPatch?.serviceUrl)) {
           uploadPatch = {
             ...(uploadPatch ?? {}),
-            ...(uploadPatch?.serviceUrl ? {} : defaults.serviceUrl ? { serviceUrl: defaults.serviceUrl } : {}),
-            ...(uploadPatch?.remotePath ? {} : defaults.remotePath ? { remotePath: defaults.remotePath } : {}),
+            serviceUrl: defaults.serviceUrl,
           };
         }
       }
@@ -506,7 +551,6 @@ const MangaUpscaleAgent = () => {
     const trimmedToken = uploadForm.bearerToken.trim();
     const trimmedTitle = uploadForm.title.trim();
     const trimmedVolume = uploadForm.volume.trim();
-    const trimmedPath = uploadForm.remotePath.trim();
 
     setJobForm((prev) => {
       let changed = false;
@@ -528,10 +572,6 @@ const MangaUpscaleAgent = () => {
         next.volume = trimmedVolume;
         changed = true;
       }
-      if (!prev.inputPath && trimmedPath) {
-        next.inputPath = trimmedPath;
-        changed = true;
-      }
 
       return changed ? next : prev;
     });
@@ -540,7 +580,6 @@ const MangaUpscaleAgent = () => {
     uploadForm.bearerToken,
     uploadForm.title,
     uploadForm.volume,
-    uploadForm.remotePath,
   ]);
 
   useEffect(() => {
@@ -555,13 +594,19 @@ const MangaUpscaleAgent = () => {
     try {
       const defaults = {
         serviceUrl: uploadForm.serviceUrl,
-        remotePath: uploadForm.remotePath,
       };
       window.localStorage.setItem(UPLOAD_DEFAULTS_KEY, JSON.stringify(defaults));
     } catch (storageError) {
       console.warn("Failed to persist upload defaults", storageError);
     }
-  }, [hasRestoredDefaults, uploadForm.serviceUrl, uploadForm.remotePath]);
+  }, [hasRestoredDefaults, uploadForm.serviceUrl]);
+
+  useEffect(() => {
+    if (lastUploadRemotePath || !jobForm.inputPath.trim()) {
+      return;
+    }
+    setLastUploadRemotePath(jobForm.inputPath.trim());
+  }, [jobForm.inputPath, lastUploadRemotePath]);
 
   useEffect(() => {
     let disposed = false;
@@ -726,6 +771,39 @@ const MangaUpscaleAgent = () => {
     }
     return volumeMappings.find((item) => item.directory === selectedVolumeKey) ?? null;
   }, [selectedVolumeKey, volumeMappings]);
+
+  const remotePathPreview = useMemo(() => {
+    const resolvedTitle = uploadForm.title.trim() || jobForm.title.trim();
+    const selectedVolumeName = selectedVolume ? selectedVolume.volumeName.trim() : "";
+    const selectedVolumeFolder = selectedVolume ? selectedVolume.folderName.trim() : "";
+    const resolvedVolume =
+      uploadForm.volume.trim() ||
+      jobForm.volume.trim() ||
+      selectedVolumeName ||
+      selectedVolumeFolder ||
+      "";
+
+    return buildRemotePath({
+      title: resolvedTitle,
+      volume: resolvedVolume,
+      seed: remotePathSeed,
+      mode: uploadForm.mode,
+    });
+  }, [
+    jobForm.title,
+    jobForm.volume,
+    remotePathSeed,
+    selectedVolume?.directory,
+    selectedVolume?.folderName,
+    selectedVolume?.volumeName,
+    uploadForm.mode,
+    uploadForm.title,
+    uploadForm.volume,
+  ]);
+
+  const handleRegenerateRemotePath = useCallback(() => {
+    setRemotePathSeed(Date.now());
+  }, []);
 
   const filteredJobs = useMemo(() => {
     const keyword = jobSearch.trim().toLowerCase();
@@ -1701,12 +1779,9 @@ const MangaUpscaleAgent = () => {
       setUploadError("请先完成重命名预览或执行，确保本地目录已确认。");
       return;
     }
-    if (!uploadForm.serviceUrl.trim()) {
+    const serviceUrl = uploadForm.serviceUrl.trim();
+    if (!serviceUrl) {
       setUploadError("请填写 Copyparty 服务地址。");
-      return;
-    }
-    if (!uploadForm.remotePath.trim()) {
-      setUploadError("请填写远端存储路径，例如 /incoming/project.zip。");
       return;
     }
 
@@ -1719,6 +1794,7 @@ const MangaUpscaleAgent = () => {
 
       const trimmedTitle = uploadForm.title.trim();
       const trimmedVolume = uploadForm.volume.trim();
+      const remotePath = remotePathPreview;
 
       if (trimmedTitle) {
         metadataEntries.title = trimmedTitle;
@@ -1750,8 +1826,8 @@ const MangaUpscaleAgent = () => {
       }
 
       const request: Record<string, unknown> = {
-        serviceUrl: uploadForm.serviceUrl.trim(),
-        remotePath: uploadForm.remotePath.trim(),
+        serviceUrl,
+        remotePath,
         localPath,
         mode: uploadForm.mode,
       };
@@ -1770,9 +1846,19 @@ const MangaUpscaleAgent = () => {
       });
 
       const sizeInMb = (result.uploadedBytes / (1024 * 1024)).toFixed(2);
+      setLastUploadRemotePath(remotePath);
+      setJobForm((prev) => ({
+        ...prev,
+        serviceUrl: serviceUrl || prev.serviceUrl,
+        bearerToken: trimmedToken || prev.bearerToken,
+        title: trimmedTitle || prev.title,
+        volume: trimmedVolume || prev.volume,
+        inputPath: remotePath,
+      }));
       setUploadStatus(
         `上传完成：${result.fileCount} 个文件，约 ${sizeInMb} MB，remote = ${result.remoteUrl}`,
       );
+      setRemotePathSeed(Date.now());
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1780,6 +1866,7 @@ const MangaUpscaleAgent = () => {
     }
   }, [
     isMultiVolumeSource,
+    remotePathPreview,
     renameForm.directory,
     renameSummary,
     selectedVolume,
@@ -1950,7 +2037,7 @@ const MangaUpscaleAgent = () => {
     const trimmedToken = uploadForm.bearerToken.trim();
     const trimmedTitle = uploadForm.title.trim();
     const trimmedVolume = uploadForm.volume.trim();
-    const trimmedPath = uploadForm.remotePath.trim();
+    const trimmedPath = lastUploadRemotePath.trim();
 
     setJobForm((prev) => ({
       ...prev,
@@ -1960,7 +2047,7 @@ const MangaUpscaleAgent = () => {
       volume: trimmedVolume || prev.volume,
       inputPath: trimmedPath || prev.inputPath,
     }));
-  }, [uploadForm]);
+  }, [lastUploadRemotePath, uploadForm]);
 
   const handleCreateJob = useCallback(async () => {
     const serviceUrl = jobForm.serviceUrl.trim();
@@ -2487,13 +2574,18 @@ const MangaUpscaleAgent = () => {
           </label>
 
           <label className="form-field">
-            <span className="field-label">上传路径</span>
+            <span className="field-label">远端输入路径（自动生成）</span>
             <input
               type="text"
-              value={uploadForm.remotePath}
-              onChange={handleUploadInput("remotePath")}
-              placeholder="/incoming/manga-volume.zip"
+              value={remotePathPreview}
+              readOnly
+              aria-readonly="true"
+              onFocus={(event) => event.currentTarget.select()}
             />
+            <button type="button" onClick={handleRegenerateRemotePath}>
+              重新生成
+            </button>
+            <small>无需手动填写，上传时会使用该路径并自动在远端推理步骤中填入。</small>
           </label>
 
           <label className="form-field">
@@ -2835,8 +2927,11 @@ const MangaUpscaleAgent = () => {
             <input
               type="text"
               value={jobForm.inputPath}
-              onChange={handleJobInput("inputPath")}
-              placeholder="incoming/manga-volume.zip"
+              readOnly
+              aria-readonly="true"
+              onFocus={(event) => event.currentTarget.select()}
+              placeholder="上传完成后自动填充"
+              title={jobForm.inputPath || undefined}
             />
           </label>
 

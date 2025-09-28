@@ -1232,6 +1232,7 @@ fn finalize_artifact(
     archive_path: PathBuf,
     artifact_hash: String,
     mut warnings: Vec<String>,
+    cleanup_extract: bool,
 ) -> Result<PreparedArtifact, ArtifactError> {
     if let Some(parent) = archive_path.parent() {
         fs::create_dir_all(parent)
@@ -1299,6 +1300,19 @@ fn finalize_artifact(
         warnings.push("压缩包中未找到图片文件。".to_string());
     }
 
+    if cleanup_extract {
+        match fs::remove_dir_all(&extract_root) {
+            Ok(_) => warnings.push(format!(
+                "已清理临时目录 {}",
+                extract_root.display()
+            )),
+            Err(err) => warnings.push(format!(
+                "清理临时目录失败: {}",
+                err
+            )),
+        }
+    }
+
     Ok(PreparedArtifact {
         extract_root,
         archive_path,
@@ -1352,7 +1366,14 @@ pub fn download_artifact(
     temp_file.flush()?;
     let artifact_hash = hex::encode(hasher.finalize());
 
-    let prepared = finalize_artifact(&temp_file, &request, archive_path, artifact_hash, warnings)?;
+    let prepared = finalize_artifact(
+        &temp_file,
+        &request,
+        archive_path,
+        artifact_hash,
+        warnings,
+        true,
+    )?;
 
     Ok(ArtifactDownloadSummary {
         job_id: request.job_id,
@@ -1430,7 +1451,14 @@ pub fn validate_artifact(
     temp_file.flush()?;
     let artifact_hash = hex::encode(hasher.finalize());
 
-    let prepared = finalize_artifact(&temp_file, &request, archive_path, artifact_hash, warnings)?;
+    let prepared = finalize_artifact(
+        &temp_file,
+        &request,
+        archive_path,
+        artifact_hash,
+        warnings,
+        false,
+    )?;
 
     let expected_map = if let Some(path) = request.manifest_path.as_ref() {
         Some(read_manifest_expectations(path)?)
@@ -2073,6 +2101,13 @@ mod artifact_tests {
         let expected_archive = output_dir.join("0003_Title.zip");
         assert_eq!(summary.archive_path, expected_archive);
         assert!(expected_archive.exists());
+        assert!(!summary.extract_path.exists());
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("已清理临时目录"))
+        );
 
         let file = File::open(&summary.archive_path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
