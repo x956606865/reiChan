@@ -463,6 +463,70 @@ body {
   text-transform: uppercase;
 }
 
+/* Notion Import – align inline buttons with global look */
+.notion-import-agent .ghost {
+  border: none;
+  border-radius: 10px;
+  padding: 0.5em 0.9em;
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+  background: rgba(148, 163, 184, 0.18);
+  color: #475569;
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+
+.notion-import-agent .ghost:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(148, 163, 184, 0.18);
+}
+
+.notion-import-agent input[type="text"],
+.notion-import-agent input[type="password"],
+.notion-import-agent select {
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 10px;
+  padding: 0.6em 0.75em;
+  font-size: 0.95rem;
+  background: rgba(248, 250, 252, 0.92);
+  color: #0f172a;
+}
+
+/* Normalize <select> look & align with inputs */
+.notion-import-agent select {
+  -webkit-appearance: none;
+  appearance: none;
+  background-clip: padding-box;
+  padding-right: 2.2em; /* space for custom arrow */
+  min-height: 36px;
+  line-height: 1.2;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23475569' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 14px 14px;
+}
+
+.notion-import-agent input[type="text"]:focus,
+.notion-import-agent input[type="password"]:focus,
+.notion-import-agent select:focus {
+  outline: none;
+  border-color: rgba(37, 99, 235, 0.65);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.notion-import-agent .token-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.notion-import-agent .token-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+}
+
 .form-grid {
   display: grid;
   gap: 16px;
@@ -962,6 +1026,67 @@ body {
   font-size: 0.9rem;
 }
 
+/* Mapping editor table overrides to avoid global table constraints */
+.notion-import-agent .mapping-table {
+  table-layout: auto; /* override global fixed layout */
+}
+
+/* CSV 预览表：允许按内容撑开并横向滚动 */
+/* 仅限 CSV 预览区域内的分析表格生效，避免影响数据库搜索表 */
+.notion-import-agent .csv-preview-wrap .analysis-table {
+  width: max-content; /* 让表格宽度随内容增长，触发外层滚动 */
+  table-layout: auto; /* 避免固定列宽造成挤压重叠 */
+}
+
+.notion-import-agent .csv-preview-wrap .analysis-table th {
+  white-space: nowrap; /* 表头不换行，保持单元格宽度稳定 */
+}
+
+/* CSV 预览容器：限制高度与宽度，内部滚动 */
+.notion-import-agent .csv-preview-wrap {
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.9);
+  overflow: auto;            /* 横纵向都在容器内滚动 */
+  width: 100%;               /* 占满父容器，不随内部表格扩张 */
+  max-width: 65vw;           /* 限制为视口 65% 宽，更易保留按钮可见 */
+  min-width: 0;              /* 作为 flex 子项允许收缩，防止撑开 step-card */
+  max-height: 320px;         /* 防止撑开页面挡住按钮 */
+  padding-bottom: 2px;       /* 预留滚动条空间，避免遮挡文字 */
+}
+
+.notion-import-agent .csv-preview-wrap table.analysis-table {
+  margin: 0; /* 去掉表格在容器内的多余外边距 */
+}
+
+.notion-import-agent .mapping-table th,
+.notion-import-agent .mapping-table td {
+  padding: 8px 10px; /* slightly tighter */
+  vertical-align: middle;
+}
+
+.notion-import-agent .mapping-table th:first-child,
+.notion-import-agent .mapping-table td:first-child {
+  width: 64px; /* include checkbox */
+  text-align: center;
+}
+
+.notion-import-agent .mapping-table th:nth-child(2),
+.notion-import-agent .mapping-table td:nth-child(2) {
+  width: 220px; /* source field input */
+}
+
+.notion-import-agent .mapping-table th:nth-child(4),
+.notion-import-agent .mapping-table td:nth-child(4) {
+  width: 140px; /* type label */
+}
+
+.notion-import-agent .mapping-table th:last-child,
+.notion-import-agent .mapping-table td:last-child {
+  width: 100px; /* actions */
+  text-align: center;
+}
+
 .analysis-table th,
 .analysis-table td,
 .mapping-table th,
@@ -980,6 +1105,7 @@ body {
 .mapping-table select {
   width: 100%;
   box-sizing: border-box;
+  min-height: 36px; /* align height across inputs & selects */
 }
 
 .preview-header {

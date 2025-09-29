@@ -1,5 +1,6 @@
 mod doublepage;
 mod manga;
+mod notion;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -756,10 +757,15 @@ pub fn run() {
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&app_data_dir)?;
-            let db_path = app_data_dir.join("favorites.db");
+            let db_path = app_data_dir.join("app.db");
             initialize_database(&db_path)?;
 
-            app.manage(AppState { db_path });
+            app.manage(AppState { db_path: db_path.clone() });
+            // Notion: use SQLite-backed store and HTTP adapter when enabled.
+            #[cfg(feature = "notion-sqlite")]
+            app.manage(notion::commands::create_state_with_sqlite(db_path.clone()));
+            #[cfg(not(feature = "notion-sqlite"))]
+            app.manage(notion::commands::create_default_state());
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -779,7 +785,20 @@ pub fn run() {
             resume_manga_job,
             cancel_manga_job,
             download_manga_artifact,
-            validate_manga_artifact
+            validate_manga_artifact,
+            // Notion Import M1 (skeleton)
+            notion::commands::notion_save_token,
+            notion::commands::notion_list_tokens,
+            notion::commands::notion_delete_token,
+            notion::commands::notion_test_connection,
+            notion::commands::notion_search_databases,
+            notion::commands::notion_search_databases_page,
+            // Notion Import M2
+            notion::commands::notion_get_database,
+            notion::commands::notion_template_save,
+            notion::commands::notion_template_list,
+            notion::commands::notion_template_delete,
+            notion::commands::notion_import_dry_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -787,12 +806,67 @@ pub fn run() {
 
 fn initialize_database(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::open(path)?;
+    // port_favorites (existing)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS port_favorites (
             protocol TEXT NOT NULL,
             local_address TEXT NOT NULL,
             local_port INTEGER,
             PRIMARY KEY (protocol, local_address, local_port)
+        )",
+        [],
+    )?;
+    // notion_* tables (M1)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notion_tokens (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            token_cipher BLOB NOT NULL,
+            workspace_name TEXT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER NULL,
+            encryption_salt BLOB NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notion_import_templates (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            token_id TEXT NOT NULL,
+            database_id TEXT NOT NULL,
+            mapping_json TEXT NOT NULL,
+            defaults_json TEXT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notion_import_jobs (
+            id TEXT PRIMARY KEY,
+            token_id TEXT NOT NULL,
+            database_id TEXT NOT NULL,
+            source_file_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total INTEGER NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            started_at INTEGER NULL,
+            ended_at INTEGER NULL,
+            config_snapshot_json TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notion_import_job_rows (
+            job_id TEXT NOT NULL,
+            row_index INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            error_code TEXT NULL,
+            error_message TEXT NULL,
+            PRIMARY KEY (job_id, row_index)
         )",
         [],
     )?;

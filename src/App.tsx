@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import MangaUpscaleAgent from "./features/manga/MangaUpscaleAgent";
+import NotionImportAgent from "./features/notion-import/NotionImportAgent";
 
 type Nullable<T> = T | null | undefined;
 
@@ -52,7 +53,7 @@ type FavoriteRecord = {
   localPort?: Nullable<number>;
 };
 
-type ToolId = "port-monitor" | "manga-upscale" | "clipboard" | "snippets";
+type ToolId = "port-monitor" | "manga-upscale" | "notion-import" | "clipboard" | "snippets";
 
 type ToolMeta = {
   id: ToolId;
@@ -72,6 +73,12 @@ const TOOL_CATALOG: ToolMeta[] = [
     id: "manga-upscale",
     label: "漫画高清化",
     description: "提供重命名、上传 Copyparty 的基础流程，准备后端推理。",
+    status: "ready",
+  },
+  {
+    id: "notion-import",
+    label: "Notion 导入",
+    description: "从 JSON/CSV 导入到 Notion 数据库（M1 框架）。",
     status: "ready",
   },
   {
@@ -133,6 +140,7 @@ function App() {
         <section className="content-body">
           {activeTool.id === "port-monitor" && <PortActivityTool />}
           {activeTool.id === "manga-upscale" && <MangaUpscaleAgent />}
+          {activeTool.id === "notion-import" && <NotionImportAgent />}
           {activeTool.id !== "port-monitor" && activeTool.id !== "manga-upscale" && (
             <ComingSoon label={activeTool.label} />
           )}
