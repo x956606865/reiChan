@@ -798,7 +798,9 @@ pub fn run() {
             notion::commands::notion_template_save,
             notion::commands::notion_template_list,
             notion::commands::notion_template_delete,
-            notion::commands::notion_import_dry_run
+            notion::commands::notion_import_preview_file,
+            notion::commands::notion_import_dry_run,
+            notion::commands::notion_transform_eval_sample
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

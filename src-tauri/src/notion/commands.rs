@@ -3,13 +3,29 @@ use std::sync::{Arc, Mutex};
 use tauri::State;
 
 use super::adapter::{MockNotionAdapter, NotionAdapter};
+use super::mapping::build_property_entry;
+use super::preview::{preview_file as notion_preview_file, PreviewRequest, PreviewResponse};
 use super::storage::{InMemoryTokenStore, TokenStore};
+use super::transform::{TransformContext, TransformExecutor};
 #[cfg(feature = "notion-http")]
 use super::adapter::HttpNotionAdapter;
 #[cfg(feature = "notion-sqlite")]
 use super::storage::SqliteTokenStore;
 use std::path::PathBuf;
-use super::types::{DatabaseBrief, DatabasePage, SaveTokenRequest, TokenRow, WorkspaceInfo, DatabaseSchema, ImportTemplate, DryRunInput, DryRunReport, RowError};
+use super::types::{
+    DatabaseBrief,
+    DatabasePage,
+    DatabaseSchema,
+    DryRunInput,
+    DryRunReport,
+    ImportTemplate,
+    RowError,
+    SaveTokenRequest,
+    TokenRow,
+    TransformEvalRequest,
+    TransformEvalResult,
+    WorkspaceInfo,
+};
 use serde_json::Value;
 use rusqlite::Connection;
 
@@ -273,35 +289,120 @@ pub fn notion_template_delete(state: State<NotionState>, id: String) -> Result<(
 // -----------------------------
 #[tauri::command]
 pub fn notion_import_dry_run(input: DryRunInput) -> Result<DryRunReport, String> {
-    use crate::notion::mapping::build_properties;
+    if input.records.is_empty() {
+        return Err("Dry-run requires at least one sample record".into());
+    }
+
     let mut ok = 0usize;
     let mut failed = 0usize;
     let mut errors: Vec<RowError> = Vec::new();
+    let mut executor: Option<TransformExecutor> = None;
+    let has_title_prop = input.schema.properties.iter().any(|p| p.type_ == "title");
+
     for (idx, rec) in input.records.iter().enumerate() {
-        let obj = rec.as_object().ok_or_else(|| format!("Record {} is not an object", idx))?;
-        match build_properties(obj, &input.mappings) {
-            Ok(props) => {
-                // Minimal schema check: ensure title property exists in result if schema has a title property named like commonly used ones.
-                let has_title_prop = input.schema.properties.iter().any(|p| p.type_ == "title");
-                if has_title_prop && !props.values().any(|v| v.get("title").is_some()) {
+        let obj = match rec.as_object() {
+            Some(map) => map.clone(),
+            None => {
+                failed += 1;
+                errors.push(RowError { row_index: idx, message: "record is not an object".into() });
+                continue;
+            }
+        };
+
+        let mut props = serde_json::Map::new();
+        let mut record_failed = false;
+
+        for mapping in input.mappings.iter().filter(|m| m.include) {
+            let src_val = obj
+                .get(&mapping.source_field)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let effective_val = if let Some(code) = mapping.transform_code.as_ref().filter(|c| !c.trim().is_empty()) {
+                if executor.is_none() {
+                    executor = Some(TransformExecutor::new().map_err(|err| err.to_string())?);
+                }
+                let ctx = TransformContext { row_index: idx, record: obj.clone() };
+                match executor
+                    .as_ref()
+                    .unwrap()
+                    .execute(code, src_val.clone(), ctx)
+                {
+                    Ok(val) => val,
+                    Err(err) => {
+                        failed += 1;
+                        errors.push(RowError {
+                            row_index: idx,
+                            message: format!("transform error ({}): {}", mapping.source_field, err),
+                        });
+                        record_failed = true;
+                        break;
+                    }
+                }
+            } else {
+                src_val
+            };
+
+            match build_property_entry(mapping, &effective_val) {
+                Ok(entry) => {
+                    props.insert(mapping.target_property.clone(), entry);
+                }
+                Err(err) => {
                     failed += 1;
-                    errors.push(RowError { row_index: idx, message: "Missing title property mapping".into() });
-                } else {
-                    ok += 1;
+                    errors.push(RowError {
+                        row_index: idx,
+                        message: format!("mapping error ({} -> {}): {}", mapping.source_field, mapping.target_property, err),
+                    });
+                    record_failed = true;
+                    break;
                 }
             }
-            Err(e) => {
-                failed += 1;
-                errors.push(RowError { row_index: idx, message: e });
-            }
         }
+
+        if record_failed {
+            continue;
+        }
+
+        if has_title_prop && !props.values().any(|v| v.get("title").is_some()) {
+            failed += 1;
+            errors.push(RowError { row_index: idx, message: "Missing title property mapping".into() });
+            continue;
+        }
+
+        ok += 1;
     }
+
     Ok(DryRunReport { total: input.records.len(), ok, failed, errors })
+}
+
+// -----------------------------
+// M2: Preview & Transform helpers
+// -----------------------------
+
+#[tauri::command]
+pub fn notion_import_preview_file(req: PreviewRequest) -> Result<PreviewResponse, String> {
+    notion_preview_file(&req)
+}
+
+#[tauri::command]
+pub fn notion_transform_eval_sample(req: TransformEvalRequest) -> Result<TransformEvalResult, String> {
+    let record_map = req
+        .record
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "record must be an object".to_string())?;
+    let executor = TransformExecutor::new().map_err(|err| err.to_string())?;
+    let ctx = TransformContext { row_index: req.row_index, record: record_map };
+    let result = executor
+        .execute(&req.code, req.value, ctx)
+        .map_err(|err| err.to_string())?;
+    Ok(TransformEvalResult { result })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use crate::notion::types::{DatabaseProperty, FieldMapping};
 
     #[test]
     fn filter_removes_empty_titles_by_default() {
@@ -323,5 +424,54 @@ mod tests {
         ];
         apply_filter_empty_title(&mut list, true);
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn dry_run_returns_error_when_no_records() {
+        let schema = DatabaseSchema {
+            id: "db".into(),
+            title: "Test DB".into(),
+            properties: vec![DatabaseProperty { name: "Name".into(), type_: "title".into(), required: Some(true), options: None }],
+        };
+        let input = DryRunInput { schema, mappings: vec![], records: vec![] };
+        let result = notion_import_dry_run(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dry_run_reports_transform_error() {
+        let schema = DatabaseSchema {
+            id: "db".into(),
+            title: "Test DB".into(),
+            properties: vec![DatabaseProperty { name: "Name".into(), type_: "title".into(), required: Some(true), options: None }],
+        };
+        let mappings = vec![
+            FieldMapping {
+                include: true,
+                source_field: "title".into(),
+                target_property: "Name".into(),
+                target_type: "title".into(),
+                transform_code: Some("function transform(value) { throw new Error('oops'); }".into()),
+            },
+        ];
+        let records = vec![json!({ "title": "hello" })];
+        let input = DryRunInput { schema, mappings, records };
+        let report = notion_import_dry_run(input).expect("should succeed");
+        assert_eq!(report.total, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].message.contains("oops"));
+    }
+
+    #[test]
+    fn transform_eval_sample_runs_code() {
+        let req = TransformEvalRequest {
+            code: "function transform(value) { return value + '!'; }".into(),
+            value: json!("hi"),
+            record: json!({"title": "hi"}),
+            row_index: 0,
+        };
+        let res = notion_transform_eval_sample(req).expect("eval");
+        assert_eq!(res.result, json!("hi!"));
     }
 }

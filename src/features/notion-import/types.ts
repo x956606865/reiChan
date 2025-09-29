@@ -47,3 +47,36 @@ export type DryRunReport = {
   errors: { rowIndex: number; message: string }[]
 }
 
+export type PreviewRequest = {
+  path: string
+  fileType?: string
+  limitRows?: number
+  limitBytes?: number
+}
+
+export type PreviewResponse = {
+  fields: string[]
+  records: unknown[]
+}
+
+export type TransformEvalRequest = {
+  code: string
+  value: unknown
+  record: unknown
+  rowIndex: number
+}
+
+export type TransformEvalResult = {
+  result: unknown
+}
+
+export type ImportJobDraft = {
+  tokenId: string
+  databaseId: string
+  sourceFilePath: string
+  fileType: string
+  fields: string[]
+  previewRecords: unknown[]
+  mappings: FieldMapping[]
+  defaults?: Record<string, unknown>
+}

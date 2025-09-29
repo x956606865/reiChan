@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 
-use super::types::{FieldMapping};
+use super::types::FieldMapping;
 
 /// Build Notion `properties` payload from a source record and field mappings.
 /// - This version intentionally ignores `transformCode` (M2 占位，先不执行 JS)。
@@ -10,45 +10,50 @@ pub fn build_properties(record: &Map<String, Value>, mappings: &[FieldMapping]) 
     for m in mappings.iter().filter(|m| m.include) {
         let src_val = record.get(&m.source_field).cloned().unwrap_or(Value::Null);
         let key = m.target_property.clone();
-        let entry = match m.target_type.as_str() {
-            "title" => json!({
-                "title": [{
-                    "type": "text",
-                    "text": {"content": to_string(&src_val)},
-                }]
-            }),
-            "rich_text" => json!({
-                "rich_text": [{
-                    "type": "text",
-                    "text": {"content": to_string(&src_val)},
-                }]
-            }),
-            "number" => json!({
-                "number": to_number(&src_val)
-            }),
-            "select" => {
-                let name = to_string_opt(&src_val);
-                json!({ "select": name.map(|n| json!({"name": n})).unwrap_or(Value::Null) })
-            }
-            "multi_select" => {
-                let arr = to_string_array(&src_val);
-                json!({ "multi_select": arr.into_iter().map(|n| json!({"name": n})).collect::<Vec<_>>() })
-            }
-            "date" => {
-                let iso = to_string_opt(&src_val);
-                json!({ "date": iso.map(|s| json!({"start": s})).unwrap_or(Value::Null) })
-            }
-            "checkbox" => json!({
-                "checkbox": to_bool(&src_val)
-            }),
-            "url" => json!({ "url": to_string_opt(&src_val) }),
-            "email" => json!({ "email": to_string_opt(&src_val) }),
-            "phone_number" => json!({ "phone_number": to_string_opt(&src_val) }),
-            other => return Err(format!("Unsupported targetType: {}", other)),
-        };
+        let entry = build_property_entry(m, &src_val)?;
         props.insert(key, entry);
     }
     Ok(props)
+}
+
+pub fn build_property_entry(mapping: &FieldMapping, src_val: &Value) -> Result<Value, String> {
+    let entry = match mapping.target_type.as_str() {
+        "title" => json!({
+            "title": [{
+                "type": "text",
+                "text": {"content": to_string(src_val)},
+            }]
+        }),
+        "rich_text" => json!({
+            "rich_text": [{
+                "type": "text",
+                "text": {"content": to_string(src_val)},
+            }]
+        }),
+        "number" => json!({
+            "number": to_number(src_val)
+        }),
+        "select" => {
+            let name = to_string_opt(src_val);
+            json!({ "select": name.map(|n| json!({"name": n})).unwrap_or(Value::Null) })
+        }
+        "multi_select" => {
+            let arr = to_string_array(src_val);
+            json!({ "multi_select": arr.into_iter().map(|n| json!({"name": n})).collect::<Vec<_>>() })
+        }
+        "date" => {
+            let iso = to_string_opt(src_val);
+            json!({ "date": iso.map(|s| json!({"start": s})).unwrap_or(Value::Null) })
+        }
+        "checkbox" => json!({
+            "checkbox": to_bool(src_val)
+        }),
+        "url" => json!({ "url": to_string_opt(src_val) }),
+        "email" => json!({ "email": to_string_opt(src_val) }),
+        "phone_number" => json!({ "phone_number": to_string_opt(src_val) }),
+        other => return Err(format!("Unsupported targetType: {}", other)),
+    };
+    Ok(entry)
 }
 
 fn to_string(v: &Value) -> String {
@@ -132,5 +137,18 @@ mod tests {
         assert!(props.get("Date").is_some());
         assert!(props.get("Done").is_some());
     }
-}
 
+    #[test]
+    fn build_property_entry_transforms_number() {
+        let mapping = FieldMapping {
+            include: true,
+            source_field: "score".into(),
+            target_property: "Score".into(),
+            target_type: "number".into(),
+            transform_code: None,
+        };
+        let entry = build_property_entry(&mapping, &json!("12"))
+            .expect("entry");
+        assert_eq!(entry.get("number").and_then(|v| v.as_f64()), Some(12.0));
+    }
+}

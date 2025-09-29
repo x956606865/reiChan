@@ -41,6 +41,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 imageproc = { version = "0.24", default-features = false }
 opencv = "0.94" 
 csv = "1"
+rquickjs = "0.9"
+thiserror = "1"
 
 [dev-dependencies]
 httpmock = "0.7"

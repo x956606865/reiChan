@@ -107,3 +107,18 @@ pub struct DryRunReport {
     pub failed: usize,
     pub errors: Vec<RowError>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformEvalRequest {
+    pub code: String,
+    pub value: Value,
+    pub record: Value,
+    pub row_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformEvalResult {
+    pub result: Value,
+}

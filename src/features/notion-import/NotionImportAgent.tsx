@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import MappingEditor from "./MappingEditor";
-import type { DatabaseBrief as DbBrief } from "./types";
+import type { DatabaseBrief as DbBrief, PreviewResponse, ImportJobDraft } from "./types";
 
 type TokenRow = {
   id: string;
@@ -72,20 +73,19 @@ export default function NotionImportAgent() {
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [selectedTokenId, setSelectedTokenId] = useState<string | null>(null);
   const [selectedDb, setSelectedDb] = useState<DbBrief | null>(null);
-  const [csvFields, setCsvFields] = useState<string[] | null>(null);
+  const [previewInfo, setPreviewInfo] = useState<{ path: string; fileType: string; data: PreviewResponse } | null>(null);
+  const [jobDraft, setJobDraft] = useState<ImportJobDraft | null>(null);
 
   const stepOrder = [1, 2, 3, 4] as const;
   const stepIndexMap = useMemo(() => new Map([[1, 1], [2, 2], [3, 3], [4, 4]]), []);
-
-  const goNext = useCallback(() => setStep(2), []);
-  const goPrev = useCallback(() => setStep(1), []);
+  const backToTokenStep = useCallback(() => setStep(1), []);
 
   return (
     <div className="notion-import-agent">
       <div className="stepper-nav" role="presentation">
         {stepOrder.map((s) => {
           const status = s === step ? "active" : s < step ? "completed" : "";
-          const label = s === 1 ? "选择 Token" : s === 2 ? "搜索并选择数据库" : s === 3 ? "上传 CSV" : "映射与模板";
+          const label = s === 1 ? "选择 Token" : s === 2 ? "搜索并选择数据库" : s === 3 ? "选择数据源" : "映射与模板";
           const index = stepIndexMap.get(s) ?? s;
           return (
             <div key={s} className={`stepper-nav-item ${status}`}>
@@ -123,35 +123,57 @@ export default function NotionImportAgent() {
             <h3>搜索并选择数据库</h3>
             <p>进入本步骤时自动拉取第一页；可继续检索与分页。</p>
           </header>
-          <DatabaseSearchStep tokenId={selectedTokenId} onPrev={goPrev} onSelect={(db) => {
+          <DatabaseSearchStep tokenId={selectedTokenId} onPrev={backToTokenStep} onSelect={(db) => {
             setSelectedDb(db);
             setStep(3);
           }} />
           <div className="wizard-controls">
-            <button type="button" onClick={goPrev}>返回上一步</button>
+            <button type="button" onClick={backToTokenStep}>返回上一步</button>
           </div>
         </section>
       )}
 
       {step === 3 && selectedTokenId && selectedDb && (
-        <section className="step-card" aria-label="上传 CSV">
+        <section className="step-card" aria-label="选择数据源">
           <header className="step-card-header">
             <span className="step-index">步骤 {stepIndexMap.get(3)}</span>
-            <h3>上传 CSV</h3>
-            <p>选择 CSV 文件以提取表头，后续映射的源字段默认来自该表头。</p>
+            <h3>选择数据源</h3>
+            <p>支持 CSV / JSON / JSONL。解析在后端完成，预览前 {"50"} 行以内。</p>
           </header>
-          <CsvUploadStep onPrev={() => setStep(2)} onNext={(fields) => { setCsvFields(fields); setStep(4); }} />
+          <DataSourceStep
+            initialSelection={previewInfo}
+            onPrev={() => setStep(2)}
+            onNext={(info) => {
+              setPreviewInfo(info);
+              setJobDraft(null);
+              setStep(4);
+            }}
+          />
         </section>
       )}
 
-      {step === 4 && selectedTokenId && selectedDb && (
+      {step === 4 && selectedTokenId && selectedDb && previewInfo && (
         <section className="step-card" aria-label="映射与模板">
           <header className="step-card-header">
             <span className="step-index">步骤 {stepIndexMap.get(4)}</span>
             <h3>映射与模板</h3>
-            <p>编辑字段映射，保存模板，并进行 Dry-run 校验。</p>
+            <p>
+              编辑字段映射，保存模板，并在 Dry-run 成功后生成导入草稿。
+              <br />
+              当前数据源：<code>{previewInfo.path}</code>
+            </p>
           </header>
-          <MappingEditor tokenId={selectedTokenId} databaseId={selectedDb.id} csvFields={csvFields ?? undefined} onPrev={() => setStep(3)} />
+          <MappingEditor
+            tokenId={selectedTokenId}
+            databaseId={selectedDb.id}
+            sourceFilePath={previewInfo.path}
+            fileType={previewInfo.fileType}
+            previewFields={previewInfo.data.fields}
+            previewRecords={previewInfo.data.records}
+            draft={jobDraft}
+            onDraftChange={setJobDraft}
+            onPrev={() => setStep(3)}
+          />
         </section>
       )}
     </div>
@@ -445,145 +467,183 @@ function DatabaseSearchStep(props: { tokenId: string | null; onPrev: () => void;
 }
 
 // -----------------------------
-// Step 3: 上传 CSV（前端读取表头 + 预览）
+// Step 3: 数据源选择（调用后端预览）
 // -----------------------------
 
-function CsvUploadStep(props: { onPrev: () => void; onNext: (csvFields: string[]) => void }) {
-  const [fileName, setFileName] = useState<string>("");
-  const [fields, setFields] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<string[][]>([]);
-  const [loading, setLoading] = useState(false);
+type DataSourceSelection = { path: string; fileType: string; data: PreviewResponse };
 
-  const onFile = useCallback((file: File) => {
+function DataSourceStep(props: {
+  initialSelection?: DataSourceSelection | null
+  onPrev: () => void
+  onNext: (info: DataSourceSelection) => void
+}) {
+  const [filePath, setFilePath] = useState<string>(props.initialSelection?.path ?? "");
+  const [fileType, setFileType] = useState<string>(props.initialSelection?.fileType ?? "auto");
+  const [preview, setPreview] = useState<PreviewResponse | null>(props.initialSelection?.data ?? null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const resolvedType = fileType === "auto" ? detectFileType(filePath) ?? "" : fileType;
+
+  const loadPreview = useCallback(async (path: string, typeHint?: string) => {
+    if (!path) return;
     setLoading(true);
     setError(null);
-    setFileName(file.name);
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const text = String(reader.result ?? "");
-        // 只读取前 256KB 以保障性能
-        const slice = text.slice(0, 256 * 1024);
-        const { headers, rows } = parseCsvPreview(slice, 20);
-        setFields(headers);
-        setPreview(rows);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        setLoading(false);
-      }
-    };
-    reader.onerror = () => {
+    try {
+      const req = {
+        path,
+        fileType: typeHint && typeHint !== "auto" ? typeHint : undefined,
+        limitRows: 50,
+        limitBytes: 512 * 1024,
+      };
+      const data = await invoke<PreviewResponse>("notion_import_preview_file", { req });
+      setPreview(data);
+    } catch (err) {
+      setPreview(null);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
       setLoading(false);
-      setError("读取文件失败");
-    };
-    reader.readAsText(file);
+    }
   }, []);
 
+  const chooseFile = useCallback(async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: '数据文件', extensions: ['csv', 'json', 'jsonl', 'txt'] }],
+      })
+      const path = Array.isArray(selected) ? selected[0] : typeof selected === 'string' ? selected : null
+      if (!path) return
+      const detected = detectFileType(path) ?? 'auto'
+      setError(null)
+      setPreview(null)
+      setFilePath(path)
+      setFileType(detected)
+      await loadPreview(path, detected === 'auto' ? undefined : detected)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [loadPreview])
+
+  const fields = preview?.fields ?? [];
+  const records = (preview?.records ?? []).slice(0, 20);
+
   return (
-    <div className="csv-upload-step">
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+    <div className="data-source-step">
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: 'wrap' }}>
         <button className="ghost" onClick={props.onPrev}>返回选择数据库</button>
-      </div>
-      <div className="form-field">
-        <label>选择 CSV 文件</label>
         <input
-          type="file"
-          accept=".csv,text/csv"
+          type="text"
+          value={filePath}
           onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onFile(f);
+            setFilePath(e.target.value)
+            setPreview(null)
+            setError(null)
           }}
+          onKeyDown={async (e) => {
+            if (e.key === 'Enter' && filePath) {
+              await loadPreview(filePath, fileType === 'auto' ? undefined : fileType)
+            }
+          }}
+          placeholder="输入文件绝对路径，例如 /Users/you/data.csv"
+          style={{ flex: 1, minWidth: 260 }}
         />
+        <button
+          className="ghost"
+          onClick={async () => {
+            if (!filePath) return
+            await loadPreview(filePath, fileType === 'auto' ? undefined : fileType)
+          }}
+          disabled={!filePath || loading}
+        >
+          加载预览
+        </button>
+        <button className="ghost" onClick={chooseFile}>{filePath ? "重新选择文件" : "选择文件"}</button>
+        <select
+          value={fileType}
+          onChange={(e) => setFileType(e.target.value)}
+          style={{ minWidth: 160 }}
+          title="若选择自动，将根据扩展名推断。"
+        >
+          <option value="auto">自动识别</option>
+          <option value="csv">CSV</option>
+          <option value="json">JSON</option>
+          <option value="jsonl">JSONL / NDJSON</option>
+        </select>
       </div>
-      {fileName && (
-        <div className="muted" style={{ marginTop: 6 }}>已选择：{fileName}</div>
-      )}
-      {error && <p className="error">{error}</p>}
-      {fields.length > 0 && (
-        <>
-          <div className="muted" style={{ margin: '8px 0' }}>检测到 {fields.length} 个表头字段。</div>
-          <div className="csv-preview-wrap">
-            <table className="analysis-table">
-              <thead>
-                <tr>
-                  {fields.map((h, i) => <th key={i}>{h || <span className='muted'>(空)</span>}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {preview.map((row, rIdx) => (
-                  <tr key={rIdx}>
-                    {fields.map((_, cIdx) => (
-                      <td key={cIdx}>{row[cIdx] ?? ''}</td>
-                    ))}
-                  </tr>
-                ))}
-                {preview.length === 0 && (
-                  <tr><td colSpan={fields.length} className="muted">无预览数据（仅提取了表头）。</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </>
+
+      {filePath && (
+        <div className="muted" style={{ marginBottom: 4 }}>
+          当前文件：<code>{filePath}</code>（类型：{resolvedType || "自动"}）
+        </div>
       )}
 
-      <div className="wizard-controls" style={{ marginTop: 8 }}>
-        <button className="primary" disabled={loading || fields.length === 0} onClick={() => props.onNext(fields)}>下一步</button>
+      {error && <p className="error">{error}</p>}
+      {loading && <p className="muted">解析中…</p>}
+
+      {fields.length > 0 && (
+        <div className="csv-preview-wrap" style={{ marginTop: 12 }}>
+          <table className="analysis-table">
+            <thead>
+              <tr>
+                {fields.map((f) => (
+                  <th key={f}>{f || <span className="muted">(空)</span>}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {records.map((row, idx) => {
+                const recordObj = (row as Record<string, unknown>) ?? {};
+                return (
+                  <tr key={idx}>
+                    {fields.map((field) => (
+                      <td key={field}>{formatPreviewCell(recordObj[field])}</td>
+                    ))}
+                  </tr>
+                );
+              })}
+              {records.length === 0 && (
+                <tr>
+                  <td colSpan={fields.length} className="muted">暂无样本记录。</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="wizard-controls" style={{ marginTop: 12 }}>
+        <button
+          className="primary"
+          disabled={!filePath || !preview || preview.fields.length === 0 || loading}
+          onClick={() => {
+            if (!filePath || !preview) return;
+            const appliedType = fileType === "auto" ? (resolvedType || "auto") : fileType;
+            props.onNext({ path: filePath, fileType: appliedType, data: preview });
+          }}
+        >
+          下一步
+        </button>
       </div>
     </div>
   );
 }
 
-// 轻量 CSV 预览解析（支持双引号与转义），仅用于表头与前若干行
-function parseCsvPreview(text: string, maxRows: number): { headers: string[]; rows: string[][] } {
-  // 去除 UTF-8 BOM
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+function detectFileType(path: string): string | null {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".csv")) return "csv";
+  if (lower.endsWith(".jsonl") || lower.endsWith(".ndjson")) return "jsonl";
+  if (lower.endsWith(".json")) return "json";
+  return null;
+}
 
-  const headers: string[] = [];
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = '';
-  let quoted = false;
-
-  const endRow = () => {
-    row.push(cell);
-    if (headers.length === 0) {
-      headers.push(...row.map((h) => h.trim()))
-    } else if (row.some((v) => v.length > 0)) {
-      rows.push(row);
-    }
-    row = [];
-    cell = '';
-  };
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quoted) {
-      if (ch === '"') {
-        if (text[i + 1] === '"') { cell += '"'; i++; }
-        else { quoted = false; }
-      } else {
-        cell += ch;
-      }
-      continue;
-    }
-
-    if (ch === '"') { quoted = true; continue; }
-    if (ch === ',') { row.push(cell); cell = ''; continue; }
-    if (ch === '\n' || ch === '\r') {
-      // 处理 CRLF：若当前为 CR，且下一个为 LF，则跳过 LF
-      if (ch === '\r' && text[i + 1] === '\n') i++;
-      endRow();
-      if (rows.length >= maxRows) break;
-      continue;
-    }
-    cell += ch;
+function formatPreviewCell(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
   }
-  // 文件末尾最后一行（可能没有换行）
-  if (cell.length > 0 || row.length > 0) {
-    endRow();
-  }
-
-  return { headers, rows };
 }
