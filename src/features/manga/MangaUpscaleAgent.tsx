@@ -1,5 +1,5 @@
 import type { ChangeEvent } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -130,6 +130,8 @@ type ServiceAddressBook = {
 };
 
 const REMOTE_ROOT = "incoming";
+const STALE_PROGRESS_THRESHOLD_MS = 15_000;
+const STALE_PROGRESS_CHECK_INTERVAL_MS = 5_000;
 
 const normalizeSegment = (input: string): string => {
   if (!input.trim()) {
@@ -279,6 +281,20 @@ type JobEventPayload = {
   message?: string | null;
   transport?: JobEventTransport;
   error?: string | null;
+  retries?: number;
+  lastError?: string | null;
+  artifactHash?: string | null;
+  params?: JobParamsConfig | null;
+  metadata?: JobMetadataInfo | null;
+};
+
+type JobStatusSnapshotPayload = {
+  jobId: string;
+  status: string;
+  processed: number;
+  total: number;
+  artifactPath?: string | null;
+  message?: string | null;
   retries?: number;
   lastError?: string | null;
   artifactHash?: string | null;
@@ -589,6 +605,7 @@ const MangaUpscaleAgent = () => {
   const [jobParamFavorites, setJobParamFavorites] = useState<JobParamFavorite[]>([]);
   const [jobParamsRestored, setJobParamsRestored] = useState(false);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
+  const staleJobsRef = useRef<Set<string>>(new Set());
   const [jobLoading, setJobLoading] = useState(false);
   const [jobError, setJobError] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string | null>(null);
@@ -1813,6 +1830,8 @@ const MangaUpscaleAgent = () => {
             return;
           }
 
+          staleJobsRef.current.delete(payload.jobId);
+
           setJobs((prev) => {
             const existing = prev.find((item) => item.jobId === payload.jobId);
             const record = mapPayloadToRecord(payload, undefined, existing ?? undefined);
@@ -1919,6 +1938,7 @@ const MangaUpscaleAgent = () => {
     async (job: JobRecord, options?: { silent?: boolean }) => {
       const terminal = job.status.toUpperCase() === "SUCCESS" || job.status.toUpperCase() === "FAILED";
       if (!job.serviceUrl || terminal) {
+        staleJobsRef.current.delete(job.jobId);
         return;
       }
 
@@ -1937,6 +1957,7 @@ const MangaUpscaleAgent = () => {
 
       try {
         await invoke("watch_manga_job", { request });
+        staleJobsRef.current.delete(job.jobId);
       } catch (watchError) {
         if (options?.silent) {
           return;
@@ -1959,6 +1980,116 @@ const MangaUpscaleAgent = () => {
     },
     [jobForm.pollIntervalMs],
   );
+
+  const refreshJobStatus = useCallback(
+    async (job: JobRecord) => {
+      if (!job.serviceUrl) {
+        staleJobsRef.current.delete(job.jobId);
+        return;
+      }
+
+      try {
+        const snapshot = await invoke<JobStatusSnapshotPayload>("fetch_manga_job_status", {
+          request: {
+            serviceUrl: job.serviceUrl,
+            jobId: job.jobId,
+            bearerToken: job.bearerToken?.trim() || undefined,
+          },
+        });
+
+        const payload: JobEventPayload = {
+          jobId: snapshot.jobId,
+          status: snapshot.status,
+          processed: snapshot.processed,
+          total: snapshot.total,
+          artifactPath: snapshot.artifactPath ?? null,
+          message: snapshot.message ?? null,
+          transport: "polling",
+          error: null,
+          retries: snapshot.retries ?? 0,
+          lastError: snapshot.lastError ?? null,
+          artifactHash: snapshot.artifactHash ?? null,
+          params: snapshot.params ?? null,
+          metadata: snapshot.metadata ?? null,
+        };
+
+        setJobs((prev) => {
+          const existing = prev.find((item) => item.jobId === payload.jobId);
+          const mapped = mapPayloadToRecord(payload, undefined, existing);
+          const next = prev.filter((item) => item.jobId !== mapped.jobId);
+          next.push(mapped);
+          next.sort((a, b) => b.lastUpdated - a.lastUpdated);
+          return next;
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setJobs((prev) =>
+          prev.map((item) =>
+            item.jobId === job.jobId
+              ? {
+                  ...item,
+                  message: `刷新状态失败：${message}`,
+                  transport: "system",
+                  error: message,
+                  lastUpdated: Date.now(),
+                }
+              : item,
+          ),
+        );
+      } finally {
+        staleJobsRef.current.delete(job.jobId);
+      }
+    },
+    [mapPayloadToRecord],
+  );
+
+  useEffect(() => {
+    if (jobs.length === 0) {
+      staleJobsRef.current.clear();
+      return () => {
+        /* noop */
+      };
+    }
+
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      for (const job of jobs) {
+        const terminal = job.status.toUpperCase() === "SUCCESS" || job.status.toUpperCase() === "FAILED";
+        if (terminal) {
+          staleJobsRef.current.delete(job.jobId);
+          continue;
+        }
+
+        if (!job.serviceUrl) {
+          continue;
+        }
+
+        if (now - job.lastUpdated < STALE_PROGRESS_THRESHOLD_MS) {
+          continue;
+        }
+
+        if (staleJobsRef.current.has(job.jobId)) {
+          continue;
+        }
+
+        staleJobsRef.current.add(job.jobId);
+        setJobs((prev) =>
+          prev.map((item) =>
+            item.jobId === job.jobId
+              ? {
+                  ...item,
+                  message: item.message ?? "进度久未更新，正在轮询刷新…",
+                  transport: "system",
+                }
+              : item,
+          ),
+        );
+        void refreshJobStatus(job);
+      }
+    }, STALE_PROGRESS_CHECK_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
+  }, [jobs, refreshJobStatus]);
 
   const resumeJob = useCallback(
     async (job: JobRecord, options?: { silent?: boolean }) => {

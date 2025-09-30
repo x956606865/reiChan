@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+try:  # pragma: no cover - optional dependency on CUDA runtime
+    import torch
+except Exception:  # pragma: no cover - torch not installed or CUDA unavailable
+    torch = None
 
 
 class UpscaleEngineProtocol(Protocol):
@@ -245,11 +252,33 @@ def _execute_sync(
     dst_ext = _determine_extension(payload.params.output_format)
 
     for image_path in image_paths:
+        decode_started = time.perf_counter()
         image = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        decode_elapsed = time.perf_counter() - decode_started
         if image is None:
             raise ValueError(f"Unable to decode image '{image_path}'")
 
+        tile_size, tile_pad = _resolve_tile_settings(image, payload.params, definition, device)
+        if hasattr(engine, "tile") and engine.tile != tile_size:
+            engine.tile = tile_size
+        if hasattr(engine, "tile_pad") and tile_pad is not None and engine.tile_pad != tile_pad:
+            engine.tile_pad = tile_pad
+
+        cuda_metrics_enabled = _cuda_metrics_available(device)
+        if cuda_metrics_enabled:
+            torch.cuda.reset_peak_memory_stats()
+
+        enhance_started = time.perf_counter()
         restored = engine.enhance(image, outscale=outscale)
+        enhance_elapsed = time.perf_counter() - enhance_started
+
+        peak_memory = None
+        if cuda_metrics_enabled:
+            torch.cuda.synchronize()
+            try:
+                peak_memory = torch.cuda.max_memory_allocated()
+            except RuntimeError:
+                peak_memory = None
 
         output_name = image_path.stem + dst_ext
         output_path = artifact_output_dir / output_name
@@ -267,6 +296,21 @@ def _execute_sync(
 
         processed += 1
         progress_callback(processed, total)
+
+        LOGGER.info(
+            "Job %s: processed %s (%dx%d → %s, scale=%.2f, tile=%d, pad=%d) decode=%.3fs enhance=%.3fs peak=%.1f MiB",
+            job_id,
+            image_path.name,
+            image.shape[1],
+            image.shape[0],
+            output_name,
+            outscale,
+            tile_size,
+            tile_pad or 0,
+            decode_elapsed,
+            enhance_elapsed,
+            _bytes_to_mebibytes(peak_memory),
+        )
 
     report = _build_report(
         job_id=job_id,
@@ -446,6 +490,52 @@ def _build_report(
         "items": list(items),
         "outputDir": str(output_dir),
     }
+
+
+def _resolve_tile_settings(
+    image: np.ndarray,
+    params: "JobParams",
+    definition: ModelDefinition,
+    device: str,
+) -> tuple[int, int]:
+    """Derive tile size/padding for the current frame, honouring user overrides."""
+
+    if params.tile_size:
+        return int(params.tile_size), int(params.tile_pad or 10)
+
+    tile_pad = int(params.tile_pad or 10)
+
+    if device != "cuda" or not _cuda_metrics_available(device):
+        return 0, tile_pad
+
+    height, width = image.shape[:2]
+    outscale = float(params.scale or definition.default_outscale)
+    scaled_area = (height * outscale) * (width * outscale)
+    megapixels = scaled_area / 1_000_000
+
+    if megapixels >= 32:
+        return 256, tile_pad
+    if megapixels >= 20:
+        return 320, tile_pad
+    if megapixels >= 14:
+        return 384, tile_pad
+    if megapixels >= 9:
+        return 448, tile_pad
+    return 0, tile_pad
+
+
+def _cuda_metrics_available(device: str) -> bool:
+    return bool(
+        torch
+        and device.startswith("cuda")
+        and torch.cuda.is_available()
+    )
+
+
+def _bytes_to_mebibytes(value: Optional[int]) -> float:
+    if not value:
+        return 0.0
+    return float(value) / (1024 ** 2)
 
 
 def _select_device(params: "JobParams") -> str:
