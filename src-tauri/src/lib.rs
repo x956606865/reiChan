@@ -760,7 +760,9 @@ pub fn run() {
             let db_path = app_data_dir.join("app.db");
             initialize_database(&db_path)?;
 
-            app.manage(AppState { db_path: db_path.clone() });
+            app.manage(AppState {
+                db_path: db_path.clone(),
+            });
             // Notion: use SQLite-backed store and HTTP adapter when enabled.
             #[cfg(feature = "notion-sqlite")]
             app.manage(notion::commands::create_state_with_sqlite(db_path.clone()));
@@ -800,7 +802,14 @@ pub fn run() {
             notion::commands::notion_template_delete,
             notion::commands::notion_import_preview_file,
             notion::commands::notion_import_dry_run,
-            notion::commands::notion_transform_eval_sample
+            notion::commands::notion_transform_eval_sample,
+            // Notion Import M3 skeleton
+            notion::commands::notion_import_start,
+            notion::commands::notion_import_pause,
+            notion::commands::notion_import_resume,
+            notion::commands::notion_import_cancel,
+            notion::commands::notion_import_get_job,
+            notion::commands::notion_import_list_jobs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rquickjs::{CatchResultExt, Context as JsContext, CaughtError, Runtime, String as JsString};
+use rquickjs::{
+    CatchResultExt, CaughtError, Context, Ctx, Error as JsError, Promise, Runtime,
+    String as JsString, Value as JsValue,
+};
 use serde_json::{Map, Value};
 
 const JS_TIMEOUT: Duration = Duration::from_millis(50);
@@ -20,13 +23,18 @@ impl TransformExecutor {
         Ok(Self { runtime })
     }
 
-    pub fn execute(&self, code: &str, value: Value, ctx: TransformContext) -> Result<Value, TransformError> {
+    pub fn execute(
+        &self,
+        code: &str,
+        value: Value,
+        ctx: TransformContext,
+    ) -> Result<Value, TransformError> {
         if code.trim().is_empty() {
             return Err(TransformError::Empty);
         }
 
-        let context = JsContext::full(&self.runtime)
-            .map_err(|err| TransformError::Engine(err.to_string()))?;
+        let context =
+            Context::full(&self.runtime).map_err(|err| TransformError::Engine(err.to_string()))?;
 
         let timeout_flag = Arc::new(AtomicBool::new(false));
         let flag = timeout_flag.clone();
@@ -43,8 +51,8 @@ impl TransformExecutor {
         let script = build_script(code, &value, &record_value, ctx.row_index);
 
         let eval_result: Result<String, String> = context.with(|js_ctx| {
-            match js_ctx.eval::<JsString, _>(script.clone()).catch(&js_ctx) {
-                Ok(out) => out.to_string().map_err(|err| err.to_string()),
+            let value = match js_ctx.eval::<JsValue, _>(script.clone()).catch(&js_ctx) {
+                Ok(val) => val,
                 Err(err) => {
                     let message = match err {
                         CaughtError::Exception(ex) => ex
@@ -56,8 +64,20 @@ impl TransformExecutor {
                             .unwrap_or_else(|| "JavaScript threw non-error value".to_string()),
                         CaughtError::Error(e) => e.to_string(),
                     };
-                    Err(message)
+                    return Err(message);
                 }
+            };
+
+            if value.is_promise() {
+                let promise = value
+                    .try_into_promise()
+                    .map_err(|_| "transform promise could not be constructed".to_string())?;
+                resolve_promise_to_string(&js_ctx, promise, start)
+            } else {
+                let js_string = value
+                    .try_into_string()
+                    .map_err(|_| "transform must return string".to_string())?;
+                js_string.to_string().map_err(|err| err.to_string())
             }
         });
         self.runtime.set_interrupt_handler(None);
@@ -74,10 +94,7 @@ impl TransformExecutor {
 
         let parsed: Value = serde_json::from_str(&output)
             .map_err(|err| TransformError::Serialization(err.to_string()))?;
-        let result = parsed
-            .get("result")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let result = parsed.get("result").cloned().unwrap_or(Value::Null);
         Ok(result)
     }
 }
@@ -135,6 +152,47 @@ JSON.stringify({{ result: __transform_normalized }});
     )
 }
 
+fn resolve_promise_to_string(
+    js_ctx: &Ctx<'_>,
+    promise: Promise<'_>,
+    start: Instant,
+) -> Result<String, String> {
+    loop {
+        if start.elapsed() > JS_TIMEOUT {
+            return Err("transform timed out".into());
+        }
+
+        match promise.result::<JsString>() {
+            Some(Ok(js_string)) => {
+                return js_string.to_string().map_err(|err| err.to_string());
+            }
+            Some(Err(JsError::Exception)) => {
+                let thrown = js_ctx.catch();
+                return Err(format_js_error(thrown));
+            }
+            Some(Err(err)) => {
+                return Err(err.to_string());
+            }
+            None => {
+                if !js_ctx.execute_pending_job() {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+fn format_js_error(value: JsValue) -> String {
+    if let Ok(js_str) = value.clone().try_into_string() {
+        if let Ok(text) = js_str.to_string() {
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    format!("JavaScript Error: {:?}", value)
+}
+
 #[derive(Debug, Clone)]
 pub struct TransformContext {
     pub row_index: usize,
@@ -164,7 +222,10 @@ mod tests {
     #[test]
     fn basic_execute_returns_value() {
         let executor = TransformExecutor::new().expect("runtime");
-        let ctx = TransformContext { row_index: 0, record: Map::new() };
+        let ctx = TransformContext {
+            row_index: 0,
+            record: Map::new(),
+        };
         let result = executor
             .execute(
                 "function transform(value) { return value; }",
@@ -178,7 +239,10 @@ mod tests {
     #[test]
     fn empty_code_rejected() {
         let executor = TransformExecutor::new().expect("runtime");
-        let ctx = TransformContext { row_index: 0, record: Map::new() };
+        let ctx = TransformContext {
+            row_index: 0,
+            record: Map::new(),
+        };
         let err = executor
             .execute("   ", Value::Null, ctx)
             .expect_err("should fail");

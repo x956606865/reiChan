@@ -41,7 +41,11 @@ pub fn preview_file(req: &PreviewRequest) -> Result<PreviewResponse, String> {
     }
 }
 
-fn preview_csv(path: &Path, limit_rows: usize, limit_bytes: usize) -> Result<PreviewResponse, String> {
+fn preview_csv(
+    path: &Path,
+    limit_rows: usize,
+    limit_bytes: usize,
+) -> Result<PreviewResponse, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let reader = BufReader::new(file);
     let limited = reader.take(limit_bytes as u64);
@@ -97,7 +101,10 @@ fn preview_json(
         .map_err(|err| err.to_string())?;
 
     if buffer.trim().is_empty() {
-        return Ok(PreviewResponse { fields: Vec::new(), records: Vec::new() });
+        return Ok(PreviewResponse {
+            fields: Vec::new(),
+            records: Vec::new(),
+        });
     }
 
     let mut rows: Vec<Value> = Vec::new();
@@ -151,7 +158,10 @@ fn preview_json(
             .collect();
     }
 
-    Ok(PreviewResponse { fields: field_order, records: rows })
+    Ok(PreviewResponse {
+        fields: field_order,
+        records: rows,
+    })
 }
 
 fn parse_json_lines<'a, I>(lines: I, limit_rows: usize, rows: &mut Vec<Value>) -> Result<(), String>
@@ -188,9 +198,10 @@ enum FileKind {
 }
 
 fn detect_file_kind(file_type: Option<&str>, path: &Path) -> Option<FileKind> {
-    let normalized = file_type
-        .map(|s| s.to_lowercase())
-        .or_else(|| path.extension().and_then(|ext| ext.to_str().map(|s| s.to_lowercase())));
+    let normalized = file_type.map(|s| s.to_lowercase()).or_else(|| {
+        path.extension()
+            .and_then(|ext| ext.to_str().map(|s| s.to_lowercase()))
+    });
 
     match normalized.as_deref() {
         Some("csv") => Some(FileKind::Csv),

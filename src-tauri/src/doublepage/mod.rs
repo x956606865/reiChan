@@ -17,6 +17,8 @@ mod mask;
 pub use mask::build_foreground_mask;
 use mask::BoundingBox;
 
+mod edge_texture;
+
 mod projection;
 use projection::analyze_projection;
 

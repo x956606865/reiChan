@@ -8,6 +8,7 @@ import type {
   DryRunReport,
   TransformEvalResult,
   ImportJobDraft,
+  DryRunErrorKind,
 } from './types'
 
 const DEFAULT_TRANSFORM = `function transform(value, ctx) {
@@ -62,6 +63,14 @@ export default function MappingEditor(props: Props) {
 
   const hasSamples = previewRecords.length > 0
 
+  const propertyMap = useMemo(() => {
+    const map = new Map<string, DatabaseSchema['properties'][number]>()
+    schema?.properties.forEach((prop) => {
+      map.set(prop.name, prop)
+    })
+    return map
+  }, [schema])
+
   const loadSchema = useCallback(async () => {
     if (!tokenId || !databaseId) return
     try {
@@ -102,6 +111,10 @@ export default function MappingEditor(props: Props) {
   }, [draft, mappings.length])
 
   const propertyNames = useMemo(() => schema?.properties.map((p) => p.name) ?? [], [schema])
+
+  const incompleteMappings = useMemo(() => {
+    return mappings.filter((m) => m.include && (!m.sourceField.trim() || !m.targetProperty.trim())).length
+  }, [mappings])
 
   const sourceFieldOptions = useMemo(() => {
     const fromPreview = Array.from(new Set(previewFields.map((f) => f || '').filter(Boolean)))
@@ -233,7 +246,7 @@ export default function MappingEditor(props: Props) {
     setDryRunReport(null)
     try {
       const records = previewRecords.slice(0, 20)
-      const input: DryRunInput = { schema, mappings, records }
+      const input: DryRunInput = defaults && Object.keys(defaults).length > 0 ? { schema, mappings, records, defaults } : { schema, mappings, records }
       const report = await invoke<DryRunReport>('notion_import_dry_run', { input })
       setDryRunReport(report)
       if (onDraftChange) {
@@ -246,7 +259,7 @@ export default function MappingEditor(props: Props) {
             fields: previewFields,
             previewRecords: records,
             mappings,
-            defaults,
+            defaults: defaults && Object.keys(defaults).length > 0 ? defaults : undefined,
           })
         } else {
           onDraftChange(null)
@@ -358,8 +371,11 @@ export default function MappingEditor(props: Props) {
                     }}
                   >
                     <option value="">选择属性</option>
-                    {propertyNames.map((name) => (
-                      <option key={name} value={name}>{name}</option>
+                    {schema?.properties.map((prop) => (
+                      <option key={prop.name} value={prop.name}>
+                        {prop.name}
+                        {prop.required ? ' *' : ''}
+                      </option>
                     ))}
                   </select>
                 </td>
@@ -392,8 +408,21 @@ export default function MappingEditor(props: Props) {
         <div style={{ flex: 1 }} />
         <input type="text" value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder="模板名称" />
         <button className="primary" disabled={savingTemplate} onClick={saveTemplate}>{savingTemplate ? '保存中…' : '保存模板'}</button>
-        <button className="ghost" disabled={dryRunLoading} onClick={runDry}>{dryRunLoading ? '校验中…' : 'Dry-run 校验'}</button>
+        <button
+          className="ghost"
+          disabled={dryRunLoading || !schema || !hasSamples || defaultsError !== null || incompleteMappings > 0}
+          onClick={runDry}
+        >
+          {dryRunLoading ? '校验中…' : 'Dry-run 校验'}
+        </button>
       </div>
+
+      {(defaultsError || incompleteMappings > 0) && (
+        <div className="error" style={{ marginBottom: 8 }}>
+          {defaultsError && <div>默认值错误：{defaultsError}</div>}
+          {incompleteMappings > 0 && <div>仍有 {incompleteMappings} 条映射缺少源字段或目标属性。</div>}
+        </div>
+      )}
 
       <section style={{ marginBottom: 12 }}>
         <h4>默认值（JSON）</h4>
@@ -432,7 +461,11 @@ export default function MappingEditor(props: Props) {
           {dryRunReport.errors.length > 0 && (
             <ul className="token-list">
               {dryRunReport.errors.map((err, idx) => (
-                <li key={idx}><code># {err.rowIndex}</code> {err.message}</li>
+                <li key={idx}>
+                  <code># {err.rowIndex}</code>
+                  <span style={{ marginLeft: 6, marginRight: 6 }}>[{mapErrorKind(err.kind)}]</span>
+                  {err.message}
+                </li>
               ))}
             </ul>
           )}
@@ -489,5 +522,18 @@ function safeStringify(value: unknown): string {
     return JSON.stringify(value)
   } catch {
     return String(value)
+  }
+}
+
+function mapErrorKind(kind: DryRunErrorKind): string {
+  switch (kind) {
+    case 'transform':
+      return 'Transform'
+    case 'mapping':
+      return 'Mapping'
+    case 'validation':
+      return 'Validation'
+    default:
+      return 'Unknown'
   }
 }

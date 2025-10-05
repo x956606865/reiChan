@@ -38,13 +38,16 @@ export type DryRunInput = {
   schema: DatabaseSchema
   mappings: FieldMapping[]
   records: unknown[]
+  defaults?: Record<string, unknown>
 }
+
+export type DryRunErrorKind = 'transform' | 'mapping' | 'validation'
 
 export type DryRunReport = {
   total: number
   ok: number
   failed: number
-  errors: { rowIndex: number; message: string }[]
+  errors: { rowIndex: number; message: string; kind: DryRunErrorKind }[]
 }
 
 export type PreviewRequest = {
