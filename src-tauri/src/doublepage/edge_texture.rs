@@ -3,6 +3,8 @@ use std::cmp::{max, min};
 use image::{DynamicImage, ImageBuffer, Luma};
 use serde::{Deserialize, Serialize};
 
+use super::config::EdgeTextureThresholdOverrides;
+
 const EPSILON: f32 = 1e-5;
 const SOBEL_X: [[f32; 3]; 3] = [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]];
 const SOBEL_Y: [[f32; 3]; 3] = [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]];
@@ -15,6 +17,9 @@ pub struct EdgeTextureConfig {
     pub entropy_window: u32,
     pub entropy_bins: u32,
     pub white_threshold: f32,
+    pub brightness_thresholds: [f32; 2],
+    pub brightness_weight: f32,
+    pub enable_dual_brightness: bool,
     pub left_search_ratio: f32,
     pub right_search_ratio: f32,
     pub center_search_ratio: f32,
@@ -31,6 +36,9 @@ impl Default for EdgeTextureConfig {
             entropy_window: 15,
             entropy_bins: 32,
             white_threshold: 0.45,
+            brightness_thresholds: [200.0, 40.0],
+            brightness_weight: 0.4,
+            enable_dual_brightness: true,
             left_search_ratio: 0.18,
             right_search_ratio: 0.18,
             center_search_ratio: 0.3,
@@ -38,6 +46,57 @@ impl Default for EdgeTextureConfig {
             center_max_ratio: 0.06,
             score_weights: [0.4, 0.35, 0.25],
         }
+    }
+}
+
+impl EdgeTextureConfig {
+    pub fn apply_overrides(mut self, overrides: &EdgeTextureThresholdOverrides) -> Self {
+        if let Some(value) = overrides.gamma {
+            self.gamma = value;
+        }
+        if let Some(value) = overrides.gaussian_kernel {
+            self.gaussian_kernel = value;
+        }
+        if let Some(value) = overrides.entropy_window {
+            self.entropy_window = value;
+        }
+        if let Some(value) = overrides.entropy_bins {
+            self.entropy_bins = value;
+        }
+        if let Some(value) = overrides.white_threshold {
+            self.white_threshold = value;
+        }
+        if let Some(value) = overrides.brightness_thresholds {
+            let bright = value[0].clamp(0.0, 255.0);
+            let dark = value[1].clamp(0.0, bright);
+            self.brightness_thresholds = [bright, dark];
+        }
+        if let Some(value) = overrides.brightness_weight {
+            self.brightness_weight = value.clamp(0.0, 1.0);
+        }
+        if let Some(value) = overrides.enable_dual_brightness {
+            self.enable_dual_brightness = value;
+        }
+        if let Some(value) = overrides.left_search_ratio {
+            self.left_search_ratio = value;
+        }
+        if let Some(value) = overrides.right_search_ratio {
+            self.right_search_ratio = value;
+        }
+        if let Some(value) = overrides.center_search_ratio {
+            self.center_search_ratio = value;
+        }
+        if let Some(value) = overrides.min_margin_ratio {
+            self.min_margin_ratio = value;
+        }
+        if let Some(value) = overrides.center_max_ratio {
+            self.center_max_ratio = value;
+        }
+        if let Some(value) = overrides.score_weights {
+            self.score_weights = value;
+        }
+
+        self
     }
 }
 
@@ -58,6 +117,7 @@ pub struct EdgeTextureMetrics {
     pub grad_variance: Vec<f32>,
     pub entropy: Vec<f32>,
     pub white_score: Vec<f32>,
+    pub mean_intensity: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +128,9 @@ pub struct EdgeTextureNotes {
     pub center_start: u32,
     pub center_end: u32,
     pub white_threshold: f32,
+    pub brightness_thresholds: [f32; 2],
+    pub brightness_weight: f32,
+    pub dual_brightness_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,10 +151,12 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
     let height = gray.height();
 
     if width == 0 || height == 0 {
-        return empty_outcome(width, config.white_threshold);
+        return empty_outcome(width, &config);
     }
 
     let gamma_corrected = apply_gamma(&gray, config.gamma);
+    let mean_intensity =
+        compute_column_mean_intensity(width as usize, height as usize, &gamma_corrected);
     let kernel_size = ensure_odd(config.gaussian_kernel);
     let blurred = gaussian_blur(
         width as usize,
@@ -149,7 +214,11 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         let slice_limit = min(limit, white_score.len());
         find_margin(
             &white_score[..slice_limit],
+            &mean_intensity[..slice_limit],
             config.white_threshold,
+            config.brightness_thresholds,
+            config.brightness_weight,
+            config.enable_dual_brightness,
             min_margin_width,
             SearchDirection::Left,
         )
@@ -161,7 +230,11 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         let offset = right_start as usize;
         let region = find_margin(
             &white_score[offset..],
+            &mean_intensity[offset..],
             config.white_threshold,
+            config.brightness_thresholds,
+            config.brightness_weight,
+            config.enable_dual_brightness,
             min_margin_width,
             SearchDirection::Right,
         );
@@ -211,6 +284,7 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         grad_variance,
         entropy,
         white_score: white_score.clone(),
+        mean_intensity: mean_intensity.clone(),
     };
 
     let notes = EdgeTextureNotes {
@@ -219,6 +293,9 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         center_start: center_start as u32,
         center_end: center_end as u32,
         white_threshold: config.white_threshold,
+        brightness_thresholds: config.brightness_thresholds,
+        brightness_weight: config.brightness_weight,
+        dual_brightness_enabled: config.enable_dual_brightness,
     };
 
     EdgeTextureOutcome {
@@ -239,7 +316,11 @@ enum SearchDirection {
 
 fn find_margin(
     scores: &[f32],
+    brightness: &[f32],
     threshold: f32,
+    brightness_thresholds: [f32; 2],
+    brightness_weight: f32,
+    dual_brightness_enabled: bool,
     min_width: u32,
     direction: SearchDirection,
 ) -> Option<MarginRegion> {
@@ -247,16 +328,47 @@ fn find_margin(
     if len == 0 {
         return None;
     }
+
     match direction {
         SearchDirection::Left => {
-            let mut end = 0;
-            while end < len && scores[end] <= threshold {
-                end += 1;
+            let mut end = 0usize;
+            let mut score_sum = 0.0f32;
+            let mut brightness_conf_sum = 0.0f32;
+
+            while end < len {
+                let value = scores[end];
+                let intensity = brightness.get(end).copied().unwrap_or(0.0);
+                if let Some(column_conf) = evaluate_margin_column(
+                    value,
+                    intensity,
+                    threshold,
+                    brightness_thresholds,
+                    dual_brightness_enabled,
+                ) {
+                    score_sum += value;
+                    if dual_brightness_enabled {
+                        brightness_conf_sum += column_conf;
+                    }
+                    end += 1;
+                } else {
+                    break;
+                }
             }
+
             if end as u32 >= min_width && end > 0 {
-                let segment = &scores[..end];
-                let mean = segment.iter().sum::<f32>() / segment.len() as f32;
-                let confidence = 1.0 - (mean / (threshold + 1e-5)).clamp(0.0, 1.0);
+                let mean = score_sum / end as f32;
+                let brightness_conf = if dual_brightness_enabled {
+                    brightness_conf_sum / end as f32
+                } else {
+                    0.0
+                };
+                let confidence = compute_margin_confidence(
+                    mean,
+                    threshold,
+                    brightness_weight,
+                    brightness_conf,
+                    dual_brightness_enabled,
+                );
                 Some(MarginRegion {
                     start_x: 0,
                     end_x: end as u32 - 1,
@@ -268,16 +380,48 @@ fn find_margin(
             }
         }
         SearchDirection::Right => {
-            let mut start = len as isize - 1;
-            while start >= 0 && scores[start as usize] <= threshold {
-                start -= 1;
+            let mut idx = len as isize - 1;
+            let mut count = 0usize;
+            let mut score_sum = 0.0f32;
+            let mut brightness_conf_sum = 0.0f32;
+
+            while idx >= 0 {
+                let index = idx as usize;
+                let value = scores[index];
+                let intensity = brightness.get(index).copied().unwrap_or(0.0);
+                if let Some(column_conf) = evaluate_margin_column(
+                    value,
+                    intensity,
+                    threshold,
+                    brightness_thresholds,
+                    dual_brightness_enabled,
+                ) {
+                    score_sum += value;
+                    if dual_brightness_enabled {
+                        brightness_conf_sum += column_conf;
+                    }
+                    count += 1;
+                    idx -= 1;
+                } else {
+                    break;
+                }
             }
-            let run_start = (start + 1) as usize;
-            let width = len - run_start;
-            if width as u32 >= min_width && width > 0 {
-                let segment = &scores[run_start..];
-                let mean = segment.iter().sum::<f32>() / segment.len() as f32;
-                let confidence = 1.0 - (mean / (threshold + 1e-5)).clamp(0.0, 1.0);
+
+            if count as u32 >= min_width && count > 0 {
+                let run_start = len - count;
+                let mean = score_sum / count as f32;
+                let brightness_conf = if dual_brightness_enabled {
+                    brightness_conf_sum / count as f32
+                } else {
+                    0.0
+                };
+                let confidence = compute_margin_confidence(
+                    mean,
+                    threshold,
+                    brightness_weight,
+                    brightness_conf,
+                    dual_brightness_enabled,
+                );
                 Some(MarginRegion {
                     start_x: run_start as u32,
                     end_x: (len - 1) as u32,
@@ -288,6 +432,91 @@ fn find_margin(
                 None
             }
         }
+    }
+}
+
+fn compute_margin_confidence(
+    mean_score: f32,
+    threshold: f32,
+    brightness_weight: f32,
+    brightness_conf: f32,
+    dual_brightness_enabled: bool,
+) -> f32 {
+    let base_conf = (1.0 - (mean_score / (threshold + EPSILON)).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    if dual_brightness_enabled {
+        let weight = brightness_weight.clamp(0.0, 1.0);
+        ((1.0 - weight) * base_conf + weight * brightness_conf).clamp(0.0, 1.0)
+    } else {
+        base_conf
+    }
+}
+
+fn evaluate_margin_column(
+    score: f32,
+    brightness: f32,
+    threshold: f32,
+    brightness_thresholds: [f32; 2],
+    dual_brightness_enabled: bool,
+) -> Option<f32> {
+    if dual_brightness_enabled {
+        if score > threshold {
+            return None;
+        }
+
+        let clamped = brightness.clamp(0.0, 255.0);
+        let class = classify_brightness(clamped, brightness_thresholds);
+        if matches!(class, BrightnessClass::Neutral) {
+            return None;
+        }
+        Some(compute_brightness_confidence(
+            clamped,
+            class,
+            brightness_thresholds,
+        ))
+    } else if score <= threshold {
+        Some(0.0)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrightnessClass {
+    Bright,
+    Dark,
+    Neutral,
+}
+
+fn classify_brightness(value: f32, thresholds: [f32; 2]) -> BrightnessClass {
+    let bright_min = thresholds[0].clamp(0.0, 255.0);
+    let dark_max = thresholds[1].clamp(0.0, bright_min);
+
+    if value >= bright_min {
+        BrightnessClass::Bright
+    } else if value <= dark_max {
+        BrightnessClass::Dark
+    } else {
+        BrightnessClass::Neutral
+    }
+}
+
+fn compute_brightness_confidence(value: f32, class: BrightnessClass, thresholds: [f32; 2]) -> f32 {
+    match class {
+        BrightnessClass::Bright => {
+            let bright_min = thresholds[0].clamp(0.0, 255.0);
+            let denominator = (255.0 - bright_min).max(EPSILON);
+            ((value - bright_min) / denominator).clamp(0.0, 1.0)
+        }
+        BrightnessClass::Dark => {
+            let bright_min = thresholds[0].clamp(0.0, 255.0);
+            let dark_max = thresholds[1].clamp(0.0, bright_min);
+            if dark_max <= EPSILON {
+                1.0
+            } else {
+                ((dark_max - value) / dark_max).clamp(0.0, 1.0)
+            }
+        }
+        BrightnessClass::Neutral => 0.0,
     }
 }
 
@@ -470,6 +699,32 @@ fn sobel_magnitude(width: usize, height: usize, data: &[f32]) -> Vec<f32> {
     output
 }
 
+fn compute_column_mean_intensity(width: usize, height: usize, data: &[f32]) -> Vec<f32> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut sums = vec![0f32; width];
+    if height == 0 {
+        return sums;
+    }
+
+    for y in 0..height {
+        let row_offset = y * width;
+        for x in 0..width {
+            if let Some(&value) = data.get(row_offset + x) {
+                sums[x] += value;
+            }
+        }
+    }
+
+    let denom = height.max(1) as f32;
+    for value in sums.iter_mut() {
+        *value = (*value / denom).clamp(0.0, 255.0);
+    }
+    sums
+}
+
 fn compute_column_stats(width: usize, height: usize, data: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut sum = vec![0f32; width];
     let mut sum_sq = vec![0f32; width];
@@ -636,7 +891,7 @@ fn clamp_i32(value: isize, min_value: isize, max_value: isize) -> isize {
     }
 }
 
-fn empty_outcome(width: u32, threshold: f32) -> EdgeTextureOutcome {
+fn empty_outcome(width: u32, config: &EdgeTextureConfig) -> EdgeTextureOutcome {
     EdgeTextureOutcome {
         split_x: None,
         confidence: 0.0,
@@ -649,13 +904,17 @@ fn empty_outcome(width: u32, threshold: f32) -> EdgeTextureOutcome {
             grad_variance: vec![0.0; width as usize],
             entropy: vec![0.0; width as usize],
             white_score: vec![0.0; width as usize],
+            mean_intensity: vec![0.0; width as usize],
         },
         notes: EdgeTextureNotes {
             left_limit: 0,
             right_start: width,
             center_start: width / 2,
             center_end: width / 2,
-            white_threshold: threshold,
+            white_threshold: config.white_threshold,
+            brightness_thresholds: config.brightness_thresholds,
+            brightness_weight: config.brightness_weight,
+            dual_brightness_enabled: config.enable_dual_brightness,
         },
     }
 }
@@ -678,25 +937,70 @@ mod tests {
         assert!((config.min_margin_ratio - 0.025).abs() < f32::EPSILON);
         assert!((config.center_max_ratio - 0.06).abs() < f32::EPSILON);
         assert_eq!(config.score_weights, [0.4, 0.35, 0.25]);
+        assert_eq!(config.brightness_thresholds, [200.0, 40.0]);
+        assert!((config.brightness_weight - 0.4).abs() < f32::EPSILON);
+        assert!(config.enable_dual_brightness);
     }
 
     #[test]
-    fn find_margin_detects_left_sequence_below_threshold() {
-        let scores = vec![0.2, 0.3, 0.32, 0.4, 0.5, 0.6];
-        let result = find_margin(&scores, 0.45, 3, SearchDirection::Left).expect("left margin");
+    fn find_margin_detects_left_segment_with_dual_brightness() {
+        let scores = vec![0.28, 0.3, 0.52, 0.6];
+        let brightness = vec![220.0, 215.0, 180.0, 175.0];
+        let result = find_margin(
+            &scores,
+            &brightness,
+            0.45,
+            [200.0, 40.0],
+            0.4,
+            true,
+            2,
+            SearchDirection::Left,
+        )
+        .expect("left margin");
         assert_eq!(result.start_x, 0);
-        assert_eq!(result.end_x, 3);
-        assert!(result.mean_score < 0.35);
+        assert_eq!(result.end_x, 1);
         assert!(result.confidence > 0.2);
     }
 
     #[test]
-    fn find_margin_detects_right_sequence_below_threshold() {
-        let scores = vec![0.7, 0.6, 0.5, 0.3, 0.2];
-        let result = find_margin(&scores, 0.45, 2, SearchDirection::Right).expect("right margin");
-        assert_eq!(result.start_x, 3);
-        assert_eq!(result.end_x, 4);
-        assert!(result.mean_score < 0.4);
+    fn find_margin_detects_right_segment_with_dual_brightness() {
+        let scores = vec![0.55, 0.48, 0.3, 0.2];
+        let brightness = vec![80.0, 60.0, 35.0, 20.0];
+        let result = find_margin(
+            &scores,
+            &brightness,
+            0.45,
+            [200.0, 40.0],
+            0.4,
+            true,
+            2,
+            SearchDirection::Right,
+        )
+        .expect("right margin");
+        assert_eq!(result.start_x, 2);
+        assert_eq!(result.end_x, 3);
+        assert!(result.confidence > 0.2);
+    }
+
+    #[test]
+    fn find_margin_supports_single_threshold_when_disabled() {
+        let scores = vec![0.2, 0.3, 0.32, 0.4, 0.5, 0.6];
+        let brightness = vec![180.0; scores.len()];
+        let result = find_margin(
+            &scores,
+            &brightness,
+            0.45,
+            [200.0, 40.0],
+            0.4,
+            false,
+            3,
+            SearchDirection::Left,
+        )
+        .expect("legacy left margin");
+        assert_eq!(result.start_x, 0);
+        assert_eq!(result.end_x, 3);
+        assert!(result.mean_score < 0.35);
+        assert!(result.confidence > 0.2);
     }
 
     #[test]
@@ -718,6 +1022,7 @@ mod tests {
         assert_eq!(outcome.metrics.grad_variance.len(), 16);
         assert_eq!(outcome.metrics.entropy.len(), 16);
         assert_eq!(outcome.metrics.white_score.len(), 16);
+        assert_eq!(outcome.metrics.mean_intensity.len(), 16);
         assert!(outcome.left_margin.is_none());
         assert!(outcome.right_margin.is_none());
         assert!(outcome.center_band.is_none());

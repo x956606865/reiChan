@@ -1,7 +1,7 @@
-import type { ChangeEvent } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { ChangeEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 type RenameEntry = {
   originalName: string;
@@ -30,7 +30,7 @@ type RenameSplitSummary = {
   fallbackSplits: number;
 };
 
-type SplitMode = "skip" | "cover-trim" | "split" | "fallback-center";
+type SplitMode = 'skip' | 'cover-trim' | 'split' | 'fallback-center';
 
 type SplitBoundingBox = {
   x: number;
@@ -52,6 +52,7 @@ type SplitMetadata = {
   bbox_height_ratio?: number;
   reason?: string;
   split_clamped?: boolean;
+  splitStrategy?: string;
 };
 
 type SplitItemReport = {
@@ -63,6 +64,26 @@ type SplitItemReport = {
   outputs: string[];
   metadata: SplitMetadata;
 };
+
+type SplitPrimaryMode = 'edgeTexture' | 'projection';
+
+type SplitModeSelectorInput =
+  | 'edgeTextureOnly'
+  | 'projectionOnly'
+  | {
+      hybrid: {
+        primary: SplitPrimaryMode;
+        fallback: SplitPrimaryMode;
+      };
+    };
+
+type SplitThresholdOverrides = {
+  mode?: SplitModeSelectorInput;
+  max_center_offset_ratio?: number;
+  edgeTexture?: any;
+};
+
+type SplitAlgorithmOption = 'edgeTexture' | 'projection';
 
 type SplitCommandOutcome = {
   analyzedFiles: number;
@@ -85,7 +106,7 @@ type RenameSplitPayload = {
   warnings?: string[];
 };
 
-type UploadMode = "zip" | "folder";
+type UploadMode = 'zip' | 'folder';
 
 type UploadOutcome = {
   remoteUrl: string;
@@ -95,11 +116,11 @@ type UploadOutcome = {
 };
 
 type UploadProgressStage =
-  | "preparing"
-  | "uploading"
-  | "finalizing"
-  | "completed"
-  | "failed";
+  | 'preparing'
+  | 'uploading'
+  | 'finalizing'
+  | 'completed'
+  | 'failed';
 
 type UploadProgressPayload = {
   stage: UploadProgressStage;
@@ -129,20 +150,20 @@ type ServiceAddressBook = {
   job: string[];
 };
 
-const REMOTE_ROOT = "incoming";
+const REMOTE_ROOT = 'incoming';
 const STALE_PROGRESS_THRESHOLD_MS = 15_000;
 const STALE_PROGRESS_CHECK_INTERVAL_MS = 5_000;
 
 const normalizeSegment = (input: string): string => {
   if (!input.trim()) {
-    return "";
+    return '';
   }
 
   const normalized = input
-    .normalize("NFKD")
-    .replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
+    .normalize('NFKD')
+    .replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
     .toLowerCase();
 
   return normalized.slice(0, 64);
@@ -150,7 +171,7 @@ const normalizeSegment = (input: string): string => {
 
 const formatSeedSegment = (seed: number): string => {
   const date = new Date(seed);
-  const pad = (value: number) => value.toString().padStart(2, "0");
+  const pad = (value: number) => value.toString().padStart(2, '0');
   const year = date.getFullYear();
   const month = pad(date.getMonth() + 1);
   const day = pad(date.getDate());
@@ -161,20 +182,27 @@ const formatSeedSegment = (seed: number): string => {
   return `${year}${month}${day}-${hours}${minutes}${seconds}`;
 };
 
-const buildRemotePath = (options: { title?: string; volume?: string; seed: number; mode: UploadMode }): string => {
-  const { title = "", volume = "", seed, mode } = options;
+const buildRemotePath = (options: {
+  title?: string;
+  volume?: string;
+  seed: number;
+  mode: UploadMode;
+}): string => {
+  const { title = '', volume = '', seed, mode } = options;
   const titleSegment = normalizeSegment(title);
   const volumeSegment = normalizeSegment(volume);
   const segments = [titleSegment, volumeSegment].filter(Boolean);
-  const slug = segments.length > 0 ? segments.join("-") : "manga";
+  const slug = segments.length > 0 ? segments.join('-') : 'manga';
   const suffix = formatSeedSegment(seed);
   const stem = `${slug}-${suffix}`.slice(0, 96);
-  const extension = mode === "zip" ? ".zip" : "";
+  const extension = mode === 'zip' ? '.zip' : '';
 
   return `${REMOTE_ROOT}/${stem}${extension}`;
 };
 
-const mergeServiceAddresses = (...sources: (string | string[] | null | undefined)[]): string[] => {
+const mergeServiceAddresses = (
+  ...sources: (string | string[] | null | undefined)[]
+): string[] => {
   const seen = new Set<string>();
   const result: string[] = [];
 
@@ -195,7 +223,7 @@ const mergeServiceAddresses = (...sources: (string | string[] | null | undefined
       continue;
     }
 
-    if (typeof source === "string") {
+    if (typeof source === 'string') {
       const trimmed = source.trim();
       if (!trimmed || seen.has(trimmed)) {
         continue;
@@ -208,18 +236,18 @@ const mergeServiceAddresses = (...sources: (string | string[] | null | undefined
   return result;
 };
 
-type JobEventTransport = "websocket" | "polling" | "system";
+type JobEventTransport = 'websocket' | 'polling' | 'system';
 
 type JobParamsConfig = {
   model: string;
   scale: number;
-  denoise: "low" | "medium" | "high";
-  outputFormat: "jpg" | "png" | "webp";
+  denoise: 'low' | 'medium' | 'high';
+  outputFormat: 'jpg' | 'png' | 'webp';
   jpegQuality: number;
   tileSize: number | null;
   tilePad: number | null;
   batchSize: number | null;
-  device: "auto" | "cuda" | "cpu";
+  device: 'auto' | 'cuda' | 'cpu';
 };
 
 type JobMetadataInfo = {
@@ -239,7 +267,7 @@ type ArtifactValidationItem = {
   actualHash?: string | null;
   expectedBytes?: number | null;
   actualBytes?: number | null;
-  status: "matched" | "missing" | "extra" | "mismatch";
+  status: 'matched' | 'missing' | 'extra' | 'mismatch';
 };
 
 type ArtifactReport = {
@@ -311,7 +339,7 @@ type JobRecord = JobEventPayload & {
   serviceUrl: string;
   bearerToken?: string | null;
   inputPath?: string | null;
-  inputType?: JobFormState["inputType"];
+  inputType?: JobFormState['inputType'];
   manifestPath?: string | null;
   transport: JobEventTransport;
 };
@@ -321,12 +349,12 @@ type JobFormState = {
   bearerToken: string;
   title: string;
   volume: string;
-  inputType: "zip" | "folder";
+  inputType: 'zip' | 'folder';
   inputPath: string;
   pollIntervalMs: number;
 };
 
-type MangaSourceMode = "singleVolume" | "multiVolume";
+type MangaSourceMode = 'singleVolume' | 'multiVolume';
 
 type VolumeCandidate = {
   directory: string;
@@ -340,7 +368,7 @@ type SplitDetectionSummary = {
   candidates: number;
 };
 
-type SplitProgressStage = "initializing" | "processing" | "completed";
+type SplitProgressStage = 'initializing' | 'processing' | 'completed';
 
 type SplitProgressPayload = {
   totalFiles: number;
@@ -375,16 +403,16 @@ type VolumeRenameOutcome = {
 
 type RenameSummary =
   | {
-      mode: "single";
+      mode: 'single';
       outcome: RenameOutcome;
     }
   | {
-      mode: "multi";
+      mode: 'multi';
       volumes: VolumeRenameOutcome[];
       dryRun: boolean;
     };
 
-type StepId = "source" | "volumes" | "rename" | "upload" | "jobs";
+type StepId = 'source' | 'volumes' | 'rename' | 'upload' | 'jobs';
 
 type StepDescriptor = {
   id: StepId;
@@ -393,136 +421,155 @@ type StepDescriptor = {
 
 const DEFAULT_PAD = 4;
 const DEFAULT_POLL_INTERVAL = 1000;
-const SETTINGS_KEY = "manga-upscale-agent:v1";
+const SETTINGS_KEY = 'manga-upscale-agent:v1';
 const UPLOAD_DEFAULTS_KEY = `${SETTINGS_KEY}:upload-defaults`;
 const SERVICE_ADDRESS_BOOK_KEY = `${SETTINGS_KEY}:service-addresses`;
 
-const LEGACY_SETTINGS_KEY = "manga-upscale-agent";
+const LEGACY_SETTINGS_KEY = 'manga-upscale-agent';
 const LEGACY_UPLOAD_DEFAULTS_KEY = `${LEGACY_SETTINGS_KEY}:upload-defaults`;
 const LEGACY_SERVICE_ADDRESS_BOOK_KEY = `${LEGACY_SETTINGS_KEY}:service-addresses`;
 const PARAM_DEFAULTS_KEY = `${SETTINGS_KEY}:job-params`;
 const PARAM_FAVORITES_KEY = `${SETTINGS_KEY}:job-param-favorites`;
 
 const DEFAULT_JOB_PARAMS: JobParamsConfig = {
-  model: "RealESRGAN_x4plus_anime_6B",
+  model: 'RealESRGAN_x4plus_anime_6B',
   scale: 2,
-  denoise: "medium",
-  outputFormat: "jpg",
+  denoise: 'medium',
+  outputFormat: 'jpg',
   jpegQuality: 95,
   tileSize: null,
   tilePad: null,
   batchSize: null,
-  device: "auto",
+  device: 'auto',
 };
 
 const createInitialRenameForm = (): RenameFormState => ({
-  directory: "",
+  directory: '',
   pad: DEFAULT_PAD,
-  targetExtension: "jpg",
+  targetExtension: 'jpg',
 });
 
 const createInitialUploadForm = (): UploadFormState => ({
-  serviceUrl: "",
-  bearerToken: "",
-  title: "",
-  volume: "",
-  mode: "zip",
+  serviceUrl: '',
+  bearerToken: '',
+  title: '',
+  volume: '',
+  mode: 'zip',
 });
 
 const createInitialJobForm = (): JobFormState => ({
-  serviceUrl: "",
-  bearerToken: "",
-  title: "",
-  volume: "",
-  inputType: "zip",
-  inputPath: "",
+  serviceUrl: '',
+  bearerToken: '',
+  title: '',
+  volume: '',
+  inputType: 'zip',
+  inputPath: '',
   pollIntervalMs: DEFAULT_POLL_INTERVAL,
 });
 
 const MangaUpscaleAgent = () => {
   const [renameForm, setRenameForm] = useState<RenameFormState>(() =>
-    createInitialRenameForm(),
+    createInitialRenameForm()
   );
-  const [renameSummary, setRenameSummary] = useState<RenameSummary | null>(null);
+  const [renameSummary, setRenameSummary] = useState<RenameSummary | null>(
+    null
+  );
   const [renameLoading, setRenameLoading] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
 
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
-  const [sourceAnalysis, setSourceAnalysis] = useState<MangaSourceAnalysis | null>(null);
+  const [sourceAnalysis, setSourceAnalysis] =
+    useState<MangaSourceAnalysis | null>(null);
   const [volumeMappings, setVolumeMappings] = useState<VolumeMapping[]>([]);
-  const [volumeMappingError, setVolumeMappingError] = useState<string | null>(null);
+  const [volumeMappingError, setVolumeMappingError] = useState<string | null>(
+    null
+  );
   const [mappingConfirmed, setMappingConfirmed] = useState(false);
-  const [selectedVolumeKey, setSelectedVolumeKey] = useState<string | null>(null);
+  const [selectedVolumeKey, setSelectedVolumeKey] = useState<string | null>(
+    null
+  );
   const [hasRestoredDefaults, setHasRestoredDefaults] = useState(false);
 
-  const isMultiVolumeSource = sourceAnalysis?.mode === "multiVolume";
+  const isMultiVolumeSource = sourceAnalysis?.mode === 'multiVolume';
 
   const [uploadForm, setUploadForm] = useState<UploadFormState>(() =>
-    createInitialUploadForm(),
+    createInitialUploadForm()
   );
   const [uploadLoading, setUploadLoading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<UploadProgressPayload | null>(null);
+  const [uploadProgress, setUploadProgress] =
+    useState<UploadProgressPayload | null>(null);
   const [remotePathSeed, setRemotePathSeed] = useState(() => Date.now());
-  const [lastUploadRemotePath, setLastUploadRemotePath] = useState<string>("");
-  const [uploadServiceOptions, setUploadServiceOptions] = useState<string[]>([]);
+  const [lastUploadRemotePath, setLastUploadRemotePath] = useState<string>('');
+  const [uploadServiceOptions, setUploadServiceOptions] = useState<string[]>(
+    []
+  );
   const [isAddingUploadService, setIsAddingUploadService] = useState(false);
-  const [uploadAddressDraft, setUploadAddressDraft] = useState("");
-  const [uploadAddressError, setUploadAddressError] = useState<string | null>(null);
+  const [uploadAddressDraft, setUploadAddressDraft] = useState('');
+  const [uploadAddressError, setUploadAddressError] = useState<string | null>(
+    null
+  );
 
   const [jobServiceOptions, setJobServiceOptions] = useState<string[]>([]);
   const [isAddingJobService, setIsAddingJobService] = useState(false);
-  const [jobAddressDraft, setJobAddressDraft] = useState("");
+  const [jobAddressDraft, setJobAddressDraft] = useState('');
   const [jobAddressError, setJobAddressError] = useState<string | null>(null);
 
   const [jobForm, setJobForm] = useState<JobFormState>(() =>
-    createInitialJobForm(),
+    createInitialJobForm()
   );
-  const [jobParams, setJobParams] = useState<JobParamsConfig>(DEFAULT_JOB_PARAMS);
+  const [jobParams, setJobParams] =
+    useState<JobParamsConfig>(DEFAULT_JOB_PARAMS);
   const [contentSplitEnabled, setContentSplitEnabled] = useState(false);
+  const [splitAlgorithm, setSplitAlgorithm] =
+    useState<SplitAlgorithmOption>('edgeTexture');
   const [splitWorkspace, setSplitWorkspace] = useState<string | null>(null);
-  const [splitSummaryState, setSplitSummaryState] = useState<RenameSplitSummary | null>(null);
+  const [splitSummaryState, setSplitSummaryState] =
+    useState<RenameSplitSummary | null>(null);
   const [splitWarningsState, setSplitWarningsState] = useState<string[]>([]);
   const [splitReportPath, setSplitReportPath] = useState<string | null>(null);
   const [splitSourceRoot, setSplitSourceRoot] = useState<string | null>(null);
   const [splitPreparing, setSplitPreparing] = useState(false);
   const [splitError, setSplitError] = useState<string | null>(null);
-  const [splitEstimate, setSplitEstimate] = useState<SplitDetectionSummary | null>(null);
-  const [splitProgress, setSplitProgress] = useState<SplitProgressPayload | null>(null);
+  const [splitEstimate, setSplitEstimate] =
+    useState<SplitDetectionSummary | null>(null);
+  const [splitProgress, setSplitProgress] =
+    useState<SplitProgressPayload | null>(null);
 
-  const [currentStep, setCurrentStep] = useState<StepId>("source");
+  const [currentStep, setCurrentStep] = useState<StepId>('source');
 
   const splitProgressPercent = useMemo(() => {
     if (!splitProgress) {
       return 0;
     }
     if (splitProgress.totalFiles <= 0) {
-      return splitProgress.stage === "completed" ? 100 : 0;
+      return splitProgress.stage === 'completed' ? 100 : 0;
     }
     const percent =
-      (splitProgress.processedFiles / Math.max(splitProgress.totalFiles, 1)) * 100;
+      (splitProgress.processedFiles / Math.max(splitProgress.totalFiles, 1)) *
+      100;
     return Math.min(100, Math.max(0, Math.round(percent)));
   }, [splitProgress]);
 
   const splitProgressStatus = useMemo(() => {
     if (!splitProgress) {
-      return splitPreparing ? "正在初始化拆分…" : null;
+      return splitPreparing ? '正在初始化拆分…' : null;
     }
 
-    if (splitProgress.stage === "completed") {
-      return "拆分完成";
+    if (splitProgress.stage === 'completed') {
+      return '拆分完成';
     }
 
-    if (splitProgress.stage === "processing") {
+    if (splitProgress.stage === 'processing') {
       if (splitProgress.totalFiles > 0) {
         return `处理中 ${splitProgress.processedFiles}/${splitProgress.totalFiles}`;
       }
-      return "处理中…";
+      return '处理中…';
     }
 
-    return "正在初始化拆分…";
+    return '正在初始化拆分…';
   }, [splitPreparing, splitProgress]);
 
   const splitProgressFileName = useMemo(() => {
@@ -544,8 +591,22 @@ const MangaUpscaleAgent = () => {
     setSplitProgress(null);
   }, []);
 
+  const handleSplitAlgorithmChange = useCallback(
+    (event: ChangeEvent<HTMLSelectElement>) => {
+      const value = event.currentTarget.value as SplitAlgorithmOption;
+      if (value === splitAlgorithm) {
+        return;
+      }
+      setSplitAlgorithm(value);
+      resetSplitState();
+      setSplitPreparing(false);
+      setSplitEstimate(null);
+    },
+    [resetSplitState, splitAlgorithm]
+  );
+
   const resetWizardState = useCallback(() => {
-    setCurrentStep("source");
+    setCurrentStep('source');
     setRenameForm(createInitialRenameForm());
     setRenameSummary(null);
     setRenameLoading(false);
@@ -569,9 +630,9 @@ const MangaUpscaleAgent = () => {
     setUploadStatus(null);
     setUploadProgress(null);
     setRemotePathSeed(Date.now());
-    setLastUploadRemotePath("");
+    setLastUploadRemotePath('');
     setIsAddingUploadService(false);
-    setUploadAddressDraft("");
+    setUploadAddressDraft('');
     setUploadAddressError(null);
     setContentSplitEnabled(false);
     resetSplitState();
@@ -588,12 +649,12 @@ const MangaUpscaleAgent = () => {
     setJobLoading(false);
     setJobError(null);
     setJobStatus(null);
-    setJobStatusFilter("all");
-    setJobSearch("");
+    setJobStatusFilter('all');
+    setJobSearch('');
     setSelectedJobIds([]);
     setJobs([]);
     setIsAddingJobService(false);
-    setJobAddressDraft("");
+    setJobAddressDraft('');
     setJobAddressError(null);
     setArtifactReports([]);
     setArtifactDownloads([]);
@@ -602,30 +663,45 @@ const MangaUpscaleAgent = () => {
     setArtifactValidateBusyJob(null);
     setArtifactTargetRoot(null);
   }, [resetSplitState]);
-  const [jobParamFavorites, setJobParamFavorites] = useState<JobParamFavorite[]>([]);
+  const [jobParamFavorites, setJobParamFavorites] = useState<
+    JobParamFavorite[]
+  >([]);
   const [jobParamsRestored, setJobParamsRestored] = useState(false);
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const staleJobsRef = useRef<Set<string>>(new Set());
   const [jobLoading, setJobLoading] = useState(false);
   const [jobError, setJobError] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string | null>(null);
-  const [jobStatusFilter, setJobStatusFilter] = useState<"all" | "active" | "completed" | "failed">("all");
-  const [jobSearch, setJobSearch] = useState("");
+  const [jobStatusFilter, setJobStatusFilter] = useState<
+    'all' | 'active' | 'completed' | 'failed'
+  >('all');
+  const [jobSearch, setJobSearch] = useState('');
   const [selectedJobIds, setSelectedJobIds] = useState<string[]>([]);
   const [artifactReports, setArtifactReports] = useState<ArtifactReport[]>([]);
-  const [artifactDownloads, setArtifactDownloads] = useState<ArtifactDownloadSummary[]>([]);
+  const [artifactDownloads, setArtifactDownloads] = useState<
+    ArtifactDownloadSummary[]
+  >([]);
   const [artifactError, setArtifactError] = useState<string | null>(null);
-  const [artifactDownloadBusyJob, setArtifactDownloadBusyJob] = useState<string | null>(null);
-  const [artifactValidateBusyJob, setArtifactValidateBusyJob] = useState<string | null>(null);
-  const [artifactTargetRoot, setArtifactTargetRoot] = useState<string | null>(null);
+  const [artifactDownloadBusyJob, setArtifactDownloadBusyJob] = useState<
+    string | null
+  >(null);
+  const [artifactValidateBusyJob, setArtifactValidateBusyJob] = useState<
+    string | null
+  >(null);
+  const [artifactTargetRoot, setArtifactTargetRoot] = useState<string | null>(
+    null
+  );
   const sanitizeVolumeName = useCallback((folderName: string) => {
-    const replaced = folderName.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+    const replaced = folderName
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
     return replaced.length > 0 ? replaced : folderName;
   }, []);
 
   const buildInitialMappings = useCallback(
     (analysis: MangaSourceAnalysis) => {
-      if (analysis.mode !== "multiVolume") {
+      if (analysis.mode !== 'multiVolume') {
         return [] as VolumeMapping[];
       }
 
@@ -633,7 +709,7 @@ const MangaUpscaleAgent = () => {
 
       return analysis.volumeCandidates.map((candidate, index) => {
         let detectedNumber =
-          typeof candidate.detectedNumber === "number"
+          typeof candidate.detectedNumber === 'number'
             ? candidate.detectedNumber
             : candidate.detectedNumber ?? null;
 
@@ -662,7 +738,7 @@ const MangaUpscaleAgent = () => {
         } satisfies VolumeMapping;
       });
     },
-    [sanitizeVolumeName],
+    [sanitizeVolumeName]
   );
 
   const analyzeDirectory = useCallback(
@@ -681,18 +757,23 @@ const MangaUpscaleAgent = () => {
       setRenameSummary(null);
 
       try {
-        const analysis = await invoke<MangaSourceAnalysis>("analyze_manga_directory", {
-          directory: path,
-        });
+        const analysis = await invoke<MangaSourceAnalysis>(
+          'analyze_manga_directory',
+          {
+            directory: path,
+          }
+        );
 
         setSourceAnalysis(analysis);
         setSplitEstimate(analysis.splitDetection ?? null);
 
-        if (analysis.mode === "multiVolume") {
+        if (analysis.mode === 'multiVolume') {
           const mappings = buildInitialMappings(analysis);
           setVolumeMappings(mappings);
           setMappingConfirmed(false);
-          setSelectedVolumeKey(mappings.length > 0 ? mappings[0].directory : null);
+          setSelectedVolumeKey(
+            mappings.length > 0 ? mappings[0].directory : null
+          );
         } else {
           setVolumeMappings([]);
           setMappingConfirmed(true);
@@ -703,25 +784,27 @@ const MangaUpscaleAgent = () => {
         setVolumeMappings([]);
         setMappingConfirmed(false);
         setSelectedVolumeKey(null);
-        setAnalysisError(error instanceof Error ? error.message : String(error));
+        setAnalysisError(
+          error instanceof Error ? error.message : String(error)
+        );
         setSplitEstimate(null);
       } finally {
         setAnalysisLoading(false);
       }
     },
-    [buildInitialMappings],
+    [buildInitialMappings]
   );
 
   const handleRefreshAnalysis = useCallback(() => {
     if (!renameForm.directory) {
-      setAnalysisError("请先选择漫画文件夹路径。");
+      setAnalysisError('请先选择漫画文件夹路径。');
       return;
     }
     analyzeDirectory(renameForm.directory);
   }, [analyzeDirectory, renameForm.directory]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window === 'undefined') {
       return;
     }
 
@@ -729,9 +812,15 @@ const MangaUpscaleAgent = () => {
       const stored = window.localStorage.getItem(SETTINGS_KEY);
       const legacyStored = window.localStorage.getItem(LEGACY_SETTINGS_KEY);
       const storedDefaults = window.localStorage.getItem(UPLOAD_DEFAULTS_KEY);
-      const legacyDefaults = window.localStorage.getItem(LEGACY_UPLOAD_DEFAULTS_KEY);
-      const storedAddressBookRaw = window.localStorage.getItem(SERVICE_ADDRESS_BOOK_KEY);
-      const legacyAddressBookRaw = window.localStorage.getItem(LEGACY_SERVICE_ADDRESS_BOOK_KEY);
+      const legacyDefaults = window.localStorage.getItem(
+        LEGACY_UPLOAD_DEFAULTS_KEY
+      );
+      const storedAddressBookRaw = window.localStorage.getItem(
+        SERVICE_ADDRESS_BOOK_KEY
+      );
+      const legacyAddressBookRaw = window.localStorage.getItem(
+        LEGACY_SERVICE_ADDRESS_BOOK_KEY
+      );
 
       let uploadPatch: Partial<UploadFormState> | null = null;
       let jobPatch: Partial<JobFormState> | null = null;
@@ -747,7 +836,7 @@ const MangaUpscaleAgent = () => {
 
         if (parsed.uploadForm) {
           uploadPatch = { ...parsed.uploadForm };
-          if (uploadPatch && "remotePath" in uploadPatch) {
+          if (uploadPatch && 'remotePath' in uploadPatch) {
             delete (uploadPatch as Record<string, unknown>).remotePath;
           }
         }
@@ -765,7 +854,7 @@ const MangaUpscaleAgent = () => {
 
           if (legacyParsed.uploadForm) {
             uploadPatch = { ...legacyParsed.uploadForm };
-            if (uploadPatch && "remotePath" in uploadPatch) {
+            if (uploadPatch && 'remotePath' in uploadPatch) {
               delete (uploadPatch as Record<string, unknown>).remotePath;
             }
           }
@@ -773,15 +862,20 @@ const MangaUpscaleAgent = () => {
             jobPatch = { ...legacyParsed.jobForm, ...(jobPatch ?? {}) };
           }
         } catch (legacyError) {
-          console.warn("Failed to restore legacy manga agent settings", legacyError);
+          console.warn(
+            'Failed to restore legacy manga agent settings',
+            legacyError
+          );
         }
       }
 
       if (storedDefaults) {
-        const defaults = JSON.parse(storedDefaults) as Partial<Pick<UploadFormState, "serviceUrl" >>;
+        const defaults = JSON.parse(storedDefaults) as Partial<
+          Pick<UploadFormState, 'serviceUrl'>
+        >;
         if (defaults?.serviceUrl) {
           defaultsServiceUrl = defaults.serviceUrl;
-          if (!(uploadPatch?.serviceUrl)) {
+          if (!uploadPatch?.serviceUrl) {
             uploadPatch = {
               ...(uploadPatch ?? {}),
               serviceUrl: defaults.serviceUrl,
@@ -792,10 +886,12 @@ const MangaUpscaleAgent = () => {
 
       if (!defaultsServiceUrl && legacyDefaults) {
         try {
-          const defaults = JSON.parse(legacyDefaults) as Partial<Pick<UploadFormState, "serviceUrl" >>;
+          const defaults = JSON.parse(legacyDefaults) as Partial<
+            Pick<UploadFormState, 'serviceUrl'>
+          >;
           if (defaults?.serviceUrl) {
             defaultsServiceUrl = defaults.serviceUrl;
-            if (!(uploadPatch?.serviceUrl)) {
+            if (!uploadPatch?.serviceUrl) {
               uploadPatch = {
                 ...(uploadPatch ?? {}),
                 serviceUrl: defaults.serviceUrl,
@@ -803,41 +899,59 @@ const MangaUpscaleAgent = () => {
             }
           }
         } catch (legacyDefaultsError) {
-          console.warn("Failed to restore legacy upload defaults", legacyDefaultsError);
+          console.warn(
+            'Failed to restore legacy upload defaults',
+            legacyDefaultsError
+          );
         }
       }
 
       if (storedAddressBookRaw) {
         try {
-          const parsedAddressBook = JSON.parse(storedAddressBookRaw) as Partial<ServiceAddressBook> | null;
-          if (parsedAddressBook && typeof parsedAddressBook === "object") {
+          const parsedAddressBook = JSON.parse(
+            storedAddressBookRaw
+          ) as Partial<ServiceAddressBook> | null;
+          if (parsedAddressBook && typeof parsedAddressBook === 'object') {
             const upload = Array.isArray(parsedAddressBook.upload)
-              ? parsedAddressBook.upload.filter((item): item is string => typeof item === "string")
+              ? parsedAddressBook.upload.filter(
+                  (item): item is string => typeof item === 'string'
+                )
               : [];
             const job = Array.isArray(parsedAddressBook.job)
-              ? parsedAddressBook.job.filter((item): item is string => typeof item === "string")
+              ? parsedAddressBook.job.filter(
+                  (item): item is string => typeof item === 'string'
+                )
               : [];
             storedAddressBook = { upload, job };
           }
         } catch (addressError) {
-          console.warn("Failed to restore service address book", addressError);
+          console.warn('Failed to restore service address book', addressError);
         }
       }
 
       if (legacyAddressBookRaw) {
         try {
-          const parsedAddressBook = JSON.parse(legacyAddressBookRaw) as Partial<ServiceAddressBook> | null;
-          if (parsedAddressBook && typeof parsedAddressBook === "object") {
+          const parsedAddressBook = JSON.parse(
+            legacyAddressBookRaw
+          ) as Partial<ServiceAddressBook> | null;
+          if (parsedAddressBook && typeof parsedAddressBook === 'object') {
             const upload = Array.isArray(parsedAddressBook.upload)
-              ? parsedAddressBook.upload.filter((item): item is string => typeof item === "string")
+              ? parsedAddressBook.upload.filter(
+                  (item): item is string => typeof item === 'string'
+                )
               : [];
             const job = Array.isArray(parsedAddressBook.job)
-              ? parsedAddressBook.job.filter((item): item is string => typeof item === "string")
+              ? parsedAddressBook.job.filter(
+                  (item): item is string => typeof item === 'string'
+                )
               : [];
             legacyAddressBook = { upload, job };
           }
         } catch (legacyAddressError) {
-          console.warn("Failed to restore legacy service address book", legacyAddressError);
+          console.warn(
+            'Failed to restore legacy service address book',
+            legacyAddressError
+          );
         }
       }
 
@@ -845,12 +959,12 @@ const MangaUpscaleAgent = () => {
         storedAddressBook?.upload ?? [],
         legacyAddressBook?.upload ?? [],
         uploadPatch?.serviceUrl,
-        defaultsServiceUrl,
+        defaultsServiceUrl
       );
       const jobCandidates = mergeServiceAddresses(
         storedAddressBook?.job ?? [],
         legacyAddressBook?.job ?? [],
-        jobPatch?.serviceUrl,
+        jobPatch?.serviceUrl
       );
 
       setUploadServiceOptions(uploadCandidates);
@@ -864,13 +978,13 @@ const MangaUpscaleAgent = () => {
       }
       setHasRestoredDefaults(true);
     } catch (storageError) {
-      console.warn("Failed to restore manga agent settings", storageError);
+      console.warn('Failed to restore manga agent settings', storageError);
       setHasRestoredDefaults(true);
     }
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || jobParamsRestored) {
+    if (typeof window === 'undefined' || jobParamsRestored) {
       return;
     }
 
@@ -888,45 +1002,54 @@ const MangaUpscaleAgent = () => {
         if (Array.isArray(favorites)) {
           setJobParamFavorites(
             favorites
-              .filter((item) => typeof item?.id === "string" && typeof item?.name === "string")
+              .filter(
+                (item) =>
+                  typeof item?.id === 'string' && typeof item?.name === 'string'
+              )
               .map((item) => ({
                 ...DEFAULT_JOB_PARAMS,
                 ...item,
                 id: item.id,
                 name: item.name,
                 createdAt: item.createdAt ?? Date.now(),
-              })),
+              }))
           );
         }
       }
     } catch (storageError) {
-      console.warn("Failed to restore manga agent job params", storageError);
+      console.warn('Failed to restore manga agent job params', storageError);
     } finally {
       setJobParamsRestored(true);
     }
   }, [jobParamsRestored]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !jobParamsRestored) {
+    if (typeof window === 'undefined' || !jobParamsRestored) {
       return;
     }
 
     try {
-      window.localStorage.setItem(PARAM_DEFAULTS_KEY, JSON.stringify(jobParams));
+      window.localStorage.setItem(
+        PARAM_DEFAULTS_KEY,
+        JSON.stringify(jobParams)
+      );
     } catch (storageError) {
-      console.warn("Failed to persist job params", storageError);
+      console.warn('Failed to persist job params', storageError);
     }
   }, [jobParams, jobParamsRestored]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !jobParamsRestored) {
+    if (typeof window === 'undefined' || !jobParamsRestored) {
       return;
     }
 
     try {
-      window.localStorage.setItem(PARAM_FAVORITES_KEY, JSON.stringify(jobParamFavorites));
+      window.localStorage.setItem(
+        PARAM_FAVORITES_KEY,
+        JSON.stringify(jobParamFavorites)
+      );
     } catch (storageError) {
-      console.warn("Failed to persist job param favorites", storageError);
+      console.warn('Failed to persist job param favorites', storageError);
     }
   }, [jobParamFavorites, jobParamsRestored]);
 
@@ -967,7 +1090,7 @@ const MangaUpscaleAgent = () => {
   ]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window === 'undefined') {
       return;
     }
 
@@ -979,14 +1102,17 @@ const MangaUpscaleAgent = () => {
       const defaults = {
         serviceUrl: uploadForm.serviceUrl,
       };
-      window.localStorage.setItem(UPLOAD_DEFAULTS_KEY, JSON.stringify(defaults));
+      window.localStorage.setItem(
+        UPLOAD_DEFAULTS_KEY,
+        JSON.stringify(defaults)
+      );
     } catch (storageError) {
-      console.warn("Failed to persist upload defaults", storageError);
+      console.warn('Failed to persist upload defaults', storageError);
     }
   }, [hasRestoredDefaults, uploadForm.serviceUrl]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window === 'undefined') {
       return;
     }
 
@@ -996,9 +1122,12 @@ const MangaUpscaleAgent = () => {
     };
 
     try {
-      window.localStorage.setItem(SERVICE_ADDRESS_BOOK_KEY, JSON.stringify(addressBook));
+      window.localStorage.setItem(
+        SERVICE_ADDRESS_BOOK_KEY,
+        JSON.stringify(addressBook)
+      );
     } catch (storageError) {
-      console.warn("Failed to persist service address book", storageError);
+      console.warn('Failed to persist service address book', storageError);
     }
   }, [jobServiceOptions, uploadServiceOptions]);
 
@@ -1038,11 +1167,11 @@ const MangaUpscaleAgent = () => {
   }, [jobForm.inputPath, lastUploadRemotePath]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window === 'undefined') {
       return;
     }
 
-  const payload = {
+    const payload = {
       uploadForm,
       jobForm,
       jobParams,
@@ -1051,7 +1180,7 @@ const MangaUpscaleAgent = () => {
     try {
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
     } catch (storageError) {
-      console.warn("Failed to persist manga agent settings", storageError);
+      console.warn('Failed to persist manga agent settings', storageError);
     }
   }, [uploadForm, jobForm, jobParams]);
 
@@ -1065,7 +1194,9 @@ const MangaUpscaleAgent = () => {
       return;
     }
 
-    const exists = volumeMappings.some((item) => item.directory === selectedVolumeKey);
+    const exists = volumeMappings.some(
+      (item) => item.directory === selectedVolumeKey
+    );
     if (!exists) {
       setSelectedVolumeKey(volumeMappings[0].directory);
     }
@@ -1087,7 +1218,7 @@ const MangaUpscaleAgent = () => {
       return;
     }
 
-    if (typeof window === "undefined") {
+    if (typeof window === 'undefined') {
       setSplitProgress(null);
       return;
     }
@@ -1109,7 +1240,7 @@ const MangaUpscaleAgent = () => {
       (renameForm.directory && renameForm.directory.length > 0
         ? renameForm.directory
         : undefined) ??
-      (renameSummary?.mode === "single" ? renameSummary.outcome.directory : "");
+      (renameSummary?.mode === 'single' ? renameSummary.outcome.directory : '');
 
     if (!directoryCandidate) {
       return;
@@ -1137,7 +1268,7 @@ const MangaUpscaleAgent = () => {
   }, [renameForm.directory, renameSummary, sourceAnalysis?.root]);
 
   const previewEntries = useMemo(() => {
-    if (!renameSummary || renameSummary.mode !== "single") {
+    if (!renameSummary || renameSummary.mode !== 'single') {
       return [] as RenameEntry[];
     }
     return renameSummary.outcome.entries.slice(0, 8);
@@ -1147,19 +1278,26 @@ const MangaUpscaleAgent = () => {
     if (!selectedVolumeKey) {
       return null;
     }
-    return volumeMappings.find((item) => item.directory === selectedVolumeKey) ?? null;
+    return (
+      volumeMappings.find((item) => item.directory === selectedVolumeKey) ??
+      null
+    );
   }, [selectedVolumeKey, volumeMappings]);
 
   const remotePathPreview = useMemo(() => {
     const resolvedTitle = uploadForm.title.trim() || jobForm.title.trim();
-    const selectedVolumeName = selectedVolume ? selectedVolume.volumeName.trim() : "";
-    const selectedVolumeFolder = selectedVolume ? selectedVolume.folderName.trim() : "";
+    const selectedVolumeName = selectedVolume
+      ? selectedVolume.volumeName.trim()
+      : '';
+    const selectedVolumeFolder = selectedVolume
+      ? selectedVolume.folderName.trim()
+      : '';
     const resolvedVolume =
       uploadForm.volume.trim() ||
       jobForm.volume.trim() ||
       selectedVolumeName ||
       selectedVolumeFolder ||
-      "";
+      '';
 
     return buildRemotePath({
       title: resolvedTitle,
@@ -1190,13 +1328,13 @@ const MangaUpscaleAgent = () => {
       const statusUpper = job.status.toUpperCase();
       const matchesStatus = (() => {
         switch (jobStatusFilter) {
-          case "active":
-            return statusUpper === "PENDING" || statusUpper === "RUNNING";
-          case "completed":
-            return statusUpper === "SUCCESS";
-          case "failed":
-            return statusUpper === "FAILED" || statusUpper === "ERROR";
-          case "all":
+          case 'active':
+            return statusUpper === 'PENDING' || statusUpper === 'RUNNING';
+          case 'completed':
+            return statusUpper === 'SUCCESS';
+          case 'failed':
+            return statusUpper === 'FAILED' || statusUpper === 'ERROR';
+          case 'all':
           default:
             return true;
         }
@@ -1212,11 +1350,11 @@ const MangaUpscaleAgent = () => {
 
       const haystack = [
         job.jobId,
-        job.message ?? "",
-        job.metadata?.title ?? "",
-        job.metadata?.volume ?? "",
+        job.message ?? '',
+        job.metadata?.title ?? '',
+        job.metadata?.volume ?? '',
       ]
-        .join(" ")
+        .join(' ')
         .toLowerCase();
 
       return haystack.includes(keyword);
@@ -1224,7 +1362,9 @@ const MangaUpscaleAgent = () => {
   }, [jobSearch, jobStatusFilter, jobs]);
 
   useEffect(() => {
-    setSelectedJobIds((prev) => prev.filter((id) => jobs.some((job) => job.jobId === id)));
+    setSelectedJobIds((prev) =>
+      prev.filter((id) => jobs.some((job) => job.jobId === id))
+    );
   }, [jobs]);
 
   const allVisibleSelected = useMemo(() => {
@@ -1257,22 +1397,25 @@ const MangaUpscaleAgent = () => {
   }, [isMultiVolumeSource, selectedVolume]);
 
   const handleSelectDirectory = useCallback(async () => {
-    const selected = await invoke<string | string[] | null>("plugin:dialog|open", {
-      options: {
-        directory: true,
-        multiple: false,
-        title: "选择漫画图片文件夹",
-      },
-    });
+    const selected = await invoke<string | string[] | null>(
+      'plugin:dialog|open',
+      {
+        options: {
+          directory: true,
+          multiple: false,
+          title: '选择漫画图片文件夹',
+        },
+      }
+    );
 
     if (!selected) {
       return;
     }
 
     const first = Array.isArray(selected) ? selected[0] : selected;
-    if (typeof first === "string" && first.length > 0) {
+    if (typeof first === 'string' && first.length > 0) {
       setRenameForm((prev) => ({ ...prev, directory: first }));
-      setCurrentStep("source");
+      setCurrentStep('source');
       analyzeDirectory(first);
     }
   }, [analyzeDirectory]);
@@ -1288,7 +1431,7 @@ const MangaUpscaleAgent = () => {
     async (overwrite = false): Promise<RenameSplitPayload | null> => {
       const root = resolveRenameRoot().trim();
       if (!root) {
-        setSplitError("请先选择有效的漫画目录。");
+        setSplitError('请先选择有效的漫画目录。');
         return null;
       }
 
@@ -1298,7 +1441,8 @@ const MangaUpscaleAgent = () => {
           workspace: splitWorkspace,
           reportPath: splitReportPath ?? undefined,
           summary: splitSummaryState ?? null,
-          warnings: splitWarningsState.length > 0 ? [...splitWarningsState] : undefined,
+          warnings:
+            splitWarningsState.length > 0 ? [...splitWarningsState] : undefined,
         };
       }
 
@@ -1306,16 +1450,32 @@ const MangaUpscaleAgent = () => {
       setSplitPreparing(true);
       setSplitError(null);
       try {
-        const outcome = await invoke<SplitCommandOutcome>("prepare_doublepage_split", {
-          options: {
-            directory: root,
-            dryRun: false,
-            overwrite,
-          },
-        });
+        const thresholds: SplitThresholdOverrides =
+          splitAlgorithm === 'edgeTexture'
+            ? {
+                mode: 'edgeTextureOnly',
+                edgeTexture: {
+                  whiteThreshold: 1.0,
+                  brightnessThresholds: [200.0, 75.0],
+                  brightnessWeight: 0.5,
+                },
+              }
+            : { mode: 'projectionOnly' };
+
+        const outcome = await invoke<SplitCommandOutcome>(
+          'prepare_doublepage_split',
+          {
+            options: {
+              directory: root,
+              dryRun: false,
+              overwrite,
+              thresholds,
+            },
+          }
+        );
 
         if (!outcome.workspaceDirectory) {
-          throw new Error("拆分命令未返回工作目录。");
+          throw new Error('拆分命令未返回工作目录。');
         }
 
         const summary: RenameSplitSummary = {
@@ -1338,7 +1498,10 @@ const MangaUpscaleAgent = () => {
           workspace: outcome.workspaceDirectory,
           reportPath: outcome.reportPath ?? null,
           summary,
-          warnings: outcome.warnings && outcome.warnings.length > 0 ? [...outcome.warnings] : undefined,
+          warnings:
+            outcome.warnings && outcome.warnings.length > 0
+              ? [...outcome.warnings]
+              : undefined,
         };
       } catch (error) {
         setSplitError(error instanceof Error ? error.message : String(error));
@@ -1354,12 +1517,13 @@ const MangaUpscaleAgent = () => {
       splitSummaryState,
       splitReportPath,
       splitWarningsState,
-    ],
+      splitAlgorithm,
+    ]
   );
 
   const handlePrepareSplit = useCallback(async () => {
     if (!contentSplitEnabled) {
-      setSplitError("请先启用内容感知拆分开关。");
+      setSplitError('请先启用内容感知拆分开关。');
       return;
     }
     await ensureSplitWorkspace(true);
@@ -1375,18 +1539,18 @@ const MangaUpscaleAgent = () => {
         setSplitError(null);
       }
     },
-    [resetSplitState],
+    [resetSplitState]
   );
 
   const runRename = useCallback(
     async (dryRun: boolean) => {
       if (!renameForm.directory) {
-        setRenameError("请先选择漫画图片所在文件夹。");
+        setRenameError('请先选择漫画图片所在文件夹。');
         return;
       }
 
       if (isMultiVolumeSource && !mappingConfirmed) {
-        setRenameError("请先在卷映射步骤完成确认。");
+        setRenameError('请先在卷映射步骤完成确认。');
         return;
       }
 
@@ -1402,30 +1566,33 @@ const MangaUpscaleAgent = () => {
           directory: resolvedRoot,
           pad: padValue,
           targetExtension:
-            renameForm.targetExtension.trim().toLowerCase() || "jpg",
+            renameForm.targetExtension.trim().toLowerCase() || 'jpg',
           dryRun,
         };
 
         if (isMultiVolumeSource) {
           if (volumeMappings.length === 0) {
-            setRenameError("未检测到任何卷。请检查目录结构。");
+            setRenameError('未检测到任何卷。请检查目录结构。');
             return;
           }
 
           const outcomes: VolumeRenameOutcome[] = [];
 
           for (const mapping of volumeMappings) {
-            const result = await invoke<RenameOutcome>("rename_manga_sequence", {
-              options: {
-                ...payload,
-                directory: mapping.directory,
-              },
-            });
+            const result = await invoke<RenameOutcome>(
+              'rename_manga_sequence',
+              {
+                options: {
+                  ...payload,
+                  directory: mapping.directory,
+                },
+              }
+            );
 
             outcomes.push({ mapping, outcome: result });
           }
 
-          setRenameSummary({ mode: "multi", volumes: outcomes, dryRun });
+          setRenameSummary({ mode: 'multi', volumes: outcomes, dryRun });
         } else {
           const targetDirectory = resolvedRoot;
           let splitPayload: RenameSplitPayload | undefined;
@@ -1438,7 +1605,7 @@ const MangaUpscaleAgent = () => {
             splitPayload = ensured;
           }
 
-          const result = await invoke<RenameOutcome>("rename_manga_sequence", {
+          const result = await invoke<RenameOutcome>('rename_manga_sequence', {
             options: {
               ...payload,
               directory: targetDirectory,
@@ -1447,13 +1614,13 @@ const MangaUpscaleAgent = () => {
           });
 
           if (result.splitApplied) {
-            if (typeof result.splitWorkspace !== "undefined") {
+            if (typeof result.splitWorkspace !== 'undefined') {
               setSplitWorkspace(result.splitWorkspace ?? null);
             }
-            if (typeof result.splitSummary !== "undefined") {
+            if (typeof result.splitSummary !== 'undefined') {
               setSplitSummaryState(result.splitSummary ?? null);
             }
-            if (typeof result.splitReportPath !== "undefined") {
+            if (typeof result.splitReportPath !== 'undefined') {
               setSplitReportPath(result.splitReportPath ?? null);
             }
             setSplitSourceRoot(result.sourceDirectory ?? targetDirectory);
@@ -1468,7 +1635,7 @@ const MangaUpscaleAgent = () => {
             setSplitWarningsState(splitPayload.warnings);
           }
 
-          setRenameSummary({ mode: "single", outcome: result });
+          setRenameSummary({ mode: 'single', outcome: result });
           setSplitError(null);
         }
 
@@ -1489,7 +1656,7 @@ const MangaUpscaleAgent = () => {
       renameForm,
       resolveRenameRoot,
       volumeMappings,
-    ],
+    ]
   );
 
   const handleRenameInput = useCallback(
@@ -1497,7 +1664,7 @@ const MangaUpscaleAgent = () => {
       (event: ChangeEvent<HTMLInputElement>) => {
         const value = event.currentTarget.value;
 
-        if (field === "directory") {
+        if (field === 'directory') {
           resetSplitState();
           setContentSplitEnabled(false);
           setSplitEstimate(null);
@@ -1512,16 +1679,16 @@ const MangaUpscaleAgent = () => {
         }
 
         setRenameForm((prev) => {
-          if (field === "pad") {
+          if (field === 'pad') {
             return { ...prev, pad: Number(value) };
           }
-          if (field === "targetExtension") {
+          if (field === 'targetExtension') {
             return { ...prev, targetExtension: value.toLowerCase() };
           }
           return { ...prev, [field]: value } as RenameFormState;
         });
       },
-    [resetSplitState],
+    [resetSplitState]
   );
 
   const handleUploadInput = useCallback(
@@ -1529,35 +1696,35 @@ const MangaUpscaleAgent = () => {
       (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
         const value = event.currentTarget.value;
         setUploadForm((prev) => {
-          if (field === "mode") {
-            if (value === "folder") {
-              setUploadError("Folder 模式仍在规划中，当前仅支持 Zip 上传。");
-              return { ...prev, mode: "zip" };
+          if (field === 'mode') {
+            if (value === 'folder') {
+              setUploadError('Folder 模式仍在规划中，当前仅支持 Zip 上传。');
+              return { ...prev, mode: 'zip' };
             }
             return { ...prev, mode: value as UploadMode };
           }
           return { ...prev, [field]: value } as UploadFormState;
         });
       },
-    [],
+    []
   );
 
   const beginAddUploadService = useCallback(() => {
     setUploadAddressError(null);
-    setUploadAddressDraft(uploadForm.serviceUrl.trim() || "");
+    setUploadAddressDraft(uploadForm.serviceUrl.trim() || '');
     setIsAddingUploadService(true);
   }, [uploadForm.serviceUrl]);
 
   const cancelAddUploadService = useCallback(() => {
     setIsAddingUploadService(false);
-    setUploadAddressDraft("");
+    setUploadAddressDraft('');
     setUploadAddressError(null);
   }, []);
 
   const confirmAddUploadService = useCallback(() => {
     const trimmed = uploadAddressDraft.trim();
     if (!trimmed) {
-      setUploadAddressError("请输入有效的上传服务器地址。");
+      setUploadAddressError('请输入有效的上传服务器地址。');
       return;
     }
 
@@ -1569,7 +1736,7 @@ const MangaUpscaleAgent = () => {
       return [...prev, trimmed];
     });
     setUploadForm((prev) => ({ ...prev, serviceUrl: trimmed }));
-    setUploadAddressDraft("");
+    setUploadAddressDraft('');
     setIsAddingUploadService(false);
   }, [uploadAddressDraft]);
 
@@ -1580,62 +1747,79 @@ const MangaUpscaleAgent = () => {
 
         setJobParams((prev) => {
           switch (field) {
-            case "scale": {
+            case 'scale': {
               const numeric = Number(rawValue);
-              const normalized = Number.isFinite(numeric) ? Math.min(4, Math.max(1, Math.floor(numeric))) : prev.scale;
+              const normalized = Number.isFinite(numeric)
+                ? Math.min(4, Math.max(1, Math.floor(numeric)))
+                : prev.scale;
               return { ...prev, scale: normalized };
             }
-            case "denoise":
-              return { ...prev, denoise: rawValue as JobParamsConfig["denoise"] };
-            case "model":
+            case 'denoise':
+              return {
+                ...prev,
+                denoise: rawValue as JobParamsConfig['denoise'],
+              };
+            case 'model':
               return { ...prev, model: rawValue };
-            case "outputFormat":
-              return { ...prev, outputFormat: rawValue as JobParamsConfig["outputFormat"] };
-            case "jpegQuality": {
+            case 'outputFormat':
+              return {
+                ...prev,
+                outputFormat: rawValue as JobParamsConfig['outputFormat'],
+              };
+            case 'jpegQuality': {
               const numeric = Number(rawValue);
               const normalized = Number.isFinite(numeric)
                 ? Math.min(100, Math.max(1, Math.round(numeric)))
                 : prev.jpegQuality;
               return { ...prev, jpegQuality: normalized };
             }
-            case "tileSize": {
-              if (rawValue.trim() === "") {
+            case 'tileSize': {
+              if (rawValue.trim() === '') {
                 return { ...prev, tileSize: null };
               }
               const numeric = Number(rawValue);
               if (!Number.isFinite(numeric)) {
                 return prev;
               }
-              return { ...prev, tileSize: Math.min(1024, Math.max(32, Math.round(numeric))) };
+              return {
+                ...prev,
+                tileSize: Math.min(1024, Math.max(32, Math.round(numeric))),
+              };
             }
-            case "tilePad": {
-              if (rawValue.trim() === "") {
+            case 'tilePad': {
+              if (rawValue.trim() === '') {
                 return { ...prev, tilePad: null };
               }
               const numeric = Number(rawValue);
               if (!Number.isFinite(numeric)) {
                 return prev;
               }
-              return { ...prev, tilePad: Math.min(128, Math.max(0, Math.round(numeric))) };
+              return {
+                ...prev,
+                tilePad: Math.min(128, Math.max(0, Math.round(numeric))),
+              };
             }
-            case "batchSize": {
-              if (rawValue.trim() === "") {
+            case 'batchSize': {
+              if (rawValue.trim() === '') {
                 return { ...prev, batchSize: null };
               }
               const numeric = Number(rawValue);
               if (!Number.isFinite(numeric)) {
                 return prev;
               }
-              return { ...prev, batchSize: Math.min(16, Math.max(1, Math.round(numeric))) };
+              return {
+                ...prev,
+                batchSize: Math.min(16, Math.max(1, Math.round(numeric))),
+              };
             }
-            case "device":
-              return { ...prev, device: rawValue as JobParamsConfig["device"] };
+            case 'device':
+              return { ...prev, device: rawValue as JobParamsConfig['device'] };
             default:
               return prev;
           }
         });
       },
-    [],
+    []
   );
 
   const handleResetParams = useCallback(() => {
@@ -1646,16 +1830,19 @@ const MangaUpscaleAgent = () => {
     const pieces = [`${params.model}`];
     pieces.push(`×${params.scale}`);
     pieces.push(`denoise:${params.denoise}`);
-    if (params.outputFormat === "jpg") {
+    if (params.outputFormat === 'jpg') {
       pieces.push(`jpg@${params.jpegQuality}`);
     } else {
       pieces.push(params.outputFormat);
     }
-    return pieces.join(" · ");
+    return pieces.join(' · ');
   }, []);
 
   const handleSaveFavorite = useCallback(() => {
-    const id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `fav-${Date.now()}`;
+    const id =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `fav-${Date.now()}`;
     const name = computeFavoriteName(jobParams);
 
     setJobParamFavorites((prev) => {
@@ -1669,7 +1856,7 @@ const MangaUpscaleAgent = () => {
           item.tileSize === jobParams.tileSize &&
           item.tilePad === jobParams.tilePad &&
           item.batchSize === jobParams.batchSize &&
-          item.device === jobParams.device,
+          item.device === jobParams.device
       );
 
       if (exists) {
@@ -1706,15 +1893,14 @@ const MangaUpscaleAgent = () => {
         device: favorite.device,
       });
     },
-    [jobParamFavorites],
+    [jobParamFavorites]
   );
 
-  const handleRemoveFavorite = useCallback(
-    (favoriteId: string) => {
-      setJobParamFavorites((prev) => prev.filter((item) => item.id !== favoriteId));
-    },
-    [],
-  );
+  const handleRemoveFavorite = useCallback((favoriteId: string) => {
+    setJobParamFavorites((prev) =>
+      prev.filter((item) => item.id !== favoriteId)
+    );
+  }, []);
 
   const inferManifestForVolume = useCallback(
     (volumeName: string | null | undefined): string | null => {
@@ -1722,11 +1908,11 @@ const MangaUpscaleAgent = () => {
         return null;
       }
 
-      if (renameSummary.mode === "single") {
+      if (renameSummary.mode === 'single') {
         return renameSummary.outcome.manifestPath ?? null;
       }
 
-      if (renameSummary.mode === "multi") {
+      if (renameSummary.mode === 'multi') {
         const normalized = volumeName?.trim().toLowerCase();
         const match = renameSummary.volumes.find((entry) => {
           if (!entry.outcome.manifestPath) {
@@ -1739,7 +1925,10 @@ const MangaUpscaleAgent = () => {
           if (candidate === normalized) {
             return true;
           }
-          if (normalized.includes(String(entry.mapping.volumeNumber ?? "")) && normalized.includes(candidate)) {
+          if (
+            normalized.includes(String(entry.mapping.volumeNumber ?? '')) &&
+            normalized.includes(candidate)
+          ) {
             return true;
           }
           return false;
@@ -1750,13 +1939,18 @@ const MangaUpscaleAgent = () => {
 
       return null;
     },
-    [renameSummary],
+    [renameSummary]
   );
 
   const mapPayloadToRecord = useCallback(
-    (payload: JobEventPayload, overrideMessage?: string | null, existing?: JobRecord): JobRecord => {
-      const displayMessage = overrideMessage ?? payload.error ?? payload.message ?? null;
-      const transport = payload.transport ?? "system";
+    (
+      payload: JobEventPayload,
+      overrideMessage?: string | null,
+      existing?: JobRecord
+    ): JobRecord => {
+      const displayMessage =
+        overrideMessage ?? payload.error ?? payload.message ?? null;
+      const transport = payload.transport ?? 'system';
       return {
         jobId: payload.jobId,
         status: payload.status,
@@ -1777,10 +1971,17 @@ const MangaUpscaleAgent = () => {
         inputPath: existing?.inputPath ?? jobForm.inputPath,
         inputType: existing?.inputType ?? jobForm.inputType,
         manifestPath:
-          existing?.manifestPath ?? inferManifestForVolume(payload.metadata?.volume ?? null),
+          existing?.manifestPath ??
+          inferManifestForVolume(payload.metadata?.volume ?? null),
       };
     },
-    [inferManifestForVolume, jobForm.bearerToken, jobForm.inputPath, jobForm.inputType, jobForm.serviceUrl],
+    [
+      inferManifestForVolume,
+      jobForm.bearerToken,
+      jobForm.inputPath,
+      jobForm.inputType,
+      jobForm.serviceUrl,
+    ]
   );
 
   useEffect(() => {
@@ -1790,7 +1991,7 @@ const MangaUpscaleAgent = () => {
     const bind = async () => {
       try {
         const uploadUnlisten = await listen<UploadProgressPayload>(
-          "manga-upload-progress",
+          'manga-upload-progress',
           (event) => {
             const payload = event.payload;
             if (!payload) {
@@ -1800,22 +2001,24 @@ const MangaUpscaleAgent = () => {
             setUploadProgress(payload);
 
             switch (payload.stage) {
-              case "preparing":
+              case 'preparing':
                 setUploadError(null);
                 setUploadStatus(null);
                 break;
-              case "failed":
-                setUploadError(payload.message ?? "上传失败");
+              case 'failed':
+                setUploadError(payload.message ?? '上传失败');
                 setUploadStatus(null);
                 break;
-              case "completed":
+              case 'completed':
                 setUploadError(null);
-                setUploadStatus((prev) => payload.message ?? prev ?? "上传完成");
+                setUploadStatus(
+                  (prev) => payload.message ?? prev ?? '上传完成'
+                );
                 break;
               default:
                 break;
             }
-          },
+          }
         );
 
         if (disposed) {
@@ -1824,23 +2027,32 @@ const MangaUpscaleAgent = () => {
         }
         disposers.push(uploadUnlisten);
 
-        const jobUnlisten = await listen<JobEventPayload>("manga-job-event", (event) => {
-          const payload = event.payload;
-          if (!payload) {
-            return;
+        const jobUnlisten = await listen<JobEventPayload>(
+          'manga-job-event',
+          (event) => {
+            const payload = event.payload;
+            if (!payload) {
+              return;
+            }
+
+            staleJobsRef.current.delete(payload.jobId);
+
+            setJobs((prev) => {
+              const existing = prev.find(
+                (item) => item.jobId === payload.jobId
+              );
+              const record = mapPayloadToRecord(
+                payload,
+                undefined,
+                existing ?? undefined
+              );
+              const next = prev.filter((item) => item.jobId !== record.jobId);
+              next.push(record);
+              next.sort((a, b) => b.lastUpdated - a.lastUpdated);
+              return next;
+            });
           }
-
-          staleJobsRef.current.delete(payload.jobId);
-
-          setJobs((prev) => {
-            const existing = prev.find((item) => item.jobId === payload.jobId);
-            const record = mapPayloadToRecord(payload, undefined, existing ?? undefined);
-            const next = prev.filter((item) => item.jobId !== record.jobId);
-            next.push(record);
-            next.sort((a, b) => b.lastUpdated - a.lastUpdated);
-            return next;
-          });
-        });
+        );
 
         if (disposed) {
           jobUnlisten();
@@ -1849,13 +2061,13 @@ const MangaUpscaleAgent = () => {
         disposers.push(jobUnlisten);
 
         const splitUnlisten = await listen<SplitProgressPayload>(
-          "doublepage-split-progress",
+          'doublepage-split-progress',
           (event) => {
             if (!event.payload) {
               return;
             }
             setSplitProgress(event.payload);
-          },
+          }
         );
 
         if (disposed) {
@@ -1864,7 +2076,7 @@ const MangaUpscaleAgent = () => {
         }
         disposers.push(splitUnlisten);
       } catch (bindingError) {
-        console.warn("Failed to bind manga upscale events", bindingError);
+        console.warn('Failed to bind manga upscale events', bindingError);
       }
     };
 
@@ -1882,14 +2094,13 @@ const MangaUpscaleAgent = () => {
     };
   }, [mapPayloadToRecord]);
 
-  const handleToggleJobSelection = useCallback(
-    (jobId: string) => {
-      setSelectedJobIds((prev) =>
-        prev.includes(jobId) ? prev.filter((id) => id !== jobId) : [...prev, jobId],
-      );
-    },
-    [],
-  );
+  const handleToggleJobSelection = useCallback((jobId: string) => {
+    setSelectedJobIds((prev) =>
+      prev.includes(jobId)
+        ? prev.filter((id) => id !== jobId)
+        : [...prev, jobId]
+    );
+  }, []);
 
   const handleSelectAllVisible = useCallback(() => {
     setSelectedJobIds(filteredJobs.map((job) => job.jobId));
@@ -1899,16 +2110,23 @@ const MangaUpscaleAgent = () => {
     setSelectedJobIds([]);
   }, []);
 
-  const handleJobSearchChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
-    setJobSearch(event.currentTarget.value);
-  }, []);
+  const handleJobSearchChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      setJobSearch(event.currentTarget.value);
+    },
+    []
+  );
 
   const handleJobStatusFilterChange = useCallback(
     (event: ChangeEvent<HTMLSelectElement>) => {
-      const value = event.currentTarget.value as "all" | "active" | "completed" | "failed";
+      const value = event.currentTarget.value as
+        | 'all'
+        | 'active'
+        | 'completed'
+        | 'failed';
       setJobStatusFilter(value);
     },
-    [],
+    []
   );
 
   const buildJobRequest = useCallback((job: JobRecord) => {
@@ -1936,7 +2154,9 @@ const MangaUpscaleAgent = () => {
 
   const startJobWatcher = useCallback(
     async (job: JobRecord, options?: { silent?: boolean }) => {
-      const terminal = job.status.toUpperCase() === "SUCCESS" || job.status.toUpperCase() === "FAILED";
+      const terminal =
+        job.status.toUpperCase() === 'SUCCESS' ||
+        job.status.toUpperCase() === 'FAILED';
       if (!job.serviceUrl || terminal) {
         staleJobsRef.current.delete(job.jobId);
         return;
@@ -1951,34 +2171,38 @@ const MangaUpscaleAgent = () => {
         request.bearerToken = job.bearerToken.trim();
       }
 
-      if (Number.isFinite(jobForm.pollIntervalMs) && jobForm.pollIntervalMs >= 250) {
+      if (
+        Number.isFinite(jobForm.pollIntervalMs) &&
+        jobForm.pollIntervalMs >= 250
+      ) {
         request.pollIntervalMs = Math.floor(jobForm.pollIntervalMs);
       }
 
       try {
-        await invoke("watch_manga_job", { request });
+        await invoke('watch_manga_job', { request });
         staleJobsRef.current.delete(job.jobId);
       } catch (watchError) {
         if (options?.silent) {
           return;
         }
-        const message = watchError instanceof Error ? watchError.message : String(watchError);
+        const message =
+          watchError instanceof Error ? watchError.message : String(watchError);
         setJobs((prev) =>
           prev.map((item) =>
             item.jobId === job.jobId
               ? {
                   ...item,
                   message: `订阅进度失败：${message}`,
-                  transport: "system",
+                  transport: 'system',
                   error: message,
                   lastUpdated: Date.now(),
                 }
-              : item,
-          ),
+              : item
+          )
         );
       }
     },
-    [jobForm.pollIntervalMs],
+    [jobForm.pollIntervalMs]
   );
 
   const refreshJobStatus = useCallback(
@@ -1989,13 +2213,16 @@ const MangaUpscaleAgent = () => {
       }
 
       try {
-        const snapshot = await invoke<JobStatusSnapshotPayload>("fetch_manga_job_status", {
-          request: {
-            serviceUrl: job.serviceUrl,
-            jobId: job.jobId,
-            bearerToken: job.bearerToken?.trim() || undefined,
-          },
-        });
+        const snapshot = await invoke<JobStatusSnapshotPayload>(
+          'fetch_manga_job_status',
+          {
+            request: {
+              serviceUrl: job.serviceUrl,
+              jobId: job.jobId,
+              bearerToken: job.bearerToken?.trim() || undefined,
+            },
+          }
+        );
 
         const payload: JobEventPayload = {
           jobId: snapshot.jobId,
@@ -2004,7 +2231,7 @@ const MangaUpscaleAgent = () => {
           total: snapshot.total,
           artifactPath: snapshot.artifactPath ?? null,
           message: snapshot.message ?? null,
-          transport: "polling",
+          transport: 'polling',
           error: null,
           retries: snapshot.retries ?? 0,
           lastError: snapshot.lastError ?? null,
@@ -2029,18 +2256,18 @@ const MangaUpscaleAgent = () => {
               ? {
                   ...item,
                   message: `刷新状态失败：${message}`,
-                  transport: "system",
+                  transport: 'system',
                   error: message,
                   lastUpdated: Date.now(),
                 }
-              : item,
-          ),
+              : item
+          )
         );
       } finally {
         staleJobsRef.current.delete(job.jobId);
       }
     },
-    [mapPayloadToRecord],
+    [mapPayloadToRecord]
   );
 
   useEffect(() => {
@@ -2054,7 +2281,9 @@ const MangaUpscaleAgent = () => {
     const timer = window.setInterval(() => {
       const now = Date.now();
       for (const job of jobs) {
-        const terminal = job.status.toUpperCase() === "SUCCESS" || job.status.toUpperCase() === "FAILED";
+        const terminal =
+          job.status.toUpperCase() === 'SUCCESS' ||
+          job.status.toUpperCase() === 'FAILED';
         if (terminal) {
           staleJobsRef.current.delete(job.jobId);
           continue;
@@ -2078,11 +2307,11 @@ const MangaUpscaleAgent = () => {
             item.jobId === job.jobId
               ? {
                   ...item,
-                  message: item.message ?? "进度久未更新，正在轮询刷新…",
-                  transport: "system",
+                  message: item.message ?? '进度久未更新，正在轮询刷新…',
+                  transport: 'system',
                 }
-              : item,
-          ),
+              : item
+          )
         );
         void refreshJobStatus(job);
       }
@@ -2095,7 +2324,7 @@ const MangaUpscaleAgent = () => {
     async (job: JobRecord, options?: { silent?: boolean }) => {
       if (!job.serviceUrl) {
         if (!options?.silent) {
-          setJobError("缺少服务地址，无法恢复作业。");
+          setJobError('缺少服务地址，无法恢复作业。');
         }
         return;
       }
@@ -2106,13 +2335,14 @@ const MangaUpscaleAgent = () => {
       }
 
       try {
-        const payload = await invoke<JobEventPayload>("resume_manga_job", {
+        const payload = await invoke<JobEventPayload>('resume_manga_job', {
           request: buildJobRequest(job),
         });
 
         let updatedRecord: JobRecord | null = null;
         setJobs((prev) => {
-          const existing = prev.find((item) => item.jobId === payload.jobId) ?? job;
+          const existing =
+            prev.find((item) => item.jobId === payload.jobId) ?? job;
           const mapped = mapPayloadToRecord(payload, undefined, existing);
           updatedRecord = mapped;
           const next = prev.filter((item) => item.jobId !== mapped.jobId);
@@ -2122,7 +2352,9 @@ const MangaUpscaleAgent = () => {
         });
 
         if (updatedRecord) {
-          void startJobWatcher(updatedRecord, { silent: options?.silent ?? false });
+          void startJobWatcher(updatedRecord, {
+            silent: options?.silent ?? false,
+          });
         }
 
         if (!options?.silent) {
@@ -2135,14 +2367,14 @@ const MangaUpscaleAgent = () => {
         }
       }
     },
-    [buildJobRequest, mapPayloadToRecord, startJobWatcher],
+    [buildJobRequest, mapPayloadToRecord, startJobWatcher]
   );
 
   const cancelJob = useCallback(
     async (job: JobRecord, options?: { silent?: boolean }) => {
       if (!job.serviceUrl) {
         if (!options?.silent) {
-          setJobError("缺少服务地址，无法终止作业。");
+          setJobError('缺少服务地址，无法终止作业。');
         }
         return;
       }
@@ -2153,12 +2385,13 @@ const MangaUpscaleAgent = () => {
       }
 
       try {
-        const payload = await invoke<JobEventPayload>("cancel_manga_job", {
+        const payload = await invoke<JobEventPayload>('cancel_manga_job', {
           request: buildJobRequest(job),
         });
 
         setJobs((prev) => {
-          const existing = prev.find((item) => item.jobId === payload.jobId) ?? job;
+          const existing =
+            prev.find((item) => item.jobId === payload.jobId) ?? job;
           const record = mapPayloadToRecord(payload, undefined, existing);
           const next = prev.filter((item) => item.jobId !== record.jobId);
           next.push(record);
@@ -2176,83 +2409,95 @@ const MangaUpscaleAgent = () => {
         }
       }
     },
-    [buildJobRequest, mapPayloadToRecord],
+    [buildJobRequest, mapPayloadToRecord]
   );
 
   const handleResumeJob = useCallback(
     (job: JobRecord) => {
       void resumeJob(job);
     },
-    [resumeJob],
+    [resumeJob]
   );
 
   const handleCancelJob = useCallback(
     (job: JobRecord) => {
       void cancelJob(job);
     },
-    [cancelJob],
+    [cancelJob]
   );
 
   const promptForDirectory = useCallback(
     async (title: string, defaultPath?: string | null) => {
-      const selection = await invoke<string | string[] | null>("plugin:dialog|open", {
-        options: {
-          directory: true,
-          multiple: false,
-          defaultPath: defaultPath ?? undefined,
-          title,
-        },
-      });
+      const selection = await invoke<string | string[] | null>(
+        'plugin:dialog|open',
+        {
+          options: {
+            directory: true,
+            multiple: false,
+            defaultPath: defaultPath ?? undefined,
+            title,
+          },
+        }
+      );
 
       if (!selection) {
         return null;
       }
       const first = Array.isArray(selection) ? selection[0] : selection;
-      return typeof first === "string" && first.length > 0 ? first : null;
+      return typeof first === 'string' && first.length > 0 ? first : null;
     },
-    [],
+    []
   );
 
   const promptForManifest = useCallback(async () => {
-    const selection = await invoke<string | string[] | null>("plugin:dialog|open", {
-      options: {
-        filters: [{ name: "Manifest", extensions: ["json"] }],
-        title: "选择 manifest.json",
-        multiple: false,
-      },
-    });
+    const selection = await invoke<string | string[] | null>(
+      'plugin:dialog|open',
+      {
+        options: {
+          filters: [{ name: 'Manifest', extensions: ['json'] }],
+          title: '选择 manifest.json',
+          multiple: false,
+        },
+      }
+    );
 
     if (!selection) {
       return null;
     }
     const first = Array.isArray(selection) ? selection[0] : selection;
-    return typeof first === "string" && first.length > 0 ? first : null;
+    return typeof first === 'string' && first.length > 0 ? first : null;
   }, []);
 
   const downloadArtifactZip = useCallback(
-    async (job: JobRecord, options?: { silent?: boolean; targetDir?: string | null }) => {
+    async (
+      job: JobRecord,
+      options?: { silent?: boolean; targetDir?: string | null }
+    ) => {
       const silent = options?.silent ?? false;
 
       if (!job.serviceUrl || !job.jobId) {
         if (!silent) {
-          setArtifactError("缺少必要信息，无法下载产物。");
+          setArtifactError('缺少必要信息，无法下载产物。');
         }
         return false;
       }
 
       if (!job.artifactPath) {
         if (!silent) {
-          setArtifactError("远端尚未提供产物路径。");
+          setArtifactError('远端尚未提供产物路径。');
         }
         return false;
       }
 
       let targetDir = options?.targetDir ?? null;
       if (!targetDir) {
-        const picked = await promptForDirectory("选择产物输出目录", artifactTargetRoot);
+        const picked = await promptForDirectory(
+          '选择产物输出目录',
+          artifactTargetRoot
+        );
         if (!picked) {
           if (!silent) {
-            setArtifactError("已取消选择输出目录。");
+            setArtifactError('已取消选择输出目录。');
           }
           return false;
         }
@@ -2270,28 +2515,36 @@ const MangaUpscaleAgent = () => {
           targetDir,
         };
 
-        const summary = await invoke<ArtifactDownloadSummary>("download_manga_artifact", {
-          request,
-        });
+        const summary = await invoke<ArtifactDownloadSummary>(
+          'download_manga_artifact',
+          {
+            request,
+          }
+        );
 
         setArtifactTargetRoot(targetDir);
 
         setArtifactDownloads((prev) => {
-          const next = [summary, ...prev.filter((item) => item.jobId !== summary.jobId)];
+          const next = [
+            summary,
+            ...prev.filter((item) => item.jobId !== summary.jobId),
+          ];
           return next.slice(0, 10);
         });
 
         setJobs((prev) =>
           prev.map((item) =>
-            item.jobId === job.jobId ? { ...item, artifactHash: summary.hash } : item,
-          ),
+            item.jobId === job.jobId
+              ? { ...item, artifactHash: summary.hash }
+              : item
+          )
         );
 
         if (!silent) {
           const warningNote =
-            summary.warnings.length > 0 ? `；注意：${summary.warnings[0]}` : "";
+            summary.warnings.length > 0 ? `；注意：${summary.warnings[0]}` : '';
           setJobStatus(
-            `ZIP 下载完成（${summary.jobId}），共 ${summary.fileCount} 张，输出：${summary.archivePath}${warningNote}`,
+            `ZIP 下载完成（${summary.jobId}），共 ${summary.fileCount} 张，输出：${summary.archivePath}${warningNote}`
           );
           if (summary.warnings.length > 0) {
             setArtifactError(summary.warnings[0]);
@@ -2309,36 +2562,43 @@ const MangaUpscaleAgent = () => {
         setArtifactDownloadBusyJob(null);
       }
     },
-    [artifactTargetRoot, buildJobRequest, promptForDirectory],
+    [artifactTargetRoot, buildJobRequest, promptForDirectory]
   );
 
   const validateArtifact = useCallback(
     async (
       job: JobRecord,
-      options?: { silent?: boolean; targetDir?: string | null; manifestPathOverride?: string | null },
+      options?: {
+        silent?: boolean;
+        targetDir?: string | null;
+        manifestPathOverride?: string | null;
+      }
     ) => {
       const silent = options?.silent ?? false;
 
       if (!job.serviceUrl || !job.jobId) {
         if (!silent) {
-          setArtifactError("缺少必要信息，无法校验产物。");
+          setArtifactError('缺少必要信息，无法校验产物。');
         }
         return false;
       }
 
       if (!job.artifactPath) {
         if (!silent) {
-          setArtifactError("远端尚未提供产物路径。");
+          setArtifactError('远端尚未提供产物路径。');
         }
         return false;
       }
 
       let targetDir = options?.targetDir ?? null;
       if (!targetDir) {
-        const picked = await promptForDirectory("选择校验输出目录", artifactTargetRoot);
+        const picked = await promptForDirectory(
+          '选择校验输出目录',
+          artifactTargetRoot
+        );
         if (!picked) {
           if (!silent) {
-            setArtifactError("已取消选择输出目录。");
+            setArtifactError('已取消选择输出目录。');
           }
           return false;
         }
@@ -2372,10 +2632,15 @@ const MangaUpscaleAgent = () => {
           request.expectedHash = job.artifactHash;
         }
 
-        const report = await invoke<ArtifactReport>("validate_manga_artifact", { request });
+        const report = await invoke<ArtifactReport>('validate_manga_artifact', {
+          request,
+        });
 
         setArtifactReports((prev) => {
-          const next = [report, ...prev.filter((item) => item.jobId !== report.jobId)];
+          const next = [
+            report,
+            ...prev.filter((item) => item.jobId !== report.jobId),
+          ];
           return next.slice(0, 10);
         });
 
@@ -2391,14 +2656,14 @@ const MangaUpscaleAgent = () => {
               manifestPath: manifestPath ?? item.manifestPath,
               artifactHash: report.hash,
             };
-          }),
+          })
         );
 
         if (!silent) {
           const warningNote =
-            report.warnings.length > 0 ? `；注意：${report.warnings[0]}` : "";
+            report.warnings.length > 0 ? `；注意：${report.warnings[0]}` : '';
           setJobStatus(
-            `校验完成（${report.jobId}）：匹配 ${report.summary.matched} / ${report.summary.totalManifest}${warningNote}`,
+            `校验完成（${report.jobId}）：匹配 ${report.summary.matched} / ${report.summary.totalManifest}${warningNote}`
           );
           if (report.warnings.length > 0) {
             setArtifactError(report.warnings[0]);
@@ -2422,21 +2687,21 @@ const MangaUpscaleAgent = () => {
       inferManifestForVolume,
       promptForDirectory,
       promptForManifest,
-    ],
+    ]
   );
 
   const handleDownloadArtifact = useCallback(
     (job: JobRecord) => {
       void downloadArtifactZip(job);
     },
-    [downloadArtifactZip],
+    [downloadArtifactZip]
   );
 
   const handleValidateArtifact = useCallback(
     (job: JobRecord) => {
       void validateArtifact(job);
     },
-    [validateArtifact],
+    [validateArtifact]
   );
 
   const handleBatchResume = useCallback(async () => {
@@ -2460,13 +2725,16 @@ const MangaUpscaleAgent = () => {
     const ready = selected.filter((job) => !!job.artifactPath);
 
     if (ready.length === 0) {
-      setJobStatus("选中的作业暂无可下载的产物。");
+      setJobStatus('选中的作业暂无可下载的产物。');
       return;
     }
 
     let targetDir = artifactTargetRoot ?? null;
     if (!targetDir) {
-      const picked = await promptForDirectory("选择批量下载目录", artifactTargetRoot);
+      const picked = await promptForDirectory(
+        '选择批量下载目录',
+        artifactTargetRoot
+      );
       if (!picked) {
         return;
       }
@@ -2482,7 +2750,7 @@ const MangaUpscaleAgent = () => {
     }
 
     if (success === 0) {
-      setJobStatus("批量下载未成功，请检查作业状态。");
+      setJobStatus('批量下载未成功，请检查作业状态。');
       return;
     }
 
@@ -2492,20 +2760,29 @@ const MangaUpscaleAgent = () => {
       summaryParts.push(`跳过 ${skipped} 项尚未生成产物的作业。`);
     }
     setJobStatus(summaryParts.join(' '));
-  }, [artifactTargetRoot, downloadArtifactZip, jobs, promptForDirectory, selectedJobIds]);
+  }, [
+    artifactTargetRoot,
+    downloadArtifactZip,
+    jobs,
+    promptForDirectory,
+    selectedJobIds,
+  ]);
 
   const handleBatchValidate = useCallback(async () => {
     const selected = jobs.filter((job) => selectedJobIds.includes(job.jobId));
     const ready = selected.filter((job) => !!job.artifactPath);
 
     if (ready.length === 0) {
-      setJobStatus("选中的作业暂无可校验的产物。");
+      setJobStatus('选中的作业暂无可校验的产物。');
       return;
     }
 
     let targetDir = artifactTargetRoot ?? null;
     if (!targetDir) {
-      const picked = await promptForDirectory("选择批量校验目录", artifactTargetRoot);
+      const picked = await promptForDirectory(
+        '选择批量校验目录',
+        artifactTargetRoot
+      );
       if (!picked) {
         return;
       }
@@ -2521,7 +2798,7 @@ const MangaUpscaleAgent = () => {
     }
 
     if (success === 0) {
-      setJobStatus("批量校验未成功，请检查作业状态。");
+      setJobStatus('批量校验未成功，请检查作业状态。');
       return;
     }
 
@@ -2531,16 +2808,22 @@ const MangaUpscaleAgent = () => {
       summaryParts.push(`跳过 ${skipped} 项尚未生成产物的作业。`);
     }
     setJobStatus(summaryParts.join(' '));
-  }, [artifactTargetRoot, jobs, promptForDirectory, selectedJobIds, validateArtifact]);
+  }, [
+    artifactTargetRoot,
+    jobs,
+    promptForDirectory,
+    selectedJobIds,
+    validateArtifact,
+  ]);
 
   const handleUpload = useCallback(async () => {
     if (!renameForm.directory) {
-      setUploadError("请先完成重命名预览或执行，确保本地目录已确认。");
+      setUploadError('请先完成重命名预览或执行，确保本地目录已确认。');
       return;
     }
     const serviceUrl = uploadForm.serviceUrl.trim();
     if (!serviceUrl) {
-      setUploadError("请填写 Copyparty 服务地址。");
+      setUploadError('请填写 Copyparty 服务地址。');
       return;
     }
 
@@ -2567,22 +2850,24 @@ const MangaUpscaleAgent = () => {
 
       if (isMultiVolumeSource) {
         if (!selectedVolume) {
-          setUploadError("请选择要上传的卷，并在卷映射步骤中确认。");
+          setUploadError('请选择要上传的卷，并在卷映射步骤中确认。');
           return;
         }
 
         if (
           !renameSummary ||
-          renameSummary.mode !== "multi" ||
-          !renameSummary.volumes.some((item) => item.mapping.directory === selectedVolume.directory)
+          renameSummary.mode !== 'multi' ||
+          !renameSummary.volumes.some(
+            (item) => item.mapping.directory === selectedVolume.directory
+          )
         ) {
-          setUploadError("请先对所选卷执行重命名预览或执行，生成 manifest。");
+          setUploadError('请先对所选卷执行重命名预览或执行，生成 manifest。');
           return;
         }
 
         localPath = selectedVolume.directory;
         splitSourceAnchor = selectedVolume.directory;
-      } else if (renameSummary?.mode === "single") {
+      } else if (renameSummary?.mode === 'single') {
         const outcome = renameSummary.outcome;
         splitSourceAnchor = outcome.sourceDirectory ?? renameForm.directory;
 
@@ -2626,7 +2911,7 @@ const MangaUpscaleAgent = () => {
         request.metadata = metadataEntries;
       }
 
-      const result = await invoke<UploadOutcome>("upload_copyparty", {
+      const result = await invoke<UploadOutcome>('upload_copyparty', {
         request,
       });
 
@@ -2641,7 +2926,7 @@ const MangaUpscaleAgent = () => {
         inputPath: remotePath,
       }));
       setUploadStatus(
-        `上传完成：${result.fileCount} 个文件，约 ${sizeInMb} MB，remote = ${result.remoteUrl}`,
+        `上传完成：${result.fileCount} 个文件，约 ${sizeInMb} MB，remote = ${result.remoteUrl}`
       );
       setRemotePathSeed(Date.now());
     } catch (error) {
@@ -2662,20 +2947,20 @@ const MangaUpscaleAgent = () => {
 
   const beginAddJobService = useCallback(() => {
     setJobAddressError(null);
-    setJobAddressDraft(jobForm.serviceUrl.trim() || "");
+    setJobAddressDraft(jobForm.serviceUrl.trim() || '');
     setIsAddingJobService(true);
   }, [jobForm.serviceUrl]);
 
   const cancelAddJobService = useCallback(() => {
     setIsAddingJobService(false);
-    setJobAddressDraft("");
+    setJobAddressDraft('');
     setJobAddressError(null);
   }, []);
 
   const confirmAddJobService = useCallback(() => {
     const trimmed = jobAddressDraft.trim();
     if (!trimmed) {
-      setJobAddressError("请输入有效的推理服务器地址。");
+      setJobAddressError('请输入有效的推理服务器地址。');
       return;
     }
 
@@ -2687,7 +2972,7 @@ const MangaUpscaleAgent = () => {
       return [...prev, trimmed];
     });
     setJobForm((prev) => ({ ...prev, serviceUrl: trimmed }));
-    setJobAddressDraft("");
+    setJobAddressDraft('');
     setIsAddingJobService(false);
   }, [jobAddressDraft]);
 
@@ -2696,34 +2981,39 @@ const MangaUpscaleAgent = () => {
       (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
         const value = event.currentTarget.value;
         setJobForm((prev) => {
-          if (field === "pollIntervalMs") {
+          if (field === 'pollIntervalMs') {
             const numeric = Number(value);
-            const normalized = Number.isFinite(numeric) ? Math.max(250, Math.floor(numeric)) : DEFAULT_POLL_INTERVAL;
+            const normalized = Number.isFinite(numeric)
+              ? Math.max(250, Math.floor(numeric))
+              : DEFAULT_POLL_INTERVAL;
             return { ...prev, pollIntervalMs: normalized };
           }
-          if (field === "inputType") {
-            return { ...prev, inputType: value as JobFormState["inputType"] };
+          if (field === 'inputType') {
+            return { ...prev, inputType: value as JobFormState['inputType'] };
           }
           return { ...prev, [field]: value } as JobFormState;
         });
-    },
-    [],
+      },
+    []
   );
 
   const stepDescriptors = useMemo(() => {
-    const steps: StepDescriptor[] = [{ id: "source", label: "选择源目录" }];
+    const steps: StepDescriptor[] = [{ id: 'source', label: '选择源目录' }];
     if (isMultiVolumeSource) {
-      steps.push({ id: "volumes", label: "卷映射确认" });
+      steps.push({ id: 'volumes', label: '卷映射确认' });
     }
     steps.push(
-      { id: "rename", label: "图片重命名" },
-      { id: "upload", label: "上传到 Copyparty" },
-      { id: "jobs", label: "远端推理" },
+      { id: 'rename', label: '图片重命名' },
+      { id: 'upload', label: '上传到 Copyparty' },
+      { id: 'jobs', label: '远端推理' }
     );
     return steps;
   }, [isMultiVolumeSource]);
 
-  const stepOrder = useMemo(() => stepDescriptors.map((item) => item.id), [stepDescriptors]);
+  const stepOrder = useMemo(
+    () => stepDescriptors.map((item) => item.id),
+    [stepDescriptors]
+  );
 
   const stepIndexMap = useMemo(() => {
     const mapping = new Map<StepId, number>();
@@ -2735,7 +3025,7 @@ const MangaUpscaleAgent = () => {
 
   useEffect(() => {
     if (!stepOrder.includes(currentStep)) {
-      setCurrentStep(stepOrder[0] ?? "source");
+      setCurrentStep(stepOrder[0] ?? 'source');
     }
   }, [currentStep, stepOrder]);
 
@@ -2766,43 +3056,41 @@ const MangaUpscaleAgent = () => {
   }, []);
 
   const handleVolumeNumberChange = useCallback(
-    (index: number) =>
-      (event: ChangeEvent<HTMLInputElement>) => {
-        const rawValue = event.currentTarget.value;
-        const numeric = Number(rawValue);
-        const normalized =
-          rawValue.trim() === "" || !Number.isFinite(numeric)
-            ? null
-            : Math.max(1, Math.floor(numeric));
+    (index: number) => (event: ChangeEvent<HTMLInputElement>) => {
+      const rawValue = event.currentTarget.value;
+      const numeric = Number(rawValue);
+      const normalized =
+        rawValue.trim() === '' || !Number.isFinite(numeric)
+          ? null
+          : Math.max(1, Math.floor(numeric));
 
-        setVolumeMappings((prev) => {
-          const next = [...prev];
-          next[index] = { ...next[index], volumeNumber: normalized };
-          return next;
-        });
+      setVolumeMappings((prev) => {
+        const next = [...prev];
+        next[index] = { ...next[index], volumeNumber: normalized };
+        return next;
+      });
 
-        setMappingConfirmed(false);
-        setRenameSummary(null);
-        setVolumeMappingError(null);
-      },
-    [],
+      setMappingConfirmed(false);
+      setRenameSummary(null);
+      setVolumeMappingError(null);
+    },
+    []
   );
 
   const handleVolumeNameChange = useCallback(
-    (index: number) =>
-      (event: ChangeEvent<HTMLInputElement>) => {
-        const value = event.currentTarget.value;
-        setVolumeMappings((prev) => {
-          const next = [...prev];
-          next[index] = { ...next[index], volumeName: value };
-          return next;
-        });
+    (index: number) => (event: ChangeEvent<HTMLInputElement>) => {
+      const value = event.currentTarget.value;
+      setVolumeMappings((prev) => {
+        const next = [...prev];
+        next[index] = { ...next[index], volumeName: value };
+        return next;
+      });
 
-        setMappingConfirmed(false);
-        setRenameSummary(null);
-        setVolumeMappingError(null);
-      },
-    [],
+      setMappingConfirmed(false);
+      setRenameSummary(null);
+      setVolumeMappingError(null);
+    },
+    []
   );
 
   const handleConfirmMapping = useCallback(() => {
@@ -2814,13 +3102,15 @@ const MangaUpscaleAgent = () => {
     }
 
     if (volumeMappings.length === 0) {
-      setVolumeMappingError("未检测到任何卷目录，请返回上一步检查源目录。");
+      setVolumeMappingError('未检测到任何卷目录，请返回上一步检查源目录。');
       return;
     }
 
-    const missingNumber = volumeMappings.some((item) => item.volumeNumber === null);
+    const missingNumber = volumeMappings.some(
+      (item) => item.volumeNumber === null
+    );
     if (missingNumber) {
-      setVolumeMappingError("请为每一卷填写卷号。");
+      setVolumeMappingError('请为每一卷填写卷号。');
       return;
     }
 
@@ -2830,7 +3120,7 @@ const MangaUpscaleAgent = () => {
         continue;
       }
       if (seen.has(mapping.volumeNumber)) {
-        setVolumeMappingError("卷号不能重复，请调整后再确认。");
+        setVolumeMappingError('卷号不能重复，请调整后再确认。');
         return;
       }
       seen.add(mapping.volumeNumber);
@@ -2875,19 +3165,19 @@ const MangaUpscaleAgent = () => {
     const bearer = jobForm.bearerToken.trim();
 
     if (!serviceUrl) {
-      setJobError("请填写推理服务地址。");
+      setJobError('请填写推理服务地址。');
       return;
     }
     if (!title) {
-      setJobError("请填写作品名，以便在远端区分作业。");
+      setJobError('请填写作品名，以便在远端区分作业。');
       return;
     }
     if (!volume) {
-      setJobError("请填写卷名，或至少提供批次标识。");
+      setJobError('请填写卷名，或至少提供批次标识。');
       return;
     }
     if (!inputPath) {
-      setJobError("请提供远端输入路径（例如 incoming/volume.zip）。");
+      setJobError('请提供远端输入路径（例如 incoming/volume.zip）。');
       return;
     }
 
@@ -2922,16 +3212,18 @@ const MangaUpscaleAgent = () => {
         },
       };
 
-      const submission = await invoke<JobSubmission>("create_manga_job", { options });
+      const submission = await invoke<JobSubmission>('create_manga_job', {
+        options,
+      });
 
       const initialRecord: JobRecord = {
         jobId: submission.jobId,
-        status: "PENDING",
+        status: 'PENDING',
         processed: 0,
         total: 0,
         artifactPath: null,
-        message: "作业已提交，等待远端处理。",
-        transport: "system",
+        message: '作业已提交，等待远端处理。',
+        transport: 'system',
         error: null,
         retries: 0,
         lastError: null,
@@ -2949,7 +3241,10 @@ const MangaUpscaleAgent = () => {
         lastUpdated: Date.now(),
       };
 
-      setJobs((prev) => [initialRecord, ...prev.filter((item) => item.jobId !== initialRecord.jobId)]);
+      setJobs((prev) => [
+        initialRecord,
+        ...prev.filter((item) => item.jobId !== initialRecord.jobId),
+      ]);
       setJobStatus(`作业 ${submission.jobId} 已创建，正在等待进度更新。`);
 
       void startJobWatcher(initialRecord);
@@ -2962,16 +3257,16 @@ const MangaUpscaleAgent = () => {
 
   const describeStatus = (status: string) => {
     switch (status.toUpperCase()) {
-      case "PENDING":
-        return "排队中";
-      case "RUNNING":
-        return "运行中";
-      case "SUCCESS":
-        return "已完成";
-      case "FAILED":
-        return "失败";
-      case "ERROR":
-        return "错误";
+      case 'PENDING':
+        return '排队中';
+      case 'RUNNING':
+        return '运行中';
+      case 'SUCCESS':
+        return '已完成';
+      case 'FAILED':
+        return '失败';
+      case 'ERROR':
+        return '错误';
       default:
         return status;
     }
@@ -2979,42 +3274,42 @@ const MangaUpscaleAgent = () => {
 
   const statusTone = (status: string) => {
     switch (status.toUpperCase()) {
-      case "SUCCESS":
-        return "success";
-      case "FAILED":
-      case "ERROR":
-        return "error";
-      case "RUNNING":
-        return "info";
+      case 'SUCCESS':
+        return 'success';
+      case 'FAILED':
+      case 'ERROR':
+        return 'error';
+      case 'RUNNING':
+        return 'info';
       default:
-        return "neutral";
+        return 'neutral';
     }
   };
 
   const describeTransport = (transport: JobEventTransport) => {
     switch (transport) {
-      case "websocket":
-        return "WebSocket";
-      case "polling":
-        return "轮询";
-      case "system":
+      case 'websocket':
+        return 'WebSocket';
+      case 'polling':
+        return '轮询';
+      case 'system':
       default:
-        return "系统";
+        return '系统';
     }
   };
 
   const describeUploadStage = (progress: UploadProgressPayload) => {
     switch (progress.stage) {
-      case "preparing":
-        return "准备中";
-      case "uploading":
-        return "上传中";
-      case "finalizing":
-        return "确认中";
-      case "completed":
-        return "完成";
-      case "failed":
-        return "失败";
+      case 'preparing':
+        return '准备中';
+      case 'uploading':
+        return '上传中';
+      case 'finalizing':
+        return '确认中';
+      case 'completed':
+        return '完成';
+      case 'failed':
+        return '失败';
       default:
         return progress.stage;
     }
@@ -3024,13 +3319,17 @@ const MangaUpscaleAgent = () => {
     if (!uploadProgress) {
       return null;
     }
-    if (uploadProgress.stage === "preparing" && uploadProgress.totalFiles > 0) {
-      return Math.round((uploadProgress.processedFiles / uploadProgress.totalFiles) * 100);
+    if (uploadProgress.stage === 'preparing' && uploadProgress.totalFiles > 0) {
+      return Math.round(
+        (uploadProgress.processedFiles / uploadProgress.totalFiles) * 100
+      );
     }
-    if (uploadProgress.stage === "uploading" && uploadProgress.totalBytes > 0) {
-      return Math.round((uploadProgress.transferredBytes / uploadProgress.totalBytes) * 100);
+    if (uploadProgress.stage === 'uploading' && uploadProgress.totalBytes > 0) {
+      return Math.round(
+        (uploadProgress.transferredBytes / uploadProgress.totalBytes) * 100
+      );
     }
-    if (uploadProgress.stage === "completed") {
+    if (uploadProgress.stage === 'completed') {
       return 100;
     }
     return null;
@@ -3044,10 +3343,10 @@ const MangaUpscaleAgent = () => {
           const currentIndex = stepOrder.indexOf(currentStep);
           const status =
             descriptor.id === currentStep
-              ? "active"
+              ? 'active'
               : index !== -1 && currentIndex !== -1 && index < currentIndex
-              ? "completed"
-              : "";
+              ? 'completed'
+              : '';
           const stepNumber = stepIndexMap.get(descriptor.id) ?? index + 1;
           return (
             <div key={descriptor.id} className={`stepper-nav-item ${status}`}>
@@ -3058,10 +3357,12 @@ const MangaUpscaleAgent = () => {
         })}
       </div>
 
-      {currentStep === "source" && (
+      {currentStep === 'source' && (
         <section className="step-card" aria-label="选择源目录">
           <header className="step-card-header">
-            <span className="step-index">步骤 {stepIndexMap.get("source") ?? 1}</span>
+            <span className="step-index">
+              步骤 {stepIndexMap.get('source') ?? 1}
+            </span>
             <h3>选择源目录</h3>
             <p>选取原始漫画文件夹并进行结构分析，识别单卷或多卷场景。</p>
           </header>
@@ -3073,7 +3374,7 @@ const MangaUpscaleAgent = () => {
                 <input
                   type="text"
                   value={renameForm.directory}
-                  onChange={handleRenameInput("directory")}
+                  onChange={handleRenameInput('directory')}
                   placeholder="/path/to/folder"
                 />
                 <button type="button" onClick={handleSelectDirectory}>
@@ -3087,46 +3388,56 @@ const MangaUpscaleAgent = () => {
           </div>
 
           {analysisLoading && <p className="status">正在扫描目录…</p>}
-          {analysisError && <p className="status status-error">{analysisError}</p>}
+          {analysisError && (
+            <p className="status status-error">{analysisError}</p>
+          )}
 
           {sourceAnalysis && (
             <div className="analysis-panel">
               <p>
                 检测结果：
-                {sourceAnalysis.mode === "multiVolume" ? "多卷目录" : "单卷目录"}；
-                根目录图片 {sourceAnalysis.rootImageCount} 张，总计 {sourceAnalysis.totalImages} 张。
+                {sourceAnalysis.mode === 'multiVolume'
+                  ? '多卷目录'
+                  : '单卷目录'}
+                ； 根目录图片 {sourceAnalysis.rootImageCount} 张，总计{' '}
+                {sourceAnalysis.totalImages} 张。
               </p>
 
-              {sourceAnalysis.mode === "multiVolume" && sourceAnalysis.volumeCandidates.length > 0 && (
-                <table className="analysis-table">
-                  <thead>
-                    <tr>
-                      <th>子目录</th>
-                      <th>图片数</th>
-                      <th>推测卷号</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sourceAnalysis.volumeCandidates.map((candidate) => (
-                      <tr key={candidate.directory}>
-                        <td>{candidate.folderName}</td>
-                        <td>{candidate.imageCount}</td>
-                        <td>{candidate.detectedNumber ?? "-"}</td>
+              {sourceAnalysis.mode === 'multiVolume' &&
+                sourceAnalysis.volumeCandidates.length > 0 && (
+                  <table className="analysis-table">
+                    <thead>
+                      <tr>
+                        <th>子目录</th>
+                        <th>图片数</th>
+                        <th>推测卷号</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+                    </thead>
+                    <tbody>
+                      {sourceAnalysis.volumeCandidates.map((candidate) => (
+                        <tr key={candidate.directory}>
+                          <td>{candidate.folderName}</td>
+                          <td>{candidate.imageCount}</td>
+                          <td>{candidate.detectedNumber ?? '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
 
               {sourceAnalysis.skippedEntries.length > 0 && (
                 <details>
-                  <summary>忽略的条目 ({sourceAnalysis.skippedEntries.length})</summary>
+                  <summary>
+                    忽略的条目 ({sourceAnalysis.skippedEntries.length})
+                  </summary>
                   <ul>
                     {sourceAnalysis.skippedEntries.slice(0, 10).map((entry) => (
                       <li key={entry}>{entry}</li>
                     ))}
                     {sourceAnalysis.skippedEntries.length > 10 && (
-                      <li>其余 {sourceAnalysis.skippedEntries.length - 10} 条略。</li>
+                      <li>
+                        其余 {sourceAnalysis.skippedEntries.length - 10} 条略。
+                      </li>
                     )}
                   </ul>
                 </details>
@@ -3147,10 +3458,12 @@ const MangaUpscaleAgent = () => {
         </section>
       )}
 
-      {currentStep === "volumes" && isMultiVolumeSource && (
+      {currentStep === 'volumes' && isMultiVolumeSource && (
         <section className="step-card" aria-label="卷映射确认">
           <header className="step-card-header">
-            <span className="step-index">步骤 {stepIndexMap.get("volumes") ?? 2}</span>
+            <span className="step-index">
+              步骤 {stepIndexMap.get('volumes') ?? 2}
+            </span>
             <h3>卷映射确认</h3>
             <p>为每个子目录指定卷号与显示名称，确认后将用于重命名和上传。</p>
           </header>
@@ -3186,7 +3499,7 @@ const MangaUpscaleAgent = () => {
                       <input
                         type="number"
                         min={1}
-                        value={mapping.volumeNumber ?? ""}
+                        value={mapping.volumeNumber ?? ''}
                         onChange={handleVolumeNumberChange(index)}
                       />
                     </td>
@@ -3203,20 +3516,28 @@ const MangaUpscaleAgent = () => {
             </table>
           )}
 
-          {volumeMappingError && <p className="status status-error">{volumeMappingError}</p>}
+          {volumeMappingError && (
+            <p className="status status-error">{volumeMappingError}</p>
+          )}
 
           <div className="button-row">
-            <button type="button" className="primary" onClick={handleConfirmMapping}>
+            <button
+              type="button"
+              className="primary"
+              onClick={handleConfirmMapping}
+            >
               确认映射并继续
             </button>
           </div>
         </section>
       )}
 
-      {currentStep === "rename" && (
+      {currentStep === 'rename' && (
         <section className="step-card" aria-label="图片重命名">
           <header className="step-card-header">
-            <span className="step-index">步骤 {stepIndexMap.get("rename") ?? 1}</span>
+            <span className="step-index">
+              步骤 {stepIndexMap.get('rename') ?? 1}
+            </span>
             <h3>图片重命名与预览</h3>
             <p>根据卷映射批量重命名图片并生成 manifest 映射。</p>
           </header>
@@ -3228,7 +3549,7 @@ const MangaUpscaleAgent = () => {
                 type="number"
                 min={1}
                 value={renameForm.pad}
-                onChange={handleRenameInput("pad")}
+                onChange={handleRenameInput('pad')}
               />
             </label>
 
@@ -3237,7 +3558,7 @@ const MangaUpscaleAgent = () => {
               <input
                 type="text"
                 value={renameForm.targetExtension}
-                onChange={handleRenameInput("targetExtension")}
+                onChange={handleRenameInput('targetExtension')}
                 maxLength={8}
               />
             </label>
@@ -3262,10 +3583,25 @@ const MangaUpscaleAgent = () => {
                   onClick={handlePrepareSplit}
                   disabled={splitPreparing}
                 >
-                  {splitPreparing ? "准备中…" : "开始内容拆分"}
+                  {splitPreparing ? '准备中…' : '开始内容拆分'}
                 </button>
               )}
             </div>
+
+            {contentSplitEnabled && !isMultiVolumeSource && (
+              <div className="split-settings-row">
+                <label className="form-field compact">
+                  <span className="field-label">拆分算法</span>
+                  <select
+                    value={splitAlgorithm}
+                    onChange={handleSplitAlgorithmChange}
+                  >
+                    <option value="edgeTexture">Edge Texture（推荐）</option>
+                    <option value="projection">传统投影</option>
+                  </select>
+                </label>
+              </div>
+            )}
 
             {splitEstimate && (
               <p className="status status-tip">
@@ -3274,13 +3610,19 @@ const MangaUpscaleAgent = () => {
             )}
 
             {isMultiVolumeSource && (
-              <p className="status status-tip">多卷目录暂不支持内容感知拆分，请在单卷模式或逐卷操作中使用。</p>
+              <p className="status status-tip">
+                多卷目录暂不支持内容感知拆分，请在单卷模式或逐卷操作中使用。
+              </p>
             )}
 
             {contentSplitEnabled && !isMultiVolumeSource && (
               <div className="split-summary">
                 {(splitPreparing || splitProgress) && (
-                  <div className="split-progress" role="status" aria-live="polite">
+                  <div
+                    className="split-progress"
+                    role="status"
+                    aria-live="polite"
+                  >
                     <div
                       className="split-progress-bar"
                       role="progressbar"
@@ -3288,17 +3630,24 @@ const MangaUpscaleAgent = () => {
                       aria-valuemin={0}
                       aria-valuemax={100}
                     >
-                      <span style={{ width: `${splitProgress ? splitProgressPercent : 0}%` }} />
+                      <span
+                        style={{
+                          width: `${splitProgress ? splitProgressPercent : 0}%`,
+                        }}
+                      />
                     </div>
 
                     <div className="split-progress-meta">
-                      <span className="split-progress-status">{splitProgressStatus ?? ""}</span>
+                      <span className="split-progress-status">
+                        {splitProgressStatus ?? ''}
+                      </span>
                       <span className="split-progress-percent">
-                        {splitProgress ? `${splitProgressPercent}%` : "--%"}
+                        {splitProgress ? `${splitProgressPercent}%` : '--%'}
                       </span>
                       {splitProgress?.totalFiles ? (
                         <span className="split-progress-count">
-                          {splitProgress.processedFiles}/{splitProgress.totalFiles}
+                          {splitProgress.processedFiles}/
+                          {splitProgress.totalFiles}
                         </span>
                       ) : null}
                     </div>
@@ -3319,17 +3668,22 @@ const MangaUpscaleAgent = () => {
                     工作目录：{splitWorkspace}
                     {splitSummaryState && (
                       <span>
-                        ，输出 {splitSummaryState.emittedFiles} 文件，拆分 {splitSummaryState.splitPages} 页
+                        ，输出 {splitSummaryState.emittedFiles} 文件，拆分{' '}
+                        {splitSummaryState.splitPages} 页
                       </span>
                     )}
                   </p>
                 )}
 
                 {splitReportPath && (
-                  <p className="status status-tip">拆分报告：{splitReportPath}</p>
+                  <p className="status status-tip">
+                    拆分报告：{splitReportPath}
+                  </p>
                 )}
 
-                {splitError && <p className="status status-error">{splitError}</p>}
+                {splitError && (
+                  <p className="status status-error">{splitError}</p>
+                )}
 
                 {splitWarningsState.length > 0 && (
                   <ul className="status status-warning">
@@ -3349,7 +3703,7 @@ const MangaUpscaleAgent = () => {
               onClick={() => runRename(true)}
               disabled={renameLoading}
             >
-              {renameLoading ? "处理中…" : "预览重命名"}
+              {renameLoading ? '处理中…' : '预览重命名'}
             </button>
 
             <button
@@ -3357,21 +3711,23 @@ const MangaUpscaleAgent = () => {
               onClick={() => runRename(false)}
               disabled={renameLoading}
             >
-              {renameLoading ? "处理中…" : "执行重命名"}
+              {renameLoading ? '处理中…' : '执行重命名'}
             </button>
           </div>
 
           {renameError && <p className="status status-error">{renameError}</p>}
 
-          {renameSummary && renameSummary.mode === "single" && (
+          {renameSummary && renameSummary.mode === 'single' && (
             <div className="preview-panel">
               <div className="preview-header">
                 <strong>
                   {renameSummary.outcome.entries.length} 个文件
-                  {renameSummary.outcome.dryRun ? "（预览）" : "（已重命名）"}
+                  {renameSummary.outcome.dryRun ? '（预览）' : '（已重命名）'}
                 </strong>
                 {renameSummary.outcome.manifestPath && (
-                  <span className="manifest-path">manifest: {renameSummary.outcome.manifestPath}</span>
+                  <span className="manifest-path">
+                    manifest: {renameSummary.outcome.manifestPath}
+                  </span>
                 )}
               </div>
 
@@ -3383,15 +3739,20 @@ const MangaUpscaleAgent = () => {
                 </ul>
               )}
 
-              {renameSummary.outcome.splitApplied && renameSummary.outcome.splitSummary && (
-                <p className="status status-tip">
-                  内容感知拆分：输出 {renameSummary.outcome.splitSummary.emittedFiles} 文件，
-                  拆分 {renameSummary.outcome.splitSummary.splitPages} 页。
-                  {renameSummary.outcome.splitWorkspace && (
-                    <span> 工作目录：{renameSummary.outcome.splitWorkspace}</span>
-                  )}
-                </p>
-              )}
+              {renameSummary.outcome.splitApplied &&
+                renameSummary.outcome.splitSummary && (
+                  <p className="status status-tip">
+                    内容感知拆分：输出{' '}
+                    {renameSummary.outcome.splitSummary.emittedFiles} 文件，
+                    拆分 {renameSummary.outcome.splitSummary.splitPages} 页。
+                    {renameSummary.outcome.splitWorkspace && (
+                      <span>
+                        {' '}
+                        工作目录：{renameSummary.outcome.splitWorkspace}
+                      </span>
+                    )}
+                  </p>
+                )}
 
               <table className="preview-table">
                 <thead>
@@ -3412,13 +3773,15 @@ const MangaUpscaleAgent = () => {
 
               {renameSummary.outcome.entries.length > previewEntries.length && (
                 <p className="preview-more">
-                  其余 {renameSummary.outcome.entries.length - previewEntries.length} 条略。
+                  其余{' '}
+                  {renameSummary.outcome.entries.length - previewEntries.length}{' '}
+                  条略。
                 </p>
               )}
             </div>
           )}
 
-          {renameSummary && renameSummary.mode === "multi" && (
+          {renameSummary && renameSummary.mode === 'multi' && (
             <div className="preview-panel multi">
               {renameSummary.volumes.map(({ mapping, outcome }) => (
                 <div key={mapping.directory} className="volume-preview">
@@ -3428,10 +3791,12 @@ const MangaUpscaleAgent = () => {
                     </strong>
                     <span>
                       {outcome.entries.length} 个文件
-                      {renameSummary.dryRun ? "（预览）" : "（已重命名）"}
+                      {renameSummary.dryRun ? '（预览）' : '（已重命名）'}
                     </span>
                     {outcome.manifestPath && (
-                      <span className="manifest-path">manifest: {outcome.manifestPath}</span>
+                      <span className="manifest-path">
+                        manifest: {outcome.manifestPath}
+                      </span>
                     )}
                   </header>
 
@@ -3452,7 +3817,9 @@ const MangaUpscaleAgent = () => {
                     </thead>
                     <tbody>
                       {outcome.entries.slice(0, 5).map((entry) => (
-                        <tr key={`${mapping.directory}-${entry.originalName}-${entry.renamedName}`}>
+                        <tr
+                          key={`${mapping.directory}-${entry.originalName}-${entry.renamedName}`}
+                        >
                           <td>{entry.originalName}</td>
                           <td>{entry.renamedName}</td>
                         </tr>
@@ -3481,685 +3848,808 @@ const MangaUpscaleAgent = () => {
         </section>
       )}
 
-      {currentStep === "upload" && (
+      {currentStep === 'upload' && (
         <section className="step-card" aria-label="步骤 2 上传 Copyparty">
-        <header className="step-card-header">
-          <span className="step-index">步骤 {stepIndexMap.get("upload") ?? 1}</span>
-          <h3>上传到 Copyparty</h3>
-          <p>将整理后的目录打包为 zip 上传，并附带作品信息。</p>
-        </header>
+          <header className="step-card-header">
+            <span className="step-index">
+              步骤 {stepIndexMap.get('upload') ?? 1}
+            </span>
+            <h3>上传到 Copyparty</h3>
+            <p>将整理后的目录打包为 zip 上传，并附带作品信息。</p>
+          </header>
 
-        <div className="form-grid">
-          <label className="form-field">
-            <span className="field-label">服务地址</span>
-            <div className="select-with-button">
-              <select value={uploadForm.serviceUrl} onChange={handleUploadInput("serviceUrl")}>
-                <option value="">选择或新增上传地址</option>
-                {uploadServiceOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-              <button type="button" onClick={beginAddUploadService}>
-                添加
-              </button>
-            </div>
-            {isAddingUploadService && (
-              <div className="address-add-row">
-                <input
-                  type="text"
-                  value={uploadAddressDraft}
-                  onChange={(event) => {
-                    setUploadAddressDraft(event.currentTarget.value);
-                    if (uploadAddressError) {
-                      setUploadAddressError(null);
-                    }
-                  }}
-                  placeholder="http://127.0.0.1:3923"
-                  autoFocus
-                />
-                <button type="button" className="primary" onClick={confirmAddUploadService}>
-                  保存
-                </button>
-                <button type="button" className="ghost" onClick={cancelAddUploadService}>
-                  取消
+          <div className="form-grid">
+            <label className="form-field">
+              <span className="field-label">服务地址</span>
+              <div className="select-with-button">
+                <select
+                  value={uploadForm.serviceUrl}
+                  onChange={handleUploadInput('serviceUrl')}
+                >
+                  <option value="">选择或新增上传地址</option>
+                  {uploadServiceOptions.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" onClick={beginAddUploadService}>
+                  添加
                 </button>
               </div>
-            )}
-            {uploadAddressError && <p className="field-error">{uploadAddressError}</p>}
-          </label>
-
-          <label className="form-field">
-            <span className="field-label">远端输入路径（自动生成）</span>
-            <input
-              type="text"
-              value={remotePathPreview}
-              readOnly
-              aria-readonly="true"
-              onFocus={(event) => event.currentTarget.select()}
-            />
-            <button type="button" onClick={handleRegenerateRemotePath}>
-              重新生成
-            </button>
-            <small>无需手动填写，上传时会使用该路径并自动在远端推理步骤中填入。</small>
-          </label>
-
-          <label className="form-field">
-            <span className="field-label">Bearer Token（可选）</span>
-            <input
-              type="text"
-              value={uploadForm.bearerToken}
-              onChange={handleUploadInput("bearerToken")}
-              placeholder="xxxxxx"
-            />
-          </label>
-
-          <label className="form-field compact">
-            <span className="field-label">作品名（可选）</span>
-            <input
-              type="text"
-              value={uploadForm.title}
-              onChange={handleUploadInput("title")}
-            />
-          </label>
-
-          <label className="form-field compact">
-            <span className="field-label">卷名（可选）</span>
-            <input
-              type="text"
-              value={uploadForm.volume}
-              onChange={handleUploadInput("volume")}
-            />
-          </label>
-
-          {isMultiVolumeSource && volumeMappings.length > 0 && (
-            <label className="form-field compact">
-              <span className="field-label">上传卷</span>
-              <select
-                value={selectedVolumeKey ?? ""}
-                onChange={(event) => handleSelectVolume(event.currentTarget.value)}
-              >
-                {volumeMappings.map((mapping) => (
-                  <option key={mapping.directory} value={mapping.directory}>
-                    卷 {mapping.volumeNumber ?? "-"} · {mapping.volumeName}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-
-          <label className="form-field compact">
-            <span className="field-label">模式</span>
-            <select
-              value={uploadForm.mode}
-              onChange={handleUploadInput("mode")}
-            >
-              <option value="zip">Zip</option>
-              <option value="folder">Folder（规划中）</option>
-            </select>
-          </label>
-        </div>
-
-        <div className="button-row">
-          <button type="button" className="primary" onClick={handleUpload} disabled={uploadLoading}>
-            {uploadLoading ? "上传中…" : "上传到 Copyparty"}
-          </button>
-        </div>
-
-        {uploadError && <p className="status status-error">{uploadError}</p>}
-        {uploadStatus && <p className="status status-success">{uploadStatus}</p>}
-        {uploadProgress && (
-          <div className="upload-progress">
-            <div className="upload-progress-header">
-              <span
-                className={`status-chip status-${
-                  uploadProgress.stage === "failed"
-                    ? "error"
-                    : uploadProgress.stage === "completed"
-                      ? "success"
-                      : "info"
-                }`}
-              >
-                {describeUploadStage(uploadProgress)}
-              </span>
-              {uploadPercent != null && (
-                <span className="progress-label">{uploadPercent}%</span>
+              {isAddingUploadService && (
+                <div className="address-add-row">
+                  <input
+                    type="text"
+                    value={uploadAddressDraft}
+                    onChange={(event) => {
+                      setUploadAddressDraft(event.currentTarget.value);
+                      if (uploadAddressError) {
+                        setUploadAddressError(null);
+                      }
+                    }}
+                    placeholder="http://127.0.0.1:3923"
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={confirmAddUploadService}
+                  >
+                    保存
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={cancelAddUploadService}
+                  >
+                    取消
+                  </button>
+                </div>
               )}
-            </div>
-            <div className="progress-bar">
-              <span style={{ width: `${Math.max(0, Math.min(uploadPercent ?? 0, 100))}%` }} />
-            </div>
-            {(uploadProgress.message || uploadProgress.totalBytes > 0) && (
-              <p className="progress-hint">
-                {uploadProgress.message ??
-                  `${(uploadProgress.transferredBytes / (1024 * 1024)).toFixed(2)} / ${(uploadProgress.totalBytes / (1024 * 1024)).toFixed(2)} MB`}
-              </p>
-            )}
-          </div>
-        )}
+              {uploadAddressError && (
+                <p className="field-error">{uploadAddressError}</p>
+              )}
+            </label>
 
-        <div className="wizard-controls">
-          <button type="button" onClick={goToPreviousStep}>
-            上一步
-          </button>
-          <button type="button" className="primary" onClick={goToNextStep}>
-            下一步
-          </button>
-        </div>
-      </section>
-      )}
-
-      {currentStep === "jobs" && (
-        <section className="step-card" aria-label="远端推理">
-        <header className="step-card-header">
-          <span className="step-index">步骤 {stepIndexMap.get("jobs") ?? 1}</span>
-          <h3>远端推理</h3>
-          <p>提交 FastAPI 推理作业并实时查看进度。</p>
-        </header>
-
-        <div className="params-panel" aria-label="推理参数配置">
-          <div className="params-panel-header">
-            <h4>推理参数</h4>
-            <p>调整模型、放大倍率与高级选项，配置将自动保存为默认值。</p>
-          </div>
-
-          <div className="params-grid">
             <label className="form-field">
-              <span className="field-label">模型</span>
+              <span className="field-label">远端输入路径（自动生成）</span>
               <input
                 type="text"
-                value={jobParams.model}
-                onChange={handleParamChange("model")}
-                placeholder="RealESRGAN_x4plus_anime_6B"
+                value={remotePathPreview}
+                readOnly
+                aria-readonly="true"
+                onFocus={(event) => event.currentTarget.select()}
               />
+              <button type="button" onClick={handleRegenerateRemotePath}>
+                重新生成
+              </button>
+              <small>
+                无需手动填写，上传时会使用该路径并自动在远端推理步骤中填入。
+              </small>
             </label>
 
-            <label className="form-field compact">
-              <span className="field-label">放大倍率</span>
+            <label className="form-field">
+              <span className="field-label">Bearer Token（可选）</span>
               <input
-                type="number"
-                min={1}
-                max={4}
-                value={jobParams.scale}
-                onChange={handleParamChange("scale")}
+                type="text"
+                value={uploadForm.bearerToken}
+                onChange={handleUploadInput('bearerToken')}
+                placeholder="xxxxxx"
               />
             </label>
 
             <label className="form-field compact">
-              <span className="field-label">降噪等级</span>
-              <select value={jobParams.denoise} onChange={handleParamChange("denoise")}>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
-            </label>
-
-            <label className="form-field compact">
-              <span className="field-label">输出格式</span>
-              <select value={jobParams.outputFormat} onChange={handleParamChange("outputFormat")}>
-                <option value="jpg">JPG</option>
-                <option value="png">PNG</option>
-                <option value="webp">WEBP</option>
-              </select>
-            </label>
-
-            <label className="form-field compact">
-              <span className="field-label">JPEG 质量</span>
+              <span className="field-label">作品名（可选）</span>
               <input
-                type="number"
-                min={1}
-                max={100}
-                value={jobParams.jpegQuality}
-                onChange={handleParamChange("jpegQuality")}
-                disabled={jobParams.outputFormat !== "jpg"}
+                type="text"
+                value={uploadForm.title}
+                onChange={handleUploadInput('title')}
               />
             </label>
 
             <label className="form-field compact">
-              <span className="field-label">Tile 尺寸</span>
+              <span className="field-label">卷名（可选）</span>
               <input
-                type="number"
-                min={32}
-                max={1024}
-                value={jobParams.tileSize ?? ""}
-                onChange={handleParamChange("tileSize")}
-                placeholder="留空表示自动"
+                type="text"
+                value={uploadForm.volume}
+                onChange={handleUploadInput('volume')}
               />
             </label>
 
-            <label className="form-field compact">
-              <span className="field-label">Tile Pad</span>
-              <input
-                type="number"
-                min={0}
-                max={128}
-                value={jobParams.tilePad ?? ""}
-                onChange={handleParamChange("tilePad")}
-                placeholder="留空表示自动"
-              />
-            </label>
+            {isMultiVolumeSource && volumeMappings.length > 0 && (
+              <label className="form-field compact">
+                <span className="field-label">上传卷</span>
+                <select
+                  value={selectedVolumeKey ?? ''}
+                  onChange={(event) =>
+                    handleSelectVolume(event.currentTarget.value)
+                  }
+                >
+                  {volumeMappings.map((mapping) => (
+                    <option key={mapping.directory} value={mapping.directory}>
+                      卷 {mapping.volumeNumber ?? '-'} · {mapping.volumeName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
 
             <label className="form-field compact">
-              <span className="field-label">Batch Size</span>
-              <input
-                type="number"
-                min={1}
-                max={16}
-                value={jobParams.batchSize ?? ""}
-                onChange={handleParamChange("batchSize")}
-                placeholder="留空表示自动"
-              />
-            </label>
-
-            <label className="form-field compact">
-              <span className="field-label">设备偏好</span>
-              <select value={jobParams.device} onChange={handleParamChange("device")}>
-                <option value="auto">Auto</option>
-                <option value="cuda">CUDA</option>
-                <option value="cpu">CPU</option>
+              <span className="field-label">模式</span>
+              <select
+                value={uploadForm.mode}
+                onChange={handleUploadInput('mode')}
+              >
+                <option value="zip">Zip</option>
+                <option value="folder">Folder（规划中）</option>
               </select>
             </label>
           </div>
 
-          <div className="params-actions">
-            <button type="button" onClick={handleResetParams}>
-              重置为内置默认
-            </button>
-            <button type="button" onClick={handleSaveFavorite}>
-              收藏当前参数
+          <div className="button-row">
+            <button
+              type="button"
+              className="primary"
+              onClick={handleUpload}
+              disabled={uploadLoading}
+            >
+              {uploadLoading ? '上传中…' : '上传到 Copyparty'}
             </button>
           </div>
 
-          {jobParamFavorites.length > 0 && (
-            <div className="params-favorites">
-              <div className="favorite-header">
-                <h5>收藏参数预设</h5>
-                <span>最多保留 8 组，可随时应用或删除。</span>
+          {uploadError && <p className="status status-error">{uploadError}</p>}
+          {uploadStatus && (
+            <p className="status status-success">{uploadStatus}</p>
+          )}
+          {uploadProgress && (
+            <div className="upload-progress">
+              <div className="upload-progress-header">
+                <span
+                  className={`status-chip status-${
+                    uploadProgress.stage === 'failed'
+                      ? 'error'
+                      : uploadProgress.stage === 'completed'
+                      ? 'success'
+                      : 'info'
+                  }`}
+                >
+                  {describeUploadStage(uploadProgress)}
+                </span>
+                {uploadPercent != null && (
+                  <span className="progress-label">{uploadPercent}%</span>
+                )}
               </div>
+              <div className="progress-bar">
+                <span
+                  style={{
+                    width: `${Math.max(0, Math.min(uploadPercent ?? 0, 100))}%`,
+                  }}
+                />
+              </div>
+              {(uploadProgress.message || uploadProgress.totalBytes > 0) && (
+                <p className="progress-hint">
+                  {uploadProgress.message ??
+                    `${(
+                      uploadProgress.transferredBytes /
+                      (1024 * 1024)
+                    ).toFixed(2)} / ${(
+                      uploadProgress.totalBytes /
+                      (1024 * 1024)
+                    ).toFixed(2)} MB`}
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className="wizard-controls">
+            <button type="button" onClick={goToPreviousStep}>
+              上一步
+            </button>
+            <button type="button" className="primary" onClick={goToNextStep}>
+              下一步
+            </button>
+          </div>
+        </section>
+      )}
+
+      {currentStep === 'jobs' && (
+        <section className="step-card" aria-label="远端推理">
+          <header className="step-card-header">
+            <span className="step-index">
+              步骤 {stepIndexMap.get('jobs') ?? 1}
+            </span>
+            <h3>远端推理</h3>
+            <p>提交 FastAPI 推理作业并实时查看进度。</p>
+          </header>
+
+          <div className="params-panel" aria-label="推理参数配置">
+            <div className="params-panel-header">
+              <h4>推理参数</h4>
+              <p>调整模型、放大倍率与高级选项，配置将自动保存为默认值。</p>
+            </div>
+
+            <div className="params-grid">
+              <label className="form-field">
+                <span className="field-label">模型</span>
+                <input
+                  type="text"
+                  value={jobParams.model}
+                  onChange={handleParamChange('model')}
+                  placeholder="RealESRGAN_x4plus_anime_6B"
+                />
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">放大倍率</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={4}
+                  value={jobParams.scale}
+                  onChange={handleParamChange('scale')}
+                />
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">降噪等级</span>
+                <select
+                  value={jobParams.denoise}
+                  onChange={handleParamChange('denoise')}
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">输出格式</span>
+                <select
+                  value={jobParams.outputFormat}
+                  onChange={handleParamChange('outputFormat')}
+                >
+                  <option value="jpg">JPG</option>
+                  <option value="png">PNG</option>
+                  <option value="webp">WEBP</option>
+                </select>
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">JPEG 质量</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={jobParams.jpegQuality}
+                  onChange={handleParamChange('jpegQuality')}
+                  disabled={jobParams.outputFormat !== 'jpg'}
+                />
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">Tile 尺寸</span>
+                <input
+                  type="number"
+                  min={32}
+                  max={1024}
+                  value={jobParams.tileSize ?? ''}
+                  onChange={handleParamChange('tileSize')}
+                  placeholder="留空表示自动"
+                />
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">Tile Pad</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={128}
+                  value={jobParams.tilePad ?? ''}
+                  onChange={handleParamChange('tilePad')}
+                  placeholder="留空表示自动"
+                />
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">Batch Size</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={16}
+                  value={jobParams.batchSize ?? ''}
+                  onChange={handleParamChange('batchSize')}
+                  placeholder="留空表示自动"
+                />
+              </label>
+
+              <label className="form-field compact">
+                <span className="field-label">设备偏好</span>
+                <select
+                  value={jobParams.device}
+                  onChange={handleParamChange('device')}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="cuda">CUDA</option>
+                  <option value="cpu">CPU</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="params-actions">
+              <button type="button" onClick={handleResetParams}>
+                重置为内置默认
+              </button>
+              <button type="button" onClick={handleSaveFavorite}>
+                收藏当前参数
+              </button>
+            </div>
+
+            {jobParamFavorites.length > 0 && (
+              <div className="params-favorites">
+                <div className="favorite-header">
+                  <h5>收藏参数预设</h5>
+                  <span>最多保留 8 组，可随时应用或删除。</span>
+                </div>
+                <ul>
+                  {jobParamFavorites.map((favorite) => (
+                    <li key={favorite.id}>
+                      <button
+                        type="button"
+                        onClick={() => handleApplyFavorite(favorite.id)}
+                      >
+                        {favorite.name}
+                      </button>
+                      <span className="favorite-meta">
+                        {new Date(favorite.createdAt).toLocaleString()}
+                      </span>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => handleRemoveFavorite(favorite.id)}
+                      >
+                        删除
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+
+          <div className="job-toolbar">
+            <div className="job-toolbar-group">
+              <label className="field-label" htmlFor="job-status-filter">
+                状态筛选
+              </label>
+              <select
+                id="job-status-filter"
+                value={jobStatusFilter}
+                onChange={handleJobStatusFilterChange}
+              >
+                <option value="all">全部</option>
+                <option value="active">进行中</option>
+                <option value="completed">已完成</option>
+                <option value="failed">失败/错误</option>
+              </select>
+            </div>
+
+            <div className="job-toolbar-group flex">
+              <label className="field-label" htmlFor="job-search">
+                搜索作业
+              </label>
+              <input
+                id="job-search"
+                type="text"
+                value={jobSearch}
+                onChange={handleJobSearchChange}
+                placeholder="按 Job ID / 标题 过滤"
+              />
+            </div>
+
+            <div className="job-toolbar-actions">
+              <button type="button" onClick={handleSelectAllVisible}>
+                全选当前列表
+              </button>
+              <button type="button" onClick={handleClearSelections}>
+                清除选择
+              </button>
+            </div>
+          </div>
+
+          <div className="form-grid">
+            <label className="form-field">
+              <span className="field-label">服务地址</span>
+              <div className="select-with-button">
+                <select
+                  value={jobForm.serviceUrl}
+                  onChange={handleJobInput('serviceUrl')}
+                >
+                  <option value="">选择或新增推理地址</option>
+                  {jobServiceOptions.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" onClick={beginAddJobService}>
+                  添加
+                </button>
+              </div>
+              {isAddingJobService && (
+                <div className="address-add-row">
+                  <input
+                    type="text"
+                    value={jobAddressDraft}
+                    onChange={(event) => {
+                      setJobAddressDraft(event.currentTarget.value);
+                      if (jobAddressError) {
+                        setJobAddressError(null);
+                      }
+                    }}
+                    placeholder="http://127.0.0.1:9000"
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={confirmAddJobService}
+                  >
+                    保存
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={cancelAddJobService}
+                  >
+                    取消
+                  </button>
+                </div>
+              )}
+              {jobAddressError && (
+                <p className="field-error">{jobAddressError}</p>
+              )}
+            </label>
+
+            <label className="form-field">
+              <span className="field-label">Bearer Token（可选）</span>
+              <input
+                type="text"
+                value={jobForm.bearerToken}
+                onChange={handleJobInput('bearerToken')}
+                placeholder="xxxxxx"
+              />
+            </label>
+
+            <label className="form-field">
+              <span className="field-label">作品名</span>
+              <input
+                type="text"
+                value={jobForm.title}
+                onChange={handleJobInput('title')}
+                placeholder="作品名"
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">卷名</span>
+              <input
+                type="text"
+                value={jobForm.volume}
+                onChange={handleJobInput('volume')}
+                placeholder="第 1 卷"
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">输入类型</span>
+              <select
+                value={jobForm.inputType}
+                onChange={handleJobInput('inputType')}
+              >
+                <option value="zip">Zip</option>
+                <option value="folder">Folder</option>
+              </select>
+            </label>
+
+            <label className="form-field">
+              <span className="field-label">远端输入路径</span>
+              <input
+                type="text"
+                value={jobForm.inputPath}
+                readOnly
+                aria-readonly="true"
+                onFocus={(event) => event.currentTarget.select()}
+                placeholder="上传完成后自动填充"
+                title={jobForm.inputPath || undefined}
+              />
+            </label>
+
+            <label className="form-field compact">
+              <span className="field-label">轮询间隔 (ms)</span>
+              <input
+                type="number"
+                min={250}
+                value={jobForm.pollIntervalMs}
+                onChange={handleJobInput('pollIntervalMs')}
+              />
+            </label>
+          </div>
+
+          <div className="button-row">
+            <button type="button" onClick={applyUploadContext}>
+              从上传填充
+            </button>
+            <button
+              type="button"
+              className="primary"
+              onClick={handleCreateJob}
+              disabled={jobLoading}
+            >
+              {jobLoading ? '提交中…' : '创建推理作业'}
+            </button>
+          </div>
+
+          {jobError && <p className="status status-error">{jobError}</p>}
+          {jobStatus && <p className="status status-success">{jobStatus}</p>}
+          {artifactError && (
+            <p className="status status-error">{artifactError}</p>
+          )}
+
+          {filteredJobs.length > 0 ? (
+            <div className="job-board">
+              <table className="jobs-table">
+                <thead>
+                  <tr>
+                    <th className="select-col">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={(event) => {
+                          if (event.currentTarget.checked) {
+                            handleSelectAllVisible();
+                          } else {
+                            handleClearSelections();
+                          }
+                        }}
+                      />
+                    </th>
+                    <th>作业 ID / 状态</th>
+                    <th>进度</th>
+                    <th>来源</th>
+                    <th>消息</th>
+                    <th>重试</th>
+                    <th>上次错误</th>
+                    <th>产物</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredJobs.map((job) => {
+                    const percent =
+                      job.total > 0
+                        ? Math.min(
+                            100,
+                            Math.round((job.processed / job.total) * 100)
+                          )
+                        : null;
+                    return (
+                      <tr key={job.jobId}>
+                        <td className="select-col">
+                          <input
+                            type="checkbox"
+                            checked={selectedJobIds.includes(job.jobId)}
+                            onChange={() => handleToggleJobSelection(job.jobId)}
+                          />
+                        </td>
+                        <td className="job-id-cell">
+                          <span className="job-id monospace" title={job.jobId}>
+                            {job.jobId}
+                          </span>
+                          <span
+                            className={`status-chip status-${statusTone(
+                              job.status
+                            )}`}
+                          >
+                            {describeStatus(job.status)}
+                          </span>
+                        </td>
+                        <td className="progress-col">
+                          {percent !== null ? (
+                            <div className="progress-cell">
+                              <div className="progress-bar">
+                                <span style={{ width: `${percent}%` }} />
+                              </div>
+                              <span className="progress-label">
+                                {job.processed}/{job.total}（{percent}%）
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="progress-label">-</span>
+                          )}
+                        </td>
+                        <td className="transport-cell">
+                          <span className="transport-badge">
+                            {describeTransport(job.transport)}
+                          </span>
+                        </td>
+                        <td className="message-cell">
+                          {job.message ? job.message : '-'}
+                        </td>
+                        <td className="retry-cell">{job.retries ?? 0}</td>
+                        <td className="error-cell">{job.lastError ?? '-'}</td>
+                        <td className="artifact-cell">
+                          {job.artifactPath ? (
+                            <div className="artifact-info">
+                              <span
+                                className="artifact-path"
+                                title={job.artifactPath}
+                              >
+                                {job.artifactPath}
+                              </span>
+                              {job.artifactHash && (
+                                <span
+                                  className="artifact-hash"
+                                  title={job.artifactHash}
+                                >
+                                  hash: {job.artifactHash.slice(0, 8)}…
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            '-'
+                          )}
+                        </td>
+                        <td className="actions-cell">
+                          <button
+                            type="button"
+                            onClick={() => handleResumeJob(job)}
+                          >
+                            恢复
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleCancelJob(job)}
+                          >
+                            终止
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              !job.artifactPath ||
+                              artifactDownloadBusyJob === job.jobId ||
+                              artifactValidateBusyJob === job.jobId
+                            }
+                            onClick={() => handleDownloadArtifact(job)}
+                          >
+                            {artifactDownloadBusyJob === job.jobId
+                              ? '下载中…'
+                              : '下载 ZIP'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              !job.artifactPath ||
+                              artifactValidateBusyJob === job.jobId ||
+                              artifactDownloadBusyJob === job.jobId
+                            }
+                            onClick={() => handleValidateArtifact(job)}
+                          >
+                            {artifactValidateBusyJob === job.jobId
+                              ? '校验中…'
+                              : '校验'}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="status">暂无符合条件的作业。</p>
+          )}
+
+          {hasSelection && (
+            <div className="job-batch-actions">
+              <span>已选择 {selectedJobIds.length} 个作业</span>
+              <div className="job-batch-buttons">
+                <button type="button" onClick={handleBatchResume}>
+                  批量恢复
+                </button>
+                <button type="button" onClick={handleBatchCancel}>
+                  批量终止
+                </button>
+                <button type="button" onClick={handleBatchDownload}>
+                  批量下载 ZIP
+                </button>
+                <button type="button" onClick={handleBatchValidate}>
+                  批量校验
+                </button>
+              </div>
+            </div>
+          )}
+
+          {artifactDownloads.length > 0 && (
+            <div className="artifact-downloads">
+              <h4>最近下载</h4>
               <ul>
-                {jobParamFavorites.map((favorite) => (
-                  <li key={favorite.id}>
-                    <button type="button" onClick={() => handleApplyFavorite(favorite.id)}>
-                      {favorite.name}
-                    </button>
-                    <span className="favorite-meta">{new Date(favorite.createdAt).toLocaleString()}</span>
-                    <button type="button" className="ghost" onClick={() => handleRemoveFavorite(favorite.id)}>
-                      删除
-                    </button>
+                {artifactDownloads.map((summary) => (
+                  <li key={`${summary.jobId}-${summary.hash}`}>
+                    <div className="report-header">
+                      <span className="job-id monospace">{summary.jobId}</span>
+                      <span className="report-status">
+                        文件数：{summary.fileCount}
+                      </span>
+                      <span className="report-path">
+                        ZIP：{summary.archivePath}
+                      </span>
+                    </div>
+                    <div className="report-details">
+                      <span>解压目录：{summary.extractPath}</span>
+                      {summary.warnings.length > 0 && (
+                        <span className="report-warning">
+                          {summary.warnings[0]}
+                        </span>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
             </div>
           )}
-        </div>
 
-        <div className="job-toolbar">
-          <div className="job-toolbar-group">
-            <label className="field-label" htmlFor="job-status-filter">
-              状态筛选
-            </label>
-            <select id="job-status-filter" value={jobStatusFilter} onChange={handleJobStatusFilterChange}>
-              <option value="all">全部</option>
-              <option value="active">进行中</option>
-              <option value="completed">已完成</option>
-              <option value="failed">失败/错误</option>
-            </select>
-          </div>
-
-          <div className="job-toolbar-group flex">
-            <label className="field-label" htmlFor="job-search">
-              搜索作业
-            </label>
-            <input
-              id="job-search"
-              type="text"
-              value={jobSearch}
-              onChange={handleJobSearchChange}
-              placeholder="按 Job ID / 标题 过滤"
-            />
-          </div>
-
-          <div className="job-toolbar-actions">
-            <button type="button" onClick={handleSelectAllVisible}>
-              全选当前列表
-            </button>
-            <button type="button" onClick={handleClearSelections}>
-              清除选择
-            </button>
-          </div>
-        </div>
-
-        <div className="form-grid">
-          <label className="form-field">
-            <span className="field-label">服务地址</span>
-            <div className="select-with-button">
-              <select value={jobForm.serviceUrl} onChange={handleJobInput("serviceUrl")}>
-                <option value="">选择或新增推理地址</option>
-                {jobServiceOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
+          {artifactReports.length > 0 && (
+            <div className="artifact-reports">
+              <h4>最近校验结果</h4>
+              <ul>
+                {artifactReports.map((report) => (
+                  <li key={`${report.jobId}-${report.createdAt}`}>
+                    <div className="report-header">
+                      <span className="job-id monospace">{report.jobId}</span>
+                      <span className="report-status">
+                        匹配 {report.summary.matched} /{' '}
+                        {report.summary.totalManifest}
+                      </span>
+                      <span className="report-path">
+                        输出：{report.extractPath}
+                      </span>
+                      {report.archivePath && (
+                        <span className="report-archive">
+                          ZIP：{report.archivePath}
+                        </span>
+                      )}
+                    </div>
+                    <div className="report-details">
+                      <span>缺失 {report.summary.missing}</span>
+                      <span>多余 {report.summary.extra}</span>
+                      <span>哈希不一致 {report.summary.mismatched}</span>
+                      {report.warnings.length > 0 && (
+                        <span className="report-warning">
+                          {report.warnings[0]}
+                        </span>
+                      )}
+                    </div>
+                    {report.reportPath && (
+                      <span className="report-file">
+                        报告：{report.reportPath}
+                      </span>
+                    )}
+                  </li>
                 ))}
-              </select>
-              <button type="button" onClick={beginAddJobService}>
-                添加
-              </button>
+              </ul>
             </div>
-            {isAddingJobService && (
-              <div className="address-add-row">
-                <input
-                  type="text"
-                  value={jobAddressDraft}
-                  onChange={(event) => {
-                    setJobAddressDraft(event.currentTarget.value);
-                    if (jobAddressError) {
-                      setJobAddressError(null);
-                    }
-                  }}
-                  placeholder="http://127.0.0.1:9000"
-                  autoFocus
-                />
-                <button type="button" className="primary" onClick={confirmAddJobService}>
-                  保存
-                </button>
-                <button type="button" className="ghost" onClick={cancelAddJobService}>
-                  取消
-                </button>
-              </div>
-            )}
-            {jobAddressError && <p className="field-error">{jobAddressError}</p>}
-          </label>
+          )}
 
-          <label className="form-field">
-            <span className="field-label">Bearer Token（可选）</span>
-            <input
-              type="text"
-              value={jobForm.bearerToken}
-              onChange={handleJobInput("bearerToken")}
-              placeholder="xxxxxx"
-            />
-          </label>
-
-          <label className="form-field">
-            <span className="field-label">作品名</span>
-            <input
-              type="text"
-              value={jobForm.title}
-              onChange={handleJobInput("title")}
-              placeholder="作品名"
-            />
-          </label>
-
-          <label className="form-field compact">
-            <span className="field-label">卷名</span>
-            <input
-              type="text"
-              value={jobForm.volume}
-              onChange={handleJobInput("volume")}
-              placeholder="第 1 卷"
-            />
-          </label>
-
-          <label className="form-field compact">
-            <span className="field-label">输入类型</span>
-            <select value={jobForm.inputType} onChange={handleJobInput("inputType")}>
-              <option value="zip">Zip</option>
-              <option value="folder">Folder</option>
-            </select>
-          </label>
-
-          <label className="form-field">
-            <span className="field-label">远端输入路径</span>
-            <input
-              type="text"
-              value={jobForm.inputPath}
-              readOnly
-              aria-readonly="true"
-              onFocus={(event) => event.currentTarget.select()}
-              placeholder="上传完成后自动填充"
-              title={jobForm.inputPath || undefined}
-            />
-          </label>
-
-          <label className="form-field compact">
-            <span className="field-label">轮询间隔 (ms)</span>
-            <input
-              type="number"
-              min={250}
-              value={jobForm.pollIntervalMs}
-              onChange={handleJobInput("pollIntervalMs")}
-            />
-          </label>
-        </div>
-
-        <div className="button-row">
-          <button type="button" onClick={applyUploadContext}>
-            从上传填充
-          </button>
-          <button
-            type="button"
-            className="primary"
-            onClick={handleCreateJob}
-            disabled={jobLoading}
-          >
-            {jobLoading ? "提交中…" : "创建推理作业"}
-          </button>
-        </div>
-
-        {jobError && <p className="status status-error">{jobError}</p>}
-        {jobStatus && <p className="status status-success">{jobStatus}</p>}
-        {artifactError && <p className="status status-error">{artifactError}</p>}
-
-        {filteredJobs.length > 0 ? (
-          <div className="job-board">
-            <table className="jobs-table">
-              <thead>
-                <tr>
-                  <th className="select-col">
-                    <input
-                      type="checkbox"
-                      checked={allVisibleSelected}
-                      onChange={(event) => {
-                        if (event.currentTarget.checked) {
-                          handleSelectAllVisible();
-                        } else {
-                          handleClearSelections();
-                        }
-                      }}
-                    />
-                  </th>
-                  <th>作业 ID / 状态</th>
-                  <th>进度</th>
-                  <th>来源</th>
-                  <th>消息</th>
-                  <th>重试</th>
-                  <th>上次错误</th>
-                  <th>产物</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredJobs.map((job) => {
-                  const percent = job.total > 0 ? Math.min(100, Math.round((job.processed / job.total) * 100)) : null;
-                  return (
-                    <tr key={job.jobId}>
-                      <td className="select-col">
-                        <input
-                          type="checkbox"
-                          checked={selectedJobIds.includes(job.jobId)}
-                          onChange={() => handleToggleJobSelection(job.jobId)}
-                        />
-                      </td>
-                      <td className="job-id-cell">
-                        <span className="job-id monospace" title={job.jobId}>
-                          {job.jobId}
-                        </span>
-                        <span className={`status-chip status-${statusTone(job.status)}`}>
-                          {describeStatus(job.status)}
-                        </span>
-                      </td>
-                      <td className="progress-col">
-                        {percent !== null ? (
-                          <div className="progress-cell">
-                            <div className="progress-bar">
-                              <span style={{ width: `${percent}%` }} />
-                            </div>
-                            <span className="progress-label">
-                              {job.processed}/{job.total}（{percent}%）
-                            </span>
-                          </div>
-                        ) : (
-                          <span className="progress-label">-</span>
-                        )}
-                      </td>
-                      <td className="transport-cell">
-                        <span className="transport-badge">{describeTransport(job.transport)}</span>
-                      </td>
-                      <td className="message-cell">
-                        {job.message ? job.message : "-"}
-                      </td>
-                      <td className="retry-cell">{job.retries ?? 0}</td>
-                      <td className="error-cell">{job.lastError ?? "-"}</td>
-                      <td className="artifact-cell">
-                        {job.artifactPath ? (
-                          <div className="artifact-info">
-                            <span className="artifact-path" title={job.artifactPath}>
-                              {job.artifactPath}
-                            </span>
-                            {job.artifactHash && (
-                              <span className="artifact-hash" title={job.artifactHash}>
-                                hash: {job.artifactHash.slice(0, 8)}…
-                              </span>
-                            )}
-                          </div>
-                        ) : (
-                          "-"
-                        )}
-                      </td>
-                      <td className="actions-cell">
-                        <button type="button" onClick={() => handleResumeJob(job)}>
-                          恢复
-                        </button>
-                        <button type="button" onClick={() => handleCancelJob(job)}>
-                          终止
-                        </button>
-                        <button
-                          type="button"
-                          disabled={
-                            !job.artifactPath ||
-                            artifactDownloadBusyJob === job.jobId ||
-                            artifactValidateBusyJob === job.jobId
-                          }
-                          onClick={() => handleDownloadArtifact(job)}
-                        >
-                          {artifactDownloadBusyJob === job.jobId ? "下载中…" : "下载 ZIP"}
-                        </button>
-                        <button
-                          type="button"
-                          disabled={
-                            !job.artifactPath ||
-                            artifactValidateBusyJob === job.jobId ||
-                            artifactDownloadBusyJob === job.jobId
-                          }
-                          onClick={() => handleValidateArtifact(job)}
-                        >
-                          {artifactValidateBusyJob === job.jobId ? "校验中…" : "校验"}
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+          <div className="wizard-controls">
+            <button type="button" onClick={goToPreviousStep}>
+              上一步
+            </button>
+            <button type="button" className="ghost" onClick={resetWizardState}>
+              开始新任务
+            </button>
           </div>
-        ) : (
-          <p className="status">暂无符合条件的作业。</p>
-        )}
-
-        {hasSelection && (
-          <div className="job-batch-actions">
-            <span>已选择 {selectedJobIds.length} 个作业</span>
-            <div className="job-batch-buttons">
-              <button type="button" onClick={handleBatchResume}>
-                批量恢复
-              </button>
-              <button type="button" onClick={handleBatchCancel}>
-                批量终止
-              </button>
-              <button type="button" onClick={handleBatchDownload}>
-                批量下载 ZIP
-              </button>
-              <button type="button" onClick={handleBatchValidate}>
-                批量校验
-              </button>
-            </div>
-          </div>
-        )}
-
-        {artifactDownloads.length > 0 && (
-          <div className="artifact-downloads">
-            <h4>最近下载</h4>
-            <ul>
-              {artifactDownloads.map((summary) => (
-                <li key={`${summary.jobId}-${summary.hash}`}>
-                  <div className="report-header">
-                    <span className="job-id monospace">{summary.jobId}</span>
-                    <span className="report-status">文件数：{summary.fileCount}</span>
-                    <span className="report-path">ZIP：{summary.archivePath}</span>
-                  </div>
-                  <div className="report-details">
-                    <span>解压目录：{summary.extractPath}</span>
-                    {summary.warnings.length > 0 && (
-                      <span className="report-warning">{summary.warnings[0]}</span>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {artifactReports.length > 0 && (
-          <div className="artifact-reports">
-            <h4>最近校验结果</h4>
-            <ul>
-              {artifactReports.map((report) => (
-                <li key={`${report.jobId}-${report.createdAt}`}>
-                  <div className="report-header">
-                    <span className="job-id monospace">{report.jobId}</span>
-                    <span className="report-status">
-                      匹配 {report.summary.matched} / {report.summary.totalManifest}
-                    </span>
-                    <span className="report-path">输出：{report.extractPath}</span>
-                    {report.archivePath && (
-                      <span className="report-archive">ZIP：{report.archivePath}</span>
-                    )}
-                  </div>
-                  <div className="report-details">
-                    <span>缺失 {report.summary.missing}</span>
-                    <span>多余 {report.summary.extra}</span>
-                    <span>哈希不一致 {report.summary.mismatched}</span>
-                    {report.warnings.length > 0 && (
-                      <span className="report-warning">{report.warnings[0]}</span>
-                    )}
-                  </div>
-                  {report.reportPath && <span className="report-file">报告：{report.reportPath}</span>}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        <div className="wizard-controls">
-          <button type="button" onClick={goToPreviousStep}>
-            上一步
-          </button>
-          <button type="button" className="ghost" onClick={resetWizardState}>
-            开始新任务
-          </button>
-        </div>
-      </section>
+        </section>
       )}
     </div>
   );

@@ -11,13 +11,20 @@ use image::{DynamicImage, GenericImageView, ImageBuffer, Luma};
 use serde::{Deserialize, Serialize};
 
 mod config;
-pub use config::SplitConfig;
+pub use config::{
+    EdgeTextureThresholdOverrides, ProjectionConfig, ProjectionThresholdOverrides, SplitConfig,
+    SplitModeSelector, SplitPrimaryMode,
+};
 
 mod mask;
 pub use mask::build_foreground_mask;
 use mask::BoundingBox;
 
 mod edge_texture;
+use edge_texture::{
+    analyze_edges, EdgeTextureConfig, EdgeTextureMetrics, EdgeTextureNotes, EdgeTextureOutcome,
+    MarginRegion,
+};
 
 mod projection;
 use projection::analyze_projection;
@@ -53,6 +60,12 @@ pub struct SplitThresholdOverrides {
     pub padding_ratio: Option<f32>,
     #[serde(default)]
     pub max_center_offset_ratio: Option<f32>,
+    #[serde(default)]
+    pub edge_texture: Option<EdgeTextureThresholdOverrides>,
+    #[serde(default)]
+    pub projection: Option<ProjectionThresholdOverrides>,
+    #[serde(default)]
+    pub mode: Option<SplitModeSelector>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +156,22 @@ impl From<BoundingBox> for SplitBoundingBox {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeTextureMetadata {
+    pub split_x: Option<u32>,
+    pub confidence: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_margin: Option<MarginRegion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_margin: Option<MarginRegion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub center_band: Option<MarginRegion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<EdgeTextureMetrics>,
+    pub notes: EdgeTextureNotes,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct SplitMetadata {
@@ -170,6 +199,14 @@ pub struct SplitMetadata {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_clamped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_texture_confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_texture_threshold: Option<f32>,
+    #[serde(rename = "edgeTexture", skip_serializing_if = "Option::is_none")]
+    pub edge_texture: Option<EdgeTextureMetadata>,
+    #[serde(rename = "splitStrategy", skip_serializing_if = "Option::is_none")]
+    pub split_strategy: Option<String>,
 }
 
 impl SplitMetadata {
@@ -814,28 +851,108 @@ fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> Pro
             meta: cover_metadata,
         };
     }
+    let mut strategy_order: Vec<SplitPrimaryMode> = Vec::with_capacity(2);
+    match config.mode {
+        SplitModeSelector::EdgeTextureOnly => strategy_order.push(SplitPrimaryMode::EdgeTexture),
+        SplitModeSelector::ProjectionOnly => strategy_order.push(SplitPrimaryMode::Projection),
+        SplitModeSelector::Hybrid { primary, fallback } => {
+            strategy_order.push(primary);
+            if fallback != primary {
+                strategy_order.push(fallback);
+            }
+        }
+    }
 
-    let (split_x, confidence, fallback, projection_stats) = locate_split(&mask, config);
+    let enforce_center_offset_limit = !matches!(config.mode, SplitModeSelector::EdgeTextureOnly);
+    let force_center_split = matches!(config.mode, SplitModeSelector::EdgeTextureOnly);
 
-    let mut fallback_required = fallback || split_x.is_none();
-    let normalized_split_x = split_x.unwrap_or(width / 2);
-    let safe_split_x = normalized_split_x.clamp(1, width.saturating_sub(1).max(1));
+    let mut edge_outcome: Option<EdgeTextureOutcome> = None;
+    let mut projection_outcome: Option<projection::ProjectionOutcome> = None;
+    let mut projection_stats: Option<ProjectionStats> = None;
+    let mut selected_strategy: Option<SplitPrimaryMode> = None;
+    let mut candidate_split: Option<u32> = None;
+    let mut candidate_confidence = 0.0f32;
 
-    let (clamped_candidate, clamped) =
-        clamp_split_to_center(safe_split_x, width, config.max_center_offset_ratio);
+    for strategy in strategy_order.iter().copied() {
+        match strategy {
+            SplitPrimaryMode::EdgeTexture => {
+                if edge_outcome.is_none() {
+                    edge_outcome = Some(analyze_edges(image, config.edge_texture));
+                }
+                if let Some(outcome) = edge_outcome.as_ref() {
+                    if force_center_split {
+                        candidate_split = Some(width / 2);
+                        candidate_confidence = outcome.confidence;
+                        selected_strategy = Some(SplitPrimaryMode::EdgeTexture);
+                        break;
+                    }
+                    if let Some(split) = outcome.split_x {
+                        if outcome.confidence >= config.confidence_threshold {
+                            candidate_split = Some(split);
+                            candidate_confidence = outcome.confidence;
+                            selected_strategy = Some(SplitPrimaryMode::EdgeTexture);
+                            break;
+                        }
+                    }
+                }
+            }
+            SplitPrimaryMode::Projection => {
+                if projection_outcome.is_none() {
+                    let outcome = analyze_projection(&mask, config.projection);
+                    projection_stats = Some(ProjectionStats {
+                        imbalance: outcome.imbalance,
+                        edge_margin: outcome.edge_margin,
+                        total_mass: outcome.total_mass,
+                    });
+                    projection_outcome = Some(outcome);
+                }
+                if let Some(outcome) = projection_outcome.as_ref() {
+                    if let Some(split) = outcome.split_x {
+                        if outcome.confidence >= config.confidence_threshold {
+                            candidate_split = Some(split);
+                            candidate_confidence = outcome.confidence;
+                            selected_strategy = Some(SplitPrimaryMode::Projection);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    let mut final_split_x = if clamped {
+    let fallback_source_split = candidate_split
+        .or_else(|| {
+            projection_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.split_x)
+        })
+        .or_else(|| edge_outcome.as_ref().and_then(|outcome| outcome.split_x))
+        .unwrap_or(width / 2);
+
+    let mut fallback_required = candidate_split.is_none();
+    let safe_split_x = fallback_source_split.clamp(1, width.saturating_sub(1).max(1));
+    let (clamped_candidate, clamped_to_center) = if enforce_center_offset_limit {
+        clamp_split_to_center(safe_split_x, width, config.max_center_offset_ratio)
+    } else {
+        (safe_split_x, false)
+    };
+
+    let mut final_split_x = if enforce_center_offset_limit && clamped_to_center {
         (width / 2).clamp(1, width.saturating_sub(1).max(1))
     } else {
         clamped_candidate
     };
 
     final_split_x = final_split_x.clamp(1, width.saturating_sub(1).max(1));
-    if clamped {
+    if enforce_center_offset_limit && clamped_to_center {
         fallback_required = true;
     }
 
-    let effective_confidence = if fallback_required { 0.0 } else { confidence };
+    let effective_confidence = if fallback_required {
+        0.0
+    } else {
+        candidate_confidence
+    };
 
     let mut split_metadata = base_metadata;
     split_metadata.split_mode = Some(if fallback_required {
@@ -844,19 +961,54 @@ fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> Pro
         SplitMode::Split
     });
     split_metadata.confidence = Some(effective_confidence);
-    split_metadata.projection_imbalance = Some(projection_stats.imbalance);
-    split_metadata.projection_edge_margin = Some(projection_stats.edge_margin);
-    split_metadata.projection_total_mass = Some(projection_stats.total_mass);
-    if clamped {
+
+    if let Some(stats) = projection_stats {
+        split_metadata.projection_imbalance = Some(stats.imbalance);
+        split_metadata.projection_edge_margin = Some(stats.edge_margin);
+        split_metadata.projection_total_mass = Some(stats.total_mass);
+    }
+
+    if enforce_center_offset_limit && clamped_to_center {
         split_metadata.split_clamped = Some(true);
     }
     split_metadata.split_x = Some(final_split_x);
 
+    if let Some(outcome) = edge_outcome.as_ref() {
+        split_metadata.edge_texture_confidence = Some(outcome.confidence);
+        split_metadata.edge_texture_threshold = Some(config.edge_texture.white_threshold);
+        split_metadata.edge_texture = Some(EdgeTextureMetadata {
+            split_x: outcome.split_x,
+            confidence: outcome.confidence,
+            left_margin: outcome.left_margin,
+            right_margin: outcome.right_margin,
+            center_band: outcome.center_band,
+            metrics: Some(outcome.metrics.clone()),
+            notes: outcome.notes.clone(),
+        });
+    }
+
+    let mut split_strategy = selected_strategy.map(|strategy| match strategy {
+        SplitPrimaryMode::EdgeTexture => "edgeTexture".to_string(),
+        SplitPrimaryMode::Projection => "projection".to_string(),
+    });
+
+    if split_strategy.is_none() && fallback_required {
+        split_strategy = Some("fallbackCenter".to_string());
+    }
+
+    split_metadata.split_strategy = split_strategy;
+
     let right_region = compute_region_bbox(&mask, final_split_x, width);
     let left_region = compute_region_bbox(&mask, 0, final_split_x);
 
-    let right = crop_region_with_padding(image, &right_region, padding_x, padding_y);
-    let left = crop_region_with_padding(image, &left_region, padding_x, padding_y);
+    let mut right = crop_region_with_padding(image, &right_region, padding_x, padding_y);
+    let mut left = crop_region_with_padding(image, &left_region, padding_x, padding_y);
+
+    if force_center_split {
+        left = trim_page_with_edge_texture(left, config.edge_texture, config.confidence_threshold);
+        right =
+            trim_page_with_edge_texture(right, config.edge_texture, config.confidence_threshold);
+    }
 
     ProcessResult::Split {
         left,
@@ -873,7 +1025,7 @@ fn locate_split(
     mask: &ImageBuffer<Luma<u8>, Vec<u8>>,
     config: SplitConfig,
 ) -> (Option<u32>, f32, bool, ProjectionStats) {
-    let outcome = analyze_projection(mask, config);
+    let outcome = analyze_projection(mask, config.projection);
     let fallback = outcome.split_x.is_none() || outcome.confidence < config.confidence_threshold;
 
     (
@@ -915,6 +1067,47 @@ fn clamp_split_to_center(split_x: u32, width: u32, max_ratio: f32) -> (u32, bool
         let clamped = split_x.clamp(1, width.saturating_sub(1).max(1));
         (clamped, false)
     }
+}
+
+fn trim_page_with_edge_texture(
+    page: DynamicImage,
+    config: EdgeTextureConfig,
+    confidence_threshold: f32,
+) -> DynamicImage {
+    let width = page.width();
+    let height = page.height();
+    if width <= 1 || height == 0 {
+        return page;
+    }
+
+    let outcome = analyze_edges(&page, config);
+
+    let mut x_start = 0u32;
+    let mut x_end = width;
+
+    if let Some(left) = outcome.left_margin {
+        if left.confidence >= confidence_threshold {
+            let candidate = left.end_x.saturating_add(1).min(width);
+            if candidate < x_end {
+                x_start = x_start.max(candidate);
+            }
+        }
+    }
+
+    if let Some(right) = outcome.right_margin {
+        if right.confidence >= confidence_threshold {
+            let candidate = right.start_x.min(width);
+            if candidate > x_start {
+                x_end = x_end.min(candidate);
+            }
+        }
+    }
+
+    if x_end <= x_start || x_end - x_start < 2 {
+        return page;
+    }
+
+    page.crop_imm(x_start, 0, x_end - x_start, height)
 }
 
 fn save_image(image: &DynamicImage, target: &Path) -> Result<(), SplitError> {
@@ -1231,10 +1424,59 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_mode_records_edge_texture_metadata_on_fallback() {
+        let fixture = image::open(fixture_path("double_page_story.png")).expect("load fixture");
+        let mut config = SplitConfig::default();
+        config.confidence_threshold = 1.2; // force algorithms to fall back
+
+        let (meta, fallback) = match super::process_image(&fixture, Path::new("story.png"), config)
+        {
+            ProcessResult::Split { meta, fallback, .. } => (meta, fallback),
+            _ => panic!("expected split outcome"),
+        };
+
+        assert!(fallback, "high threshold should force fallback center");
+        assert_eq!(meta.split_strategy.as_deref(), Some("fallbackCenter"));
+        assert!(
+            meta.edge_texture.is_some(),
+            "edge texture telemetry missing"
+        );
+        assert!(
+            meta.edge_texture_confidence.is_some(),
+            "edge texture confidence should be recorded"
+        );
+        assert_eq!(
+            meta.edge_texture_threshold,
+            Some(config.edge_texture.white_threshold)
+        );
+    }
+
+    #[test]
+    fn projection_only_mode_sets_strategy_and_hides_edge_metadata() {
+        let fixture = image::open(fixture_path("double_page_story.png")).expect("load fixture");
+        let mut config = SplitConfig::default();
+        config.mode = SplitModeSelector::ProjectionOnly;
+
+        let (meta, fallback) = match super::process_image(&fixture, Path::new("story.png"), config)
+        {
+            ProcessResult::Split { meta, fallback, .. } => (meta, fallback),
+            _ => panic!("expected split outcome"),
+        };
+
+        assert!(!fallback, "projection mode should find confident split");
+        assert_eq!(meta.split_strategy.as_deref(), Some("projection"));
+        assert!(meta.edge_texture.is_none());
+        assert!(meta.edge_texture_confidence.is_none());
+        assert!(meta.edge_texture_threshold.is_none());
+    }
+
+    #[test]
     fn skip_metadata_serializes_without_split_mode() {
         let metadata = SplitMetadata::with_reason("aspect_ratio");
         let value = serde_json::to_value(&metadata).expect("serialize skip metadata");
         assert!(value.get("splitMode").is_none());
+        assert!(value.get("splitStrategy").is_none());
+        assert!(value.get("edgeTexture").is_none());
         assert_eq!(
             value.get("reason").and_then(|val| val.as_str()),
             Some("aspect_ratio")

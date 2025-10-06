@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Luma};
 
-use super::SplitConfig;
+use super::ProjectionConfig;
 
 #[derive(Debug, Clone)]
 pub struct ProjectionOutcome {
@@ -25,7 +25,7 @@ impl ProjectionOutcome {
 
 pub fn analyze_projection(
     mask: &ImageBuffer<Luma<u8>, Vec<u8>>,
-    config: SplitConfig,
+    config: ProjectionConfig,
 ) -> ProjectionOutcome {
     let (width, height) = mask.dimensions();
     if width == 0 || height == 0 {
