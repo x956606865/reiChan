@@ -8,6 +8,7 @@ use std::thread;
 
 use chrono::{SecondsFormat, Utc};
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Luma};
+use natord::compare;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -121,6 +122,16 @@ pub struct EdgePreviewResponse {
     pub confidence_threshold: f32,
     pub metrics: EdgePreviewMetrics,
     pub search_ratios: [f32; 2],
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePreviewCandidate {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
 }
 
 pub const SPLIT_PROGRESS_EVENT: &str = "doublepage-split-progress";
@@ -324,6 +335,14 @@ pub enum EdgePreviewError {
     Io(#[from] io::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum EdgePreviewListError {
+    #[error("预览目录不存在或不是文件夹: {0}")]
+    DirectoryNotFound(PathBuf),
+    #[error("读取目录失败: {0}")]
+    Io(#[from] io::Error),
+}
+
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"];
 
 fn is_supported_image(path: &Path) -> bool {
@@ -331,6 +350,53 @@ fn is_supported_image(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+pub fn list_edge_preview_candidates(
+    directory: &Path,
+) -> Result<Vec<EdgePreviewCandidate>, EdgePreviewListError> {
+    if !directory.exists() || !directory.is_dir() {
+        return Err(EdgePreviewListError::DirectoryNotFound(directory.to_path_buf()));
+    }
+
+    let root = fs::canonicalize(directory)?;
+    let mut entries: Vec<EdgePreviewCandidate> = Vec::new();
+
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        if !is_supported_image(&path) {
+            continue;
+        }
+
+        let relative_path = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace("\\", "/");
+        let file_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| relative_path.clone());
+
+        let file_size = entry.metadata().ok().map(|meta| meta.len());
+
+        entries.push(EdgePreviewCandidate {
+            path,
+            file_name,
+            relative_path,
+            file_size,
+        });
+    }
+
+    entries.sort_by(|a, b| compare(a.relative_path.as_str(), b.relative_path.as_str()));
+
+    Ok(entries)
 }
 
 fn should_descend(entry: &DirEntry) -> bool {
@@ -1339,6 +1405,8 @@ mod tests {
             brightness_thresholds: [200.0, 75.0],
             brightness_weight: None,
             white_threshold: None,
+            left_search_ratio: None,
+            right_search_ratio: None,
         };
 
         let response =
@@ -1365,11 +1433,42 @@ mod tests {
             brightness_thresholds: [80.0, 120.0],
             brightness_weight: None,
             white_threshold: None,
+            left_search_ratio: None,
+            right_search_ratio: None,
         };
 
         let err = preview_edge_texture_trim(cache_dir.path(), request)
             .expect_err("invalid thresholds should fail");
         assert!(matches!(err, EdgePreviewError::InvalidThresholds));
+    }
+
+    #[test]
+    fn list_edge_preview_candidates_returns_files() {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs")
+            .join("assets")
+            .join("manga-content-aware-split")
+            .join("phase1_input");
+        let canonical_directory =
+            fs::canonicalize(&directory).expect("canonical directory should resolve");
+
+        let entries =
+            list_edge_preview_candidates(&directory).expect("preview candidates should load");
+
+        assert!(!entries.is_empty(), "expected test fixture to contain images");
+        for entry in entries.iter() {
+            assert!(entry.path.starts_with(&canonical_directory));
+            assert!(is_supported_image(&entry.path));
+        }
+
+        let relative_paths: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect();
+        let mut sorted = relative_paths.clone();
+        sorted.sort_by(|a, b| compare(a.as_str(), b.as_str()));
+        assert_eq!(relative_paths, sorted, "entries should be natural-sorted");
     }
 
     #[test]

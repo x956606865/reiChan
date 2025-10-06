@@ -1,8 +1,7 @@
-import type { ChangeEvent } from 'react';
+import type { ChangeEvent, UIEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
 
 type RenameEntry = {
   originalName: string;
@@ -153,6 +152,29 @@ type EdgePreviewState = {
   visible: boolean;
   loading: boolean;
   data: EdgePreviewPayload | null;
+  error: string | null;
+};
+
+type EdgePreviewCandidateResponse = {
+  path: string;
+  fileName: string;
+  relativePath: string;
+  fileSize?: number | null;
+};
+
+type EdgePreviewImageEntry = {
+  path: string;
+  fileName: string;
+  relativePath: string;
+  fileSize: number | null;
+  url: string;
+};
+
+type EdgePreviewSelectorState = {
+  visible: boolean;
+  loading: boolean;
+  directory: string | null;
+  images: EdgePreviewImageEntry[];
   error: string | null;
 };
 
@@ -495,6 +517,8 @@ const SERVICE_ADDRESS_BOOK_KEY = `${SETTINGS_KEY}:service-addresses`;
 const DEFAULT_EDGE_SEARCH_RATIO = 0.18;
 const EDGE_SEARCH_RATIO_MIN = 0.02;
 const EDGE_SEARCH_RATIO_MAX = 0.5;
+const EDGE_PREVIEW_SELECTOR_ITEM_HEIGHT = 104;
+const EDGE_PREVIEW_SELECTOR_OVERSCAN = 6;
 
 const LEGACY_SETTINGS_KEY = 'manga-upscale-agent';
 const LEGACY_UPLOAD_DEFAULTS_KEY = `${LEGACY_SETTINGS_KEY}:upload-defaults`;
@@ -612,6 +636,20 @@ const MangaUpscaleAgent = () => {
     data: null,
     error: null,
   });
+  const [edgePreviewSelector, setEdgePreviewSelector] =
+    useState<EdgePreviewSelectorState>({
+      visible: false,
+      loading: false,
+      directory: null,
+      images: [],
+      error: null,
+    });
+  const edgePreviewCacheRef = useRef<Map<string, EdgePreviewImageEntry[]>>(
+    new Map()
+  );
+  const selectorListRef = useRef<HTMLDivElement | null>(null);
+  const [selectorScrollTop, setSelectorScrollTop] = useState(0);
+  const [selectorViewportHeight, setSelectorViewportHeight] = useState(400);
   const appliedBrightnessThresholds =
     edgePreview.data?.brightnessThresholds ?? edgeBrightnessThresholds;
   const requestedBrightnessThresholds =
@@ -623,6 +661,27 @@ const MangaUpscaleAgent = () => {
     edgePreview.data?.requestedSearchRatios ?? edgeSearchRatios;
   const previewSearchRatiosMatched =
     edgePreview.data?.searchRatiosMatched ?? true;
+  const selectorViewportCount = Math.max(
+    1,
+    Math.ceil(
+      selectorViewportHeight / EDGE_PREVIEW_SELECTOR_ITEM_HEIGHT
+    )
+  );
+  const selectorStartIndex = Math.max(
+    0,
+    Math.floor(selectorScrollTop / EDGE_PREVIEW_SELECTOR_ITEM_HEIGHT) -
+      EDGE_PREVIEW_SELECTOR_OVERSCAN
+  );
+  const selectorEndIndex = Math.min(
+    edgePreviewSelector.images.length,
+    selectorStartIndex + selectorViewportCount + EDGE_PREVIEW_SELECTOR_OVERSCAN * 2
+  );
+  const selectorVisibleItems = edgePreviewSelector.images.slice(
+    selectorStartIndex,
+    selectorEndIndex
+  );
+  const selectorTotalHeight =
+    edgePreviewSelector.images.length * EDGE_PREVIEW_SELECTOR_ITEM_HEIGHT;
   const computeEdgeThresholdErrors = useCallback(
     (bright: number, dark: number): EdgeThresholdErrors => {
       const next: EdgeThresholdErrors = {};
@@ -810,6 +869,13 @@ const MangaUpscaleAgent = () => {
     [handleCloseEdgePreview, resetSplitState, splitAlgorithm]
   );
 
+  const resolveRenameRoot = useCallback(() => {
+    if (sourceAnalysis?.root && sourceAnalysis.root.length > 0) {
+      return sourceAnalysis.root;
+    }
+    return renameForm.directory;
+  }, [renameForm.directory, sourceAnalysis]);
+
   const handleEdgePreview = useCallback(async () => {
     const [bright, dark] = edgeBrightnessThresholds;
     const nextErrors = computeEdgeThresholdErrors(bright, dark);
@@ -817,6 +883,7 @@ const MangaUpscaleAgent = () => {
     if (nextErrors.bright || nextErrors.dark) {
       return;
     }
+
     const [leftRatio, rightRatio] = edgeSearchRatios;
     const nextRatioErrors = computeEdgeSearchRatioErrors(leftRatio, rightRatio);
     setEdgeSearchRatioErrors(nextRatioErrors);
@@ -824,27 +891,116 @@ const MangaUpscaleAgent = () => {
       return;
     }
 
-    let selectedPath: string | null = null;
-    try {
-      const selection = await open({
-        multiple: false,
-        filters: [
-          {
-            name: '图片',
-            extensions: ['png', 'jpg', 'jpeg', 'webp', 'avif'],
-          },
-        ],
+    const root = resolveRenameRoot().trim();
+    if (!root) {
+      setEdgePreview({
+        visible: true,
+        loading: false,
+        data: null,
+        error: '请先选择有效的漫画目录。',
       });
+      return;
+    }
 
-      if (Array.isArray(selection)) {
-        selectedPath = selection[0] ?? null;
-      } else {
-        selectedPath = selection ?? null;
+    setSelectorScrollTop(0);
+    const cached = edgePreviewCacheRef.current.get(root) ?? null;
+
+    if (cached) {
+      setEdgePreviewSelector({
+        visible: true,
+        loading: false,
+        directory: root,
+        images: cached,
+        error: cached.length === 0 ? '所选目录中没有可预览的图片。' : null,
+      });
+      if (typeof window !== 'undefined') {
+        window.requestAnimationFrame(() => {
+          if (selectorListRef.current) {
+            setSelectorViewportHeight(selectorListRef.current.clientHeight);
+          }
+        });
       }
+      return;
+    }
 
-      if (!selectedPath) {
+    setEdgePreviewSelector({
+      visible: true,
+      loading: true,
+      directory: root,
+      images: [],
+      error: null,
+    });
+
+    if (typeof window !== 'undefined') {
+      window.requestAnimationFrame(() => {
+        if (selectorListRef.current) {
+          setSelectorViewportHeight(selectorListRef.current.clientHeight);
+        }
+      });
+    }
+
+    try {
+      const response = await invoke<EdgePreviewCandidateResponse[]>(
+        'list_edge_preview_candidates',
+        {
+          directory: root,
+        }
+      );
+
+      const mapped = response.map((item) => ({
+        path: item.path,
+        fileName: item.fileName,
+        relativePath: item.relativePath,
+        fileSize: item.fileSize ?? null,
+        url: convertFileSrc(item.path),
+      }));
+
+      edgePreviewCacheRef.current.set(root, mapped);
+
+      setEdgePreviewSelector({
+        visible: true,
+        loading: false,
+        directory: root,
+        images: mapped,
+        error: mapped.length === 0 ? '所选目录中没有可预览的图片。' : null,
+      });
+    } catch (error) {
+      setEdgePreviewSelector({
+        visible: true,
+        loading: false,
+        directory: root,
+        images: [],
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [
+    computeEdgeThresholdErrors,
+    edgeBrightnessThresholds,
+    computeEdgeSearchRatioErrors,
+    edgeSearchRatios,
+    resolveRenameRoot,
+  ]);
+
+  const executeEdgePreview = useCallback(
+    async (imagePath: string) => {
+      const [bright, dark] = edgeBrightnessThresholds;
+      const nextErrors = computeEdgeThresholdErrors(bright, dark);
+      setEdgeThresholdErrors(nextErrors);
+      if (nextErrors.bright || nextErrors.dark) {
         return;
       }
+
+      const [leftRatio, rightRatio] = edgeSearchRatios;
+      const nextRatioErrors = computeEdgeSearchRatioErrors(leftRatio, rightRatio);
+      setEdgeSearchRatioErrors(nextRatioErrors);
+      if (nextRatioErrors.left || nextRatioErrors.right) {
+        return;
+      }
+
+      setEdgePreviewSelector((prev) => ({
+        ...prev,
+        visible: false,
+      }));
 
       setEdgePreview((prev) => ({
         visible: true,
@@ -853,63 +1009,94 @@ const MangaUpscaleAgent = () => {
         error: null,
       }));
 
-      const response = await invoke<EdgePreviewResponsePayload>(
-        'preview_edge_texture_trim',
-        {
-          request: {
-            imagePath: selectedPath,
-            brightnessThresholds: [bright, dark],
-            brightnessWeight: 0.5,
-            whiteThreshold: 1.0,
-            leftSearchRatio: leftRatio,
-            rightSearchRatio: rightRatio,
-          },
-        }
-      );
+      try {
+        const response = await invoke<EdgePreviewResponsePayload>(
+          'preview_edge_texture_trim',
+          {
+            request: {
+              imagePath,
+              brightnessThresholds: [bright, dark],
+              brightnessWeight: 0.5,
+              whiteThreshold: 1.0,
+              leftSearchRatio: leftRatio,
+              rightSearchRatio: rightRatio,
+            },
+          }
+        );
 
-      const requestedThresholds: [number, number] = [bright, dark];
-      const appliedThresholds = response.brightnessThresholds;
-      const thresholdsMatched = appliedThresholds.every((value, index) => {
-        const expected = requestedThresholds[index];
-        return Math.abs(value - expected) <= 1e-3;
-      });
-      const requestedRatios: [number, number] = [leftRatio, rightRatio];
-      const appliedRatios = response.searchRatios;
-      const ratiosMatched = appliedRatios.every((value, index) => {
-        const expected = requestedRatios[index];
-        return Math.abs(value - expected) <= 1e-4;
-      });
+        const requestedThresholds: [number, number] = [bright, dark];
+        const appliedThresholds = response.brightnessThresholds;
+        const thresholdsMatched = appliedThresholds.every((value, index) => {
+          const expected = requestedThresholds[index];
+          return Math.abs(value - expected) <= 1e-3;
+        });
+        const requestedRatios: [number, number] = [leftRatio, rightRatio];
+        const appliedRatios = response.searchRatios;
+        const ratiosMatched = appliedRatios.every((value, index) => {
+          const expected = requestedRatios[index];
+          return Math.abs(value - expected) <= 1e-4;
+        });
 
-      const payload: EdgePreviewPayload = {
-        ...response,
-        originalUrl: convertFileSrc(response.originalImage),
-        trimmedUrl: convertFileSrc(response.trimmedImage),
-        requestedBrightnessThresholds: requestedThresholds,
-        thresholdsMatched,
-        requestedSearchRatios: requestedRatios,
-        searchRatiosMatched: ratiosMatched,
-      };
+        const payload: EdgePreviewPayload = {
+          ...response,
+          originalUrl: convertFileSrc(response.originalImage),
+          trimmedUrl: convertFileSrc(response.trimmedImage),
+          requestedBrightnessThresholds: requestedThresholds,
+          thresholdsMatched,
+          requestedSearchRatios: requestedRatios,
+          searchRatiosMatched: ratiosMatched,
+        };
 
-      setEdgePreview({
-        visible: true,
-        loading: false,
-        data: payload,
-        error: null,
-      });
-    } catch (error) {
-      setEdgePreview({
-        visible: true,
-        loading: false,
-        data: null,
-        error: error instanceof Error ? error.message : String(error),
-      });
+        setEdgePreview({
+          visible: true,
+          loading: false,
+          data: payload,
+          error: null,
+        });
+      } catch (error) {
+        setEdgePreview({
+          visible: true,
+          loading: false,
+          data: null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, [
+      computeEdgeThresholdErrors,
+      edgeBrightnessThresholds,
+      edgeSearchRatios,
+      computeEdgeSearchRatioErrors,
+    ]
+  );
+
+  const handleCloseEdgePreviewSelector = useCallback(() => {
+    setEdgePreviewSelector((prev) => ({ ...prev, visible: false }));
+  }, []);
+
+  const handleSelectorScroll = useCallback(
+    (event: UIEvent<HTMLDivElement>) => {
+      setSelectorScrollTop(event.currentTarget.scrollTop);
+      setSelectorViewportHeight(event.currentTarget.clientHeight);
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!edgePreviewSelector.visible) {
+      return;
     }
-  }, [
-    computeEdgeThresholdErrors,
-    edgeBrightnessThresholds,
-    edgeSearchRatios,
-    computeEdgeSearchRatioErrors,
-  ]);
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const raf = window.requestAnimationFrame(() => {
+      if (selectorListRef.current) {
+        setSelectorViewportHeight(selectorListRef.current.clientHeight);
+      }
+    });
+    return () => {
+      window.cancelAnimationFrame(raf);
+    };
+  }, [edgePreviewSelector.visible]);
 
   const resetWizardState = useCallback(() => {
     setCurrentStep('source');
@@ -1774,13 +1961,6 @@ const MangaUpscaleAgent = () => {
       analyzeDirectory(first);
     }
   }, [analyzeDirectory]);
-
-  const resolveRenameRoot = useCallback(() => {
-    if (sourceAnalysis?.root && sourceAnalysis.root.length > 0) {
-      return sourceAnalysis.root;
-    }
-    return renameForm.directory;
-  }, [renameForm.directory, sourceAnalysis]);
 
   const ensureSplitWorkspace = useCallback(
     async (overwrite = false): Promise<RenameSplitPayload | null> => {
@@ -5110,6 +5290,93 @@ const MangaUpscaleAgent = () => {
             </button>
           </div>
         </section>
+      )}
+
+      {edgePreviewSelector.visible && (
+        <div className="edge-preview-backdrop" role="dialog" aria-modal="true">
+          <div className="edge-preview-dialog selector">
+            <header className="edge-preview-header">
+              <h3>选择预览图片</h3>
+              {edgePreviewSelector.directory && (
+                <p title={edgePreviewSelector.directory}>
+                  当前目录：{edgePreviewSelector.directory}
+                </p>
+              )}
+            </header>
+
+            {edgePreviewSelector.loading && (
+              <p className="status status-tip">正在加载目录图片…</p>
+            )}
+
+            {!edgePreviewSelector.loading && edgePreviewSelector.error && (
+              <p className="status status-error">{edgePreviewSelector.error}</p>
+            )}
+
+            {!edgePreviewSelector.loading &&
+              !edgePreviewSelector.error &&
+              edgePreviewSelector.images.length === 0 && (
+                <p className="status status-tip">
+                  所选目录没有可预览的图片，请确认目录内包含支持的格式。
+                </p>
+              )}
+
+            {!edgePreviewSelector.loading &&
+              !edgePreviewSelector.error &&
+              edgePreviewSelector.images.length > 0 && (
+                <>
+                  <p className="status status-tip">点击下方图片以生成阈值预览。</p>
+                  <div
+                    className="edge-preview-selector-list"
+                    ref={selectorListRef}
+                    onScroll={handleSelectorScroll}
+                    role="listbox"
+                    aria-label="可预览图片列表"
+                  >
+                    <div
+                      className="edge-preview-selector-virtual"
+                      style={{ height: selectorTotalHeight }}
+                    >
+                      {selectorVisibleItems.map((item, index) => {
+                        const actualIndex = selectorStartIndex + index;
+                        return (
+                          <button
+                            type="button"
+                            key={item.path}
+                            className="edge-preview-selector-item"
+                            style={{
+                              top:
+                                actualIndex * EDGE_PREVIEW_SELECTOR_ITEM_HEIGHT,
+                            }}
+                            onClick={() => executeEdgePreview(item.path)}
+                          >
+                            <img
+                              src={item.url}
+                              alt={item.fileName}
+                              loading="lazy"
+                            />
+                            <span className="edge-preview-selector-name">
+                              {item.relativePath}
+                            </span>
+                            {typeof item.fileSize === 'number' && (
+                              <span className="edge-preview-selector-meta">
+                                {(item.fileSize / 1024 / 1024).toFixed(2)} MB
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              )}
+
+            <div className="edge-preview-actions">
+              <button type="button" onClick={handleCloseEdgePreviewSelector}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {edgePreview.visible && (

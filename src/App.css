@@ -471,6 +471,71 @@ body {
   gap: 12px;
 }
 
+.edge-preview-dialog.selector {
+  width: min(760px, 94vw);
+}
+
+.edge-preview-selector-list {
+  position: relative;
+  overflow-y: auto;
+  max-height: min(420px, 60vh);
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(248, 250, 252, 0.85);
+}
+
+.edge-preview-selector-virtual {
+  position: relative;
+}
+
+.edge-preview-selector-item {
+  position: absolute;
+  left: 0;
+  right: 0;
+  margin: 8px;
+  height: 88px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 14px;
+  background: #ffffff;
+  border: 1px solid transparent;
+  box-shadow: 0 10px 20px rgba(15, 23, 42, 0.08);
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.edge-preview-selector-item:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 28px rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.45);
+}
+
+.edge-preview-selector-item img {
+  width: 80px;
+  height: 80px;
+  object-fit: cover;
+  border-radius: 12px;
+  background: #f1f5f9;
+}
+
+.edge-preview-selector-name {
+  flex: 1;
+  text-align: left;
+  font-size: 0.95rem;
+  color: #0f172a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.edge-preview-selector-meta {
+  font-size: 0.8rem;
+  color: #64748b;
+}
+
 .kill-dialog h3 {
   margin: 0;
   font-size: 1.35rem;

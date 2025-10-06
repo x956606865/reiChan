@@ -165,6 +165,13 @@ fn preview_edge_texture_trim(
 }
 
 #[tauri::command]
+fn list_edge_preview_candidates(
+    directory: PathBuf,
+) -> Result<Vec<doublepage::EdgePreviewCandidate>, String> {
+    doublepage::list_edge_preview_candidates(&directory).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn analyze_manga_directory(directory: PathBuf) -> Result<manga::MangaSourceAnalysis, String> {
     manga::analyze_manga_directory(directory).map_err(|err| err.to_string())
 }
@@ -789,6 +796,7 @@ pub fn run() {
             analyze_manga_directory,
             prepare_doublepage_split,
             preview_edge_texture_trim,
+            list_edge_preview_candidates,
             rename_manga_sequence,
             upload_copyparty,
             create_manga_job,
