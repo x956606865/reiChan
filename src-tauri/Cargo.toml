@@ -44,6 +44,9 @@ csv = "1"
 rquickjs = "0.9"
 thiserror = "1"
 lru = "0.12"
+wgpu = { version = "0.19", features = ["wgsl"], optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1.15", features = ["derive"], optional = true }
 
 [dev-dependencies]
 httpmock = "0.7"
@@ -52,3 +55,9 @@ httpmock = "0.7"
 default = ["notion-sqlite", "notion-http"]
 notion-sqlite = []
 notion-http = []
+edge-texture-gpu = ["wgpu", "pollster", "bytemuck"]
+
+[[example]]
+name = "edge_texture_gpu"
+path = "examples/edge_texture_gpu.rs"
+required-features = ["edge-texture-gpu"]
