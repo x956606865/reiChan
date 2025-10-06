@@ -113,9 +113,24 @@ type EdgePreviewMetrics = {
   meanIntensityAvg: number;
 };
 
+type EdgePreviewMode = 'split' | 'coverTrim' | 'skip';
+
+type EdgePreviewOutputRole = 'left' | 'right' | 'coverTrim';
+
+type EdgePreviewOutputResponse = {
+  path: string;
+  role: EdgePreviewOutputRole;
+};
+
+type EdgePreviewOutput = EdgePreviewOutputResponse & {
+  url: string;
+};
+
 type EdgePreviewResponsePayload = {
   originalImage: string;
-  trimmedImage: string;
+  trimmedImage?: string | null;
+  outputs: EdgePreviewOutputResponse[];
+  mode: EdgePreviewMode;
   leftMargin?: EdgeMarginRegion | null;
   rightMargin?: EdgeMarginRegion | null;
   brightnessThresholds: [number, number];
@@ -125,9 +140,20 @@ type EdgePreviewResponsePayload = {
   searchRatios: [number, number];
 };
 
-type EdgePreviewPayload = EdgePreviewResponsePayload & {
+type EdgePreviewPayload = {
+  originalImage: string;
   originalUrl: string;
-  trimmedUrl: string;
+  trimmedImage?: string | null;
+  trimmedUrl: string | null;
+  outputs: EdgePreviewOutput[];
+  mode: EdgePreviewMode;
+  leftMargin?: EdgeMarginRegion | null;
+  rightMargin?: EdgeMarginRegion | null;
+  brightnessThresholds: [number, number];
+  brightnessWeight: number;
+  confidenceThreshold: number;
+  metrics: EdgePreviewMetrics;
+  searchRatios: [number, number];
   requestedBrightnessThresholds: [number, number];
   thresholdsMatched: boolean;
   requestedSearchRatios: [number, number];
@@ -146,6 +172,12 @@ const formatRatioValue = (value: number): string => {
     return '—';
   }
   return value.toFixed(3);
+};
+
+const EDGE_PREVIEW_OUTPUT_LABELS: Record<EdgePreviewOutputRole, string> = {
+  left: '左页',
+  right: '右页',
+  coverTrim: '裁剪结果',
 };
 
 type EdgePreviewState = {
@@ -1037,10 +1069,28 @@ const MangaUpscaleAgent = () => {
           return Math.abs(value - expected) <= 1e-4;
         });
 
+        const trimmedUrl = response.trimmedImage
+          ? convertFileSrc(response.trimmedImage)
+          : null;
+        const outputs: EdgePreviewOutput[] = response.outputs.map((item) => ({
+          ...item,
+          url: convertFileSrc(item.path),
+        }));
+
         const payload: EdgePreviewPayload = {
-          ...response,
+          originalImage: response.originalImage,
           originalUrl: convertFileSrc(response.originalImage),
-          trimmedUrl: convertFileSrc(response.trimmedImage),
+          trimmedImage: response.trimmedImage ?? null,
+          trimmedUrl,
+          outputs,
+          mode: response.mode,
+          leftMargin: response.leftMargin ?? null,
+          rightMargin: response.rightMargin ?? null,
+          brightnessThresholds: response.brightnessThresholds,
+          brightnessWeight: response.brightnessWeight,
+          confidenceThreshold: response.confidenceThreshold,
+          metrics: response.metrics,
+          searchRatios: response.searchRatios,
           requestedBrightnessThresholds: requestedThresholds,
           thresholdsMatched,
           requestedSearchRatios: requestedRatios,
@@ -5424,111 +5474,133 @@ const MangaUpscaleAgent = () => {
                 </p>
               )}
             </header>
+            <div className="edge-preview-body">
+              {edgePreview.loading && (
+                <p className="status status-tip">正在生成预览…</p>
+              )}
 
-            {edgePreview.loading && (
-              <p className="status status-tip">正在生成预览…</p>
-            )}
+              {!edgePreview.loading && edgePreview.error && (
+                <p className="status status-error">{edgePreview.error}</p>
+              )}
 
-            {!edgePreview.loading && edgePreview.error && (
-              <p className="status status-error">{edgePreview.error}</p>
-            )}
-
-            {!edgePreview.loading && !edgePreview.error && edgePreview.data && (
-              <>
-                <div className="edge-preview-images">
-                  <figure>
-                    <img
-                      src={edgePreview.data.originalUrl}
-                      alt="原图预览"
-                    />
-                    <figcaption>原图</figcaption>
-                  </figure>
-                  <figure>
-                    <img
-                      src={edgePreview.data.trimmedUrl}
-                      alt="裁剪结果预览"
-                    />
-                    <figcaption>裁剪结果</figcaption>
-                  </figure>
-                </div>
-
-                <div className="edge-preview-metrics">
-                  <dl>
-                    <div>
-                      <dt>请求阈值</dt>
-                      <dd>
-                        亮白 {formatThresholdValue(requestedBrightnessThresholds[0])}，留黑{' '}
-                        {formatThresholdValue(requestedBrightnessThresholds[1])}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>实际阈值</dt>
-                      <dd>
-                        亮白 {formatThresholdValue(appliedBrightnessThresholds[0])}，留黑{' '}
-                        {formatThresholdValue(appliedBrightnessThresholds[1])}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>请求搜索比例</dt>
-                      <dd>
-                        左 {formatRatioValue(requestedSearchRatios[0])}，右{' '}
-                        {formatRatioValue(requestedSearchRatios[1])}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>实际搜索比例</dt>
-                      <dd>
-                        左 {formatRatioValue(appliedSearchRatios[0])}，右{' '}
-                        {formatRatioValue(appliedSearchRatios[1])}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>图像尺寸</dt>
-                      <dd>
-                        {edgePreview.data.metrics.width} ×{' '}
-                        {edgePreview.data.metrics.height}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>亮度均值</dt>
-                      <dd>
-                        {edgePreview.data.metrics.meanIntensityAvg.toFixed(2)}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>亮度范围</dt>
-                      <dd>
-                        {edgePreview.data.metrics.meanIntensityMin.toFixed(2)} ~{' '}
-                        {edgePreview.data.metrics.meanIntensityMax.toFixed(2)}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>置信阈值</dt>
-                      <dd>{edgePreview.data.confidenceThreshold.toFixed(2)}</dd>
-                    </div>
-                    <div>
-                      <dt>亮度权重</dt>
-                      <dd>{edgePreview.data.brightnessWeight.toFixed(2)}</dd>
-                    </div>
-                  </dl>
-
-                  <div className="edge-preview-notes">
-                    {edgePreview.data.leftMargin && (
-                      <span>
-                        左侧置信度：
-                        {edgePreview.data.leftMargin.confidence.toFixed(3)}
-                      </span>
-                    )}
-                    {edgePreview.data.rightMargin && (
-                      <span>
-                        右侧置信度：
-                        {edgePreview.data.rightMargin.confidence.toFixed(3)}
-                      </span>
-                    )}
+              {!edgePreview.loading && !edgePreview.error && edgePreview.data && (
+                <>
+                  <div className="edge-preview-images">
+                    <figure>
+                      <img
+                        src={edgePreview.data.originalUrl}
+                        alt="原图预览"
+                      />
+                      <figcaption>原图</figcaption>
+                    </figure>
+                    {edgePreview.data.outputs.map((output) => {
+                      const label = EDGE_PREVIEW_OUTPUT_LABELS[output.role];
+                      return (
+                        <figure key={output.path}>
+                          <img
+                            src={output.url}
+                            alt={`处理结果预览 - ${label}`}
+                          />
+                          <figcaption>{label}</figcaption>
+                        </figure>
+                      );
+                    })}
                   </div>
-                </div>
-              </>
-            )}
+
+                  {edgePreview.data.mode === 'split' && (
+                    <p className="status status-tip">
+                      已生成左右两页预览，可直接对比最终拆分成品。
+                    </p>
+                  )}
+                  {edgePreview.data.mode === 'coverTrim' && (
+                    <p className="status status-tip">
+                      当前页面判定为封面裁剪，展示单页裁剪结果。
+                    </p>
+                  )}
+                  {edgePreview.data.mode === 'skip' && (
+                    <p className="status status-warning">
+                      未识别出有效的拆分区域，请尝试调整阈值或选择其他图片。
+                    </p>
+                  )}
+
+                  <div className="edge-preview-metrics">
+                    <dl>
+                      <div>
+                        <dt>请求阈值</dt>
+                        <dd>
+                          亮白 {formatThresholdValue(requestedBrightnessThresholds[0])}，留黑{' '}
+                          {formatThresholdValue(requestedBrightnessThresholds[1])}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>实际阈值</dt>
+                        <dd>
+                          亮白 {formatThresholdValue(appliedBrightnessThresholds[0])}，留黑{' '}
+                          {formatThresholdValue(appliedBrightnessThresholds[1])}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>请求搜索比例</dt>
+                        <dd>
+                          左 {formatRatioValue(requestedSearchRatios[0])}，右{' '}
+                          {formatRatioValue(requestedSearchRatios[1])}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>实际搜索比例</dt>
+                        <dd>
+                          左 {formatRatioValue(appliedSearchRatios[0])}，右{' '}
+                          {formatRatioValue(appliedSearchRatios[1])}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>图像尺寸</dt>
+                        <dd>
+                          {edgePreview.data.metrics.width} ×{' '}
+                          {edgePreview.data.metrics.height}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>亮度均值</dt>
+                        <dd>
+                          {edgePreview.data.metrics.meanIntensityAvg.toFixed(2)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>亮度范围</dt>
+                        <dd>
+                          {edgePreview.data.metrics.meanIntensityMin.toFixed(2)} ~{' '}
+                          {edgePreview.data.metrics.meanIntensityMax.toFixed(2)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>置信阈值</dt>
+                        <dd>{edgePreview.data.confidenceThreshold.toFixed(2)}</dd>
+                      </div>
+                      <div>
+                        <dt>亮度权重</dt>
+                        <dd>{edgePreview.data.brightnessWeight.toFixed(2)}</dd>
+                      </div>
+                    </dl>
+
+                    <div className="edge-preview-notes">
+                      {edgePreview.data.leftMargin && (
+                        <span>
+                          左侧置信度：
+                          {edgePreview.data.leftMargin.confidence.toFixed(3)}
+                        </span>
+                      )}
+                      {edgePreview.data.rightMargin && (
+                        <span>
+                          右侧置信度：
+                          {edgePreview.data.rightMargin.confidence.toFixed(3)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
 
             <div className="edge-preview-actions">
               <button

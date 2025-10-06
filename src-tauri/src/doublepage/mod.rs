@@ -110,11 +110,38 @@ pub struct EdgePreviewMetrics {
     pub mean_intensity_avg: f32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EdgePreviewMode {
+    Split,
+    CoverTrim,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EdgePreviewOutputRole {
+    Left,
+    Right,
+    CoverTrim,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePreviewOutput {
+    pub path: PathBuf,
+    pub role: EdgePreviewOutputRole,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EdgePreviewResponse {
     pub original_image: PathBuf,
-    pub trimmed_image: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trimmed_image: Option<PathBuf>,
+    #[serde(default)]
+    pub outputs: Vec<EdgePreviewOutput>,
+    pub mode: EdgePreviewMode,
     pub left_margin: Option<MarginRegion>,
     pub right_margin: Option<MarginRegion>,
     pub brightness_thresholds: [f32; 2],
@@ -1263,53 +1290,84 @@ pub fn preview_edge_texture_trim(
         fs::canonicalize(&request.image_path).map_err(|_| EdgePreviewError::UnsupportedImage)?;
     let image = image::open(&canonical_image_path)?;
 
-    let mut overrides = EdgeTextureThresholdOverrides::default();
-    overrides.brightness_thresholds = Some([bright, dark]);
+    let mut edge_overrides = EdgeTextureThresholdOverrides::default();
+    edge_overrides.brightness_thresholds = Some([bright, dark]);
     if let Some(weight) = request.brightness_weight {
-        overrides.brightness_weight = Some(weight.clamp(0.0, 1.0));
+        edge_overrides.brightness_weight = Some(weight.clamp(0.0, 1.0));
     } else {
-        overrides.brightness_weight = Some(0.5);
+        edge_overrides.brightness_weight = Some(0.5);
     }
     if let Some(white_threshold) = request.white_threshold {
-        overrides.white_threshold = Some(white_threshold);
+        edge_overrides.white_threshold = Some(white_threshold);
     }
     if let Some(left_ratio) = request.left_search_ratio {
-        overrides.left_search_ratio = Some(left_ratio.clamp(0.0, 0.5));
+        edge_overrides.left_search_ratio = Some(left_ratio.clamp(0.0, 0.5));
     }
     if let Some(right_ratio) = request.right_search_ratio {
-        overrides.right_search_ratio = Some(right_ratio.clamp(0.0, 0.5));
+        edge_overrides.right_search_ratio = Some(right_ratio.clamp(0.0, 0.5));
     }
 
-    let split_config = SplitConfig::default();
+    let split_overrides = SplitThresholdOverrides {
+        cover_content_ratio: None,
+        confidence_threshold: None,
+        edge_exclusion_ratio: None,
+        min_foreground_ratio: None,
+        padding_ratio: None,
+        max_center_offset_ratio: None,
+        edge_texture: Some(edge_overrides),
+        projection: None,
+        mode: Some(SplitModeSelector::EdgeTextureOnly),
+    };
+
+    let split_config = SplitConfig::default().with_overrides(&split_overrides);
+    let config_edge = split_config.edge_texture;
+    let brightness_weight = config_edge.brightness_weight;
+    let search_ratios = [config_edge.left_search_ratio, config_edge.right_search_ratio];
     let confidence_threshold = split_config.confidence_threshold;
-    let padding_ratio = split_config.padding_ratio;
-    let config = EdgeTextureConfig::default().apply_overrides(&overrides);
-    let brightness_weight = config.brightness_weight;
-    let search_ratios = [config.left_search_ratio, config.right_search_ratio];
-    let outcome = analyze_edges(&image, config);
+
+    let outcome = analyze_edges(&image, config_edge);
 
     let width = image.width();
     let height = image.height();
-    let trimmed = match compute_trim_bounds(&outcome, width, confidence_threshold) {
-        Some((start, end)) if end > start && end - start < width => {
-            let padding_x = (padding_ratio * width as f32).max(1.0) as u32;
-            let padded_start = start.saturating_sub(padding_x);
-            let padded_end = (end + padding_x).min(width);
-            if padded_end > padded_start {
-                image.crop_imm(padded_start, 0, padded_end - padded_start, height)
-            } else {
-                image.clone()
-            }
-        }
-        _ => image.clone(),
-    };
 
     let preview_dir = cache_root.join("edge-preview");
     fs::create_dir_all(&preview_dir)?;
-    let file_name = format!("edge-preview-{}.png", Utc::now().format("%Y%m%d%H%M%S%3f"));
-    let trimmed_path = preview_dir.join(file_name);
-    trimmed.save_with_format(&trimmed_path, ImageFormat::Png)?;
-    let trimmed_path = fs::canonicalize(trimmed_path)?;
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f");
+
+    let mut trimmed_image: Option<PathBuf> = None;
+    let mut outputs: Vec<EdgePreviewOutput> = Vec::new();
+
+    let mode = match process_image(&image, &canonical_image_path, split_config) {
+        ProcessResult::Split { left, right, .. } => {
+            let left_path = preview_dir.join(format!("edge-preview-{}-left.png", timestamp));
+            let right_path = preview_dir.join(format!("edge-preview-{}-right.png", timestamp));
+            left.save_with_format(&left_path, ImageFormat::Png)?;
+            right.save_with_format(&right_path, ImageFormat::Png)?;
+            let left_path = fs::canonicalize(left_path)?;
+            let right_path = fs::canonicalize(right_path)?;
+            outputs.push(EdgePreviewOutput {
+                path: left_path.clone(),
+                role: EdgePreviewOutputRole::Left,
+            });
+            outputs.push(EdgePreviewOutput {
+                path: right_path.clone(),
+                role: EdgePreviewOutputRole::Right,
+            });
+            EdgePreviewMode::Split
+        }
+        ProcessResult::CoverTrim { image: trimmed, .. } => {
+            let trimmed_path = preview_dir.join(format!("edge-preview-{}-trim.png", timestamp));
+            trimmed.save_with_format(&trimmed_path, ImageFormat::Png)?;
+            let trimmed_path = fs::canonicalize(trimmed_path)?;
+            outputs.push(EdgePreviewOutput {
+                path: trimmed_path.clone(),
+                role: EdgePreviewOutputRole::CoverTrim,
+            });
+            trimmed_image = Some(trimmed_path);
+            EdgePreviewMode::CoverTrim
+        }
+        ProcessResult::Skip { .. } => EdgePreviewMode::Skip,
+    };
 
     let mean_values = &outcome.metrics.mean_intensity;
     let (min_intensity, max_intensity, avg_intensity) = if mean_values.is_empty() {
@@ -1328,7 +1386,9 @@ pub fn preview_edge_texture_trim(
 
     let response = EdgePreviewResponse {
         original_image: canonical_image_path,
-        trimmed_image: trimmed_path,
+        trimmed_image,
+        outputs,
+        mode,
         left_margin: outcome.left_margin,
         right_margin: outcome.right_margin,
         brightness_thresholds: [bright, dark],
@@ -1398,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_generates_trimmed_image() {
+    fn preview_generates_split_outputs() {
         let cache_dir = TempDir::new().expect("cache dir");
         let request = EdgePreviewRequest {
             image_path: fixture_path("double_page_story.png"),
@@ -1412,14 +1472,22 @@ mod tests {
         let response =
             preview_edge_texture_trim(cache_dir.path(), request).expect("preview should succeed");
 
-        assert!(response.trimmed_image.exists());
+        assert_eq!(response.mode, EdgePreviewMode::Split);
+        assert!(response.trimmed_image.is_none());
+        assert_eq!(response.outputs.len(), 2);
+        assert!(response
+            .outputs
+            .iter()
+            .any(|output| output.role == EdgePreviewOutputRole::Left));
+        assert!(response
+            .outputs
+            .iter()
+            .any(|output| output.role == EdgePreviewOutputRole::Right));
+        for output in response.outputs.iter() {
+            assert!(output.path.exists());
+        }
         let (orig_width, orig_height) =
             image::image_dimensions(&response.original_image).expect("original dimensions");
-        let (trim_width, _) =
-            image::image_dimensions(&response.trimmed_image).expect("trimmed dimensions");
-
-        assert!(trim_width > 0);
-        assert!(trim_width <= orig_width);
         assert_eq!(response.brightness_thresholds, [200.0, 75.0]);
         assert_eq!(response.metrics.width, orig_width);
         assert_eq!(response.metrics.height, orig_height);
