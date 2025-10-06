@@ -156,12 +156,18 @@ async fn prepare_doublepage_split(
 }
 
 #[tauri::command]
-fn preview_edge_texture_trim(
+async fn preview_edge_texture_trim(
     app: tauri::AppHandle,
     request: doublepage::EdgePreviewRequest,
 ) -> Result<doublepage::EdgePreviewResponse, String> {
     let cache_root = app.path().app_cache_dir().map_err(|err| err.to_string())?;
-    doublepage::preview_edge_texture_trim(&cache_root, request).map_err(|err| err.to_string())
+
+    async_runtime::spawn_blocking(move || {
+        doublepage::preview_edge_texture_trim(&cache_root, request)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]

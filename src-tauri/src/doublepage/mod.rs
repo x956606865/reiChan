@@ -1,13 +1,20 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Luma};
+use image::{
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType,
+    DynamicImage, ExtendedColorType, GenericImageView, ImageBuffer, ImageEncoder, Luma,
+};
+use lru::LruCache;
 use natord::compare;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -98,6 +105,14 @@ pub struct EdgePreviewRequest {
     pub left_search_ratio: Option<f32>,
     #[serde(default)]
     pub right_search_ratio: Option<f32>,
+    #[serde(default = "EdgePreviewRequest::default_prefer_downsample_preview")]
+    pub prefer_downsample_preview: bool,
+}
+
+impl EdgePreviewRequest {
+    fn default_prefer_downsample_preview() -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +164,316 @@ pub struct EdgePreviewResponse {
     pub confidence_threshold: f32,
     pub metrics: EdgePreviewMetrics,
     pub search_ratios: [f32; 2],
+}
+
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePreviewTiming {
+    pub stage_load: Duration,
+    pub stage_prepare: Duration,
+    pub stage_analyze: Duration,
+    pub stage_render: Duration,
+    pub stage_encode: Duration,
+    pub cache_hit: bool,
+    pub downsample_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downsample_scale: Option<f32>,
+    pub downsample_fallback: bool,
+}
+
+impl Default for EdgePreviewTiming {
+    fn default() -> Self {
+        Self {
+            stage_load: Duration::default(),
+            stage_prepare: Duration::default(),
+            stage_analyze: Duration::default(),
+            stage_render: Duration::default(),
+            stage_encode: Duration::default(),
+            cache_hit: false,
+            downsample_applied: false,
+            downsample_scale: None,
+            downsample_fallback: false,
+        }
+    }
+}
+
+const EDGE_PREVIEW_CACHE_LIMIT_ENV: &str = "EDGE_PREVIEW_CACHE_LIMIT";
+const EDGE_PREVIEW_CACHE_DEFAULT_CAPACITY: usize = 3;
+const EDGE_PREVIEW_DOWNSAMPLE_TARGET_WIDTH: u32 = 2048;
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct EdgePreviewSession {
+    pub original_path: PathBuf,
+    pub image: Arc<DynamicImage>,
+    pub downsample: Option<EdgePreviewDownsample>,
+    pub downsample_attempted: bool,
+    pub outcome: Arc<EdgeTextureOutcome>,
+    pub config: EdgeTextureConfig,
+    pub created_at: Instant,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct EdgePreviewDownsample {
+    pub image: Arc<DynamicImage>,
+    pub scale: f32,
+}
+
+fn downsample_for_preview(image: &DynamicImage, target_width: u32) -> Option<(DynamicImage, f32)> {
+    let width = image.width();
+    if target_width == 0 || width <= target_width {
+        return None;
+    }
+
+    let scale = target_width as f32 / width as f32;
+    if scale <= 0.0 {
+        return None;
+    }
+
+    let target_height = ((image.height() as f32) * scale).round().max(1.0) as u32;
+    if target_height == 0 {
+        return None;
+    }
+
+    let resized = image.resize_exact(target_width, target_height, FilterType::Triangle);
+    Some((resized, scale))
+}
+
+fn upscale_coordinate(value: u32, scale: f32, limit: u32) -> Result<u32, ()> {
+    if scale <= 0.0 {
+        return Err(());
+    }
+
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        return Ok(value.min(limit));
+    }
+
+    let mapped = (value as f32 / scale).round();
+    if !mapped.is_finite() {
+        return Err(());
+    }
+
+    let mapped_clamped = mapped.clamp(0.0, limit as f32);
+    let mapped_value = mapped_clamped as u32;
+
+    let restored = (mapped_value as f32 * scale).round();
+    if (restored - value as f32).abs() > 1.0 {
+        return Err(());
+    }
+
+    Ok(mapped_value)
+}
+
+fn upscale_region(start: u32, end: u32, scale: f32, width: u32) -> Result<(u32, u32), ()> {
+    if start > end {
+        return Err(());
+    }
+
+    if scale <= 0.0 {
+        return Err(());
+    }
+
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        let max_index = width.saturating_sub(1);
+        return Ok((start.min(max_index), end.min(max_index)));
+    }
+
+    let start_edge = (start as f32) / scale;
+    let end_edge = ((end + 1) as f32) / scale;
+    if !start_edge.is_finite() || !end_edge.is_finite() {
+        return Err(());
+    }
+
+    let mapped_start = start_edge.round().clamp(0.0, width as f32);
+    let mut mapped_end_edge = end_edge.round().clamp(0.0, (width + 1) as f32);
+
+    if mapped_end_edge <= mapped_start {
+        mapped_end_edge = (mapped_start + 1.0).min((width + 1) as f32);
+    }
+
+    let mapped_start_u = mapped_start as u32;
+    let mapped_end_edge_u = mapped_end_edge as u32;
+    let mapped_end_u = mapped_end_edge_u
+        .saturating_sub(1)
+        .min(width.saturating_sub(1));
+
+    let restored_start = (mapped_start_u as f32 * scale).round();
+    let restored_end_edge = ((mapped_end_u + 1) as f32 * scale).round();
+
+    if (restored_start - start as f32).abs() > 1.0
+        || (restored_end_edge - (end + 1) as f32).abs() > 1.0
+    {
+        return Err(());
+    }
+
+    Ok((mapped_start_u.min(width.saturating_sub(1)), mapped_end_u))
+}
+
+fn upscale_margin(
+    margin: Option<MarginRegion>,
+    scale: f32,
+    width: u32,
+) -> Result<Option<MarginRegion>, ()> {
+    let Some(margin) = margin else {
+        return Ok(None);
+    };
+
+    let (start, end) = upscale_region(margin.start_x, margin.end_x, scale, width)?;
+
+    Ok(Some(MarginRegion {
+        start_x: start,
+        end_x: end,
+        mean_score: margin.mean_score,
+        confidence: margin.confidence,
+    }))
+}
+
+fn upscale_notes(notes: EdgeTextureNotes, scale: f32, width: u32) -> Result<EdgeTextureNotes, ()> {
+    if scale <= 0.0 {
+        return Err(());
+    }
+
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        return Ok(notes);
+    }
+
+    let mut updated = notes;
+    updated.left_limit = upscale_coordinate(updated.left_limit, scale, width)?;
+    updated.right_start = upscale_coordinate(updated.right_start, scale, width)?;
+    updated.center_start = upscale_coordinate(updated.center_start, scale, width)?;
+    updated.center_end = upscale_coordinate(updated.center_end, scale, width)?;
+
+    Ok(updated)
+}
+
+fn upscale_edge_texture_outcome(
+    outcome: EdgeTextureOutcome,
+    scale: f32,
+    original_width: u32,
+) -> Result<EdgeTextureOutcome, ()> {
+    if scale <= 0.0 {
+        return Err(());
+    }
+
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        return Ok(outcome);
+    }
+
+    let mut adjusted = outcome;
+    if let Some(split) = adjusted.split_x {
+        adjusted.split_x = Some(upscale_coordinate(split, scale, original_width)?);
+    }
+
+    adjusted.left_margin = upscale_margin(adjusted.left_margin, scale, original_width)?;
+    adjusted.right_margin = upscale_margin(adjusted.right_margin, scale, original_width)?;
+    adjusted.center_band = upscale_margin(adjusted.center_band, scale, original_width)?;
+    adjusted.notes = upscale_notes(adjusted.notes, scale, original_width)?;
+
+    Ok(adjusted)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgePreviewCacheStatus {
+    Hit,
+    Miss,
+}
+
+#[derive(Debug, Default)]
+struct EdgePreviewBuildMetrics {
+    #[cfg(debug_assertions)]
+    stage_load: Duration,
+    #[cfg(debug_assertions)]
+    stage_analyze: Duration,
+    #[cfg(debug_assertions)]
+    downsample_applied: bool,
+    #[cfg(debug_assertions)]
+    downsample_scale: Option<f32>,
+    #[cfg(debug_assertions)]
+    downsample_fallback: bool,
+}
+
+static EDGE_PREVIEW_CACHE: OnceLock<Mutex<LruCache<PathBuf, Arc<EdgePreviewSession>>>> =
+    OnceLock::new();
+
+fn edge_preview_cache_capacity() -> NonZeroUsize {
+    std::env::var(EDGE_PREVIEW_CACHE_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| {
+            NonZeroUsize::new(EDGE_PREVIEW_CACHE_DEFAULT_CAPACITY)
+                .expect("default cache capacity must be non-zero")
+        })
+}
+
+fn edge_preview_cache() -> &'static Mutex<LruCache<PathBuf, Arc<EdgePreviewSession>>> {
+    EDGE_PREVIEW_CACHE.get_or_init(|| {
+        let capacity = edge_preview_cache_capacity();
+        Mutex::new(LruCache::new(capacity))
+    })
+}
+
+fn get_or_insert_preview_session<F>(
+    path: &Path,
+    config: EdgeTextureConfig,
+    builder: F,
+) -> Result<
+    (
+        Arc<EdgePreviewSession>,
+        EdgePreviewCacheStatus,
+        Option<EdgePreviewBuildMetrics>,
+    ),
+    EdgePreviewError,
+>
+where
+    F: FnOnce() -> Result<(EdgePreviewSession, EdgePreviewBuildMetrics), EdgePreviewError>,
+{
+    {
+        let mut guard = edge_preview_cache().lock().unwrap();
+        if let Some(session) = guard.get(path) {
+            if session.config == config {
+                return Ok((Arc::clone(session), EdgePreviewCacheStatus::Hit, None));
+            }
+            guard.pop(path);
+        }
+    }
+
+    let (session, metrics) = builder()?;
+    let session = Arc::new(session);
+
+    {
+        let mut guard = edge_preview_cache().lock().unwrap();
+        guard.put(path.to_path_buf(), Arc::clone(&session));
+    }
+
+    Ok((session, EdgePreviewCacheStatus::Miss, Some(metrics)))
+}
+
+#[cfg(debug_assertions)]
+fn advance_stage(clock: &mut Instant) -> Duration {
+    let elapsed = clock.elapsed();
+    *clock = Instant::now();
+    elapsed
+}
+
+#[cfg(debug_assertions)]
+fn emit_edge_preview_timing(image_path: &Path, timing: &EdgePreviewTiming, total: Duration) {
+    println!(
+        "[edge_preview] path={} cache_hit={} downsample_applied={} downsample_scale={:?} downsample_fallback={} load={:?} prepare={:?} analyze={:?} render={:?} encode={:?} total={:?}",
+        image_path.display(),
+        timing.cache_hit,
+        timing.downsample_applied,
+        timing.downsample_scale,
+        timing.downsample_fallback,
+        timing.stage_load,
+        timing.stage_prepare,
+        timing.stage_analyze,
+        timing.stage_render,
+        timing.stage_encode,
+        total,
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -383,7 +708,9 @@ pub fn list_edge_preview_candidates(
     directory: &Path,
 ) -> Result<Vec<EdgePreviewCandidate>, EdgePreviewListError> {
     if !directory.exists() || !directory.is_dir() {
-        return Err(EdgePreviewListError::DirectoryNotFound(directory.to_path_buf()));
+        return Err(EdgePreviewListError::DirectoryNotFound(
+            directory.to_path_buf(),
+        ));
     }
 
     let root = fs::canonicalize(directory)?;
@@ -743,7 +1070,7 @@ fn process_entry(
         }
     };
 
-    match process_image(&image, &path, config) {
+    match process_image(&image, &path, config, None) {
         ProcessResult::Skip {
             content_width_ratio,
             metadata,
@@ -923,7 +1250,12 @@ enum ProcessResult {
     },
 }
 
-fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> ProcessResult {
+fn process_image(
+    image: &DynamicImage,
+    _path: &Path,
+    config: SplitConfig,
+    cached_edge_outcome: Option<Arc<EdgeTextureOutcome>>,
+) -> ProcessResult {
     let (width, height) = image.dimensions();
     if width < height {
         return ProcessResult::Skip {
@@ -1011,7 +1343,7 @@ fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> Pro
     let enforce_center_offset_limit = !matches!(config.mode, SplitModeSelector::EdgeTextureOnly);
     let force_center_split = matches!(config.mode, SplitModeSelector::EdgeTextureOnly);
 
-    let mut edge_outcome: Option<EdgeTextureOutcome> = None;
+    let mut edge_outcome: Option<Arc<EdgeTextureOutcome>> = cached_edge_outcome;
     let mut projection_outcome: Option<projection::ProjectionOutcome> = None;
     let mut projection_stats: Option<ProjectionStats> = None;
     let mut selected_strategy: Option<SplitPrimaryMode> = None;
@@ -1022,9 +1354,10 @@ fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> Pro
         match strategy {
             SplitPrimaryMode::EdgeTexture => {
                 if edge_outcome.is_none() {
-                    edge_outcome = Some(analyze_edges(image, config.edge_texture));
+                    edge_outcome = Some(Arc::new(analyze_edges(image, config.edge_texture)));
                 }
                 if let Some(outcome) = edge_outcome.as_ref() {
+                    let outcome = outcome.as_ref();
                     if force_center_split {
                         candidate_split = Some(width / 2);
                         candidate_confidence = outcome.confidence;
@@ -1119,6 +1452,7 @@ fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> Pro
     split_metadata.split_x = Some(final_split_x);
 
     if let Some(outcome) = edge_outcome.as_ref() {
+        let outcome = outcome.as_ref();
         split_metadata.edge_texture_confidence = Some(outcome.confidence);
         split_metadata.edge_texture_threshold = Some(config.edge_texture.white_threshold);
         split_metadata.edge_texture = Some(EdgeTextureMetadata {
@@ -1150,9 +1484,18 @@ fn process_image(image: &DynamicImage, _path: &Path, config: SplitConfig) -> Pro
     let mut left = crop_region_with_padding(image, &left_region, padding_x, padding_y);
 
     if force_center_split {
-        left = trim_page_with_edge_texture(left, config.edge_texture, config.confidence_threshold);
-        right =
-            trim_page_with_edge_texture(right, config.edge_texture, config.confidence_threshold);
+        left = trim_page_with_edge_texture(
+            left,
+            config.edge_texture,
+            config.confidence_threshold,
+            None,
+        );
+        right = trim_page_with_edge_texture(
+            right,
+            config.edge_texture,
+            config.confidence_threshold,
+            None,
+        );
     }
 
     ProcessResult::Split {
@@ -1251,6 +1594,7 @@ fn trim_page_with_edge_texture(
     page: DynamicImage,
     config: EdgeTextureConfig,
     confidence_threshold: f32,
+    cached_outcome: Option<Arc<EdgeTextureOutcome>>,
 ) -> DynamicImage {
     let width = page.width();
     let height = page.height();
@@ -1258,13 +1602,69 @@ fn trim_page_with_edge_texture(
         return page;
     }
 
-    let outcome = analyze_edges(&page, config);
+    let outcome = cached_outcome.unwrap_or_else(|| Arc::new(analyze_edges(&page, config)));
 
-    if let Some((x_start, x_end)) = compute_trim_bounds(&outcome, width, confidence_threshold) {
+    if let Some((x_start, x_end)) =
+        compute_trim_bounds(outcome.as_ref(), width, confidence_threshold)
+    {
         page.crop_imm(x_start, 0, x_end - x_start, height)
     } else {
         page
     }
+}
+
+fn save_preview_png(image: &DynamicImage, target: &Path) -> Result<(), EdgePreviewError> {
+    let file = fs::File::create(target)?;
+    let mut writer = BufWriter::new(file);
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let encoder =
+        PngEncoder::new_with_quality(&mut writer, CompressionType::Fast, PngFilterType::Adaptive);
+    encoder.write_image(rgba.as_raw(), width, height, ExtendedColorType::Rgba8)?;
+    writer.flush()?;
+    Ok(())
+}
+fn encode_preview_outputs(
+    preview_dir: &Path,
+    timestamp: &str,
+    result: ProcessResult,
+) -> Result<(EdgePreviewMode, Option<PathBuf>, Vec<EdgePreviewOutput>), EdgePreviewError> {
+    let mut outputs: Vec<EdgePreviewOutput> = Vec::new();
+    let mut trimmed_image: Option<PathBuf> = None;
+
+    let mode = match result {
+        ProcessResult::Split { left, right, .. } => {
+            let left_path = preview_dir.join(format!("edge-preview-{}-left.png", timestamp));
+            let right_path = preview_dir.join(format!("edge-preview-{}-right.png", timestamp));
+            save_preview_png(&left, &left_path)?;
+            save_preview_png(&right, &right_path)?;
+            let left_path = fs::canonicalize(left_path)?;
+            let right_path = fs::canonicalize(right_path)?;
+            outputs.push(EdgePreviewOutput {
+                path: left_path.clone(),
+                role: EdgePreviewOutputRole::Left,
+            });
+            outputs.push(EdgePreviewOutput {
+                path: right_path.clone(),
+                role: EdgePreviewOutputRole::Right,
+            });
+            EdgePreviewMode::Split
+        }
+        ProcessResult::CoverTrim { image: trimmed, .. } => {
+            let trimmed_path = preview_dir.join(format!("edge-preview-{}-trim.png", timestamp));
+            save_preview_png(&trimmed, &trimmed_path)?;
+            let trimmed_path = fs::canonicalize(trimmed_path)?;
+            outputs.push(EdgePreviewOutput {
+                path: trimmed_path.clone(),
+                role: EdgePreviewOutputRole::CoverTrim,
+            });
+            trimmed_image = Some(trimmed_path);
+            EdgePreviewMode::CoverTrim
+        }
+        ProcessResult::Skip { .. } => EdgePreviewMode::Skip,
+    };
+
+    Ok((mode, trimmed_image, outputs))
 }
 
 pub fn preview_edge_texture_trim(
@@ -1280,6 +1680,13 @@ pub fn preview_edge_texture_trim(
         return Err(EdgePreviewError::InvalidThresholds);
     }
 
+    #[cfg(debug_assertions)]
+    let total_start = Instant::now();
+    #[cfg(debug_assertions)]
+    let mut stage_clock = total_start;
+    #[cfg(debug_assertions)]
+    let mut timing = EdgePreviewTiming::default();
+
     let bright = raw_bright.clamp(0.0, 255.0);
     let mut dark = raw_dark.clamp(0.0, 255.0);
     if dark > bright {
@@ -1288,7 +1695,6 @@ pub fn preview_edge_texture_trim(
 
     let canonical_image_path =
         fs::canonicalize(&request.image_path).map_err(|_| EdgePreviewError::UnsupportedImage)?;
-    let image = image::open(&canonical_image_path)?;
 
     let mut edge_overrides = EdgeTextureThresholdOverrides::default();
     edge_overrides.brightness_thresholds = Some([bright, dark]);
@@ -1322,52 +1728,158 @@ pub fn preview_edge_texture_trim(
     let split_config = SplitConfig::default().with_overrides(&split_overrides);
     let config_edge = split_config.edge_texture;
     let brightness_weight = config_edge.brightness_weight;
-    let search_ratios = [config_edge.left_search_ratio, config_edge.right_search_ratio];
+    let search_ratios = [
+        config_edge.left_search_ratio,
+        config_edge.right_search_ratio,
+    ];
     let confidence_threshold = split_config.confidence_threshold;
 
-    let outcome = analyze_edges(&image, config_edge);
+    #[cfg(debug_assertions)]
+    {
+        timing.stage_prepare = advance_stage(&mut stage_clock);
+    }
 
+    let prefer_downsample = request.prefer_downsample_preview;
+    let (session, cache_status, build_metrics_opt) =
+        get_or_insert_preview_session(&canonical_image_path, config_edge, {
+            let canonical_image_path = canonical_image_path.clone();
+            move || {
+                #[cfg(debug_assertions)]
+                let load_start = Instant::now();
+
+                let image = image::open(&canonical_image_path)?;
+
+                #[cfg(debug_assertions)]
+                let stage_load = load_start.elapsed();
+
+                #[cfg(debug_assertions)]
+                let analyze_start = Instant::now();
+
+                let mut downsample_attempted = false;
+                let mut downsample_applied = false;
+                let mut downsample_fallback = false;
+                let mut downsample_scale: Option<f32> = None;
+                let mut downsample_record: Option<EdgePreviewDownsample> = None;
+
+                let mut outcome: Option<EdgeTextureOutcome> = None;
+
+                if prefer_downsample {
+                    if let Some((downsample_image, scale)) =
+                        downsample_for_preview(&image, EDGE_PREVIEW_DOWNSAMPLE_TARGET_WIDTH)
+                    {
+                        downsample_attempted = true;
+                        let downsample_outcome = analyze_edges(&downsample_image, config_edge);
+                        match upscale_edge_texture_outcome(downsample_outcome, scale, image.width())
+                        {
+                            Ok(mapped) => {
+                                downsample_applied = true;
+                                downsample_scale = Some(scale);
+                                downsample_record = Some(EdgePreviewDownsample {
+                                    image: Arc::new(downsample_image),
+                                    scale,
+                                });
+                                outcome = Some(mapped);
+                            }
+                            Err(_) => {
+                                downsample_scale = Some(scale);
+                                downsample_fallback = true;
+                            }
+                        }
+                    }
+                }
+
+                if outcome.is_none() {
+                    outcome = Some(analyze_edges(&image, config_edge));
+                }
+
+                let outcome = outcome.expect("edge preview outcome must exist");
+
+                #[cfg(debug_assertions)]
+                let stage_analyze = analyze_start.elapsed();
+
+                let session = EdgePreviewSession {
+                    original_path: canonical_image_path.clone(),
+                    image: Arc::new(image),
+                    downsample: downsample_record,
+                    downsample_attempted,
+                    outcome: Arc::new(outcome),
+                    config: config_edge,
+                    created_at: Instant::now(),
+                };
+
+                let mut metrics = EdgePreviewBuildMetrics::default();
+
+                #[cfg(debug_assertions)]
+                {
+                    metrics.stage_load = stage_load;
+                    metrics.stage_analyze = stage_analyze;
+                    metrics.downsample_applied = downsample_applied;
+                    metrics.downsample_scale = downsample_scale;
+                    metrics.downsample_fallback = downsample_fallback;
+                }
+
+                Ok((session, metrics))
+            }
+        })?;
+
+    #[cfg(not(debug_assertions))]
+    let _ = cache_status;
+
+    #[cfg(not(debug_assertions))]
+    let _ = build_metrics_opt;
+
+    #[cfg(debug_assertions)]
+    {
+        timing.cache_hit = matches!(cache_status, EdgePreviewCacheStatus::Hit);
+        if let Some(metrics) = build_metrics_opt {
+            timing.stage_load = metrics.stage_load;
+            timing.stage_analyze = metrics.stage_analyze;
+            timing.downsample_applied = metrics.downsample_applied;
+            timing.downsample_scale = metrics.downsample_scale;
+            timing.downsample_fallback = metrics.downsample_fallback;
+        } else {
+            if prefer_downsample {
+                timing.downsample_applied = session.downsample.is_some();
+                timing.downsample_scale = session.downsample.as_ref().map(|record| record.scale);
+                timing.downsample_fallback =
+                    session.downsample_attempted && session.downsample.is_none();
+            } else {
+                timing.downsample_applied = false;
+                timing.downsample_scale = None;
+                timing.downsample_fallback = false;
+            }
+        }
+        stage_clock = Instant::now();
+    }
+
+    let image = session.image.as_ref();
+    let outcome = session.outcome.as_ref();
     let width = image.width();
     let height = image.height();
 
     let preview_dir = cache_root.join("edge-preview");
     fs::create_dir_all(&preview_dir)?;
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f");
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
 
-    let mut trimmed_image: Option<PathBuf> = None;
-    let mut outputs: Vec<EdgePreviewOutput> = Vec::new();
+    let process_result = process_image(
+        image,
+        &canonical_image_path,
+        split_config,
+        Some(Arc::clone(&session.outcome)),
+    );
 
-    let mode = match process_image(&image, &canonical_image_path, split_config) {
-        ProcessResult::Split { left, right, .. } => {
-            let left_path = preview_dir.join(format!("edge-preview-{}-left.png", timestamp));
-            let right_path = preview_dir.join(format!("edge-preview-{}-right.png", timestamp));
-            left.save_with_format(&left_path, ImageFormat::Png)?;
-            right.save_with_format(&right_path, ImageFormat::Png)?;
-            let left_path = fs::canonicalize(left_path)?;
-            let right_path = fs::canonicalize(right_path)?;
-            outputs.push(EdgePreviewOutput {
-                path: left_path.clone(),
-                role: EdgePreviewOutputRole::Left,
-            });
-            outputs.push(EdgePreviewOutput {
-                path: right_path.clone(),
-                role: EdgePreviewOutputRole::Right,
-            });
-            EdgePreviewMode::Split
-        }
-        ProcessResult::CoverTrim { image: trimmed, .. } => {
-            let trimmed_path = preview_dir.join(format!("edge-preview-{}-trim.png", timestamp));
-            trimmed.save_with_format(&trimmed_path, ImageFormat::Png)?;
-            let trimmed_path = fs::canonicalize(trimmed_path)?;
-            outputs.push(EdgePreviewOutput {
-                path: trimmed_path.clone(),
-                role: EdgePreviewOutputRole::CoverTrim,
-            });
-            trimmed_image = Some(trimmed_path);
-            EdgePreviewMode::CoverTrim
-        }
-        ProcessResult::Skip { .. } => EdgePreviewMode::Skip,
-    };
+    #[cfg(debug_assertions)]
+    {
+        timing.stage_render = advance_stage(&mut stage_clock);
+    }
+
+    let (mode, trimmed_image, outputs) =
+        encode_preview_outputs(&preview_dir, &timestamp, process_result)?;
+
+    #[cfg(debug_assertions)]
+    {
+        timing.stage_encode = advance_stage(&mut stage_clock);
+    }
 
     let mean_values = &outcome.metrics.mean_intensity;
     let (min_intensity, max_intensity, avg_intensity) = if mean_values.is_empty() {
@@ -1385,7 +1897,7 @@ pub fn preview_edge_texture_trim(
     };
 
     let response = EdgePreviewResponse {
-        original_image: canonical_image_path,
+        original_image: session.original_path.clone(),
         trimmed_image,
         outputs,
         mode,
@@ -1403,6 +1915,12 @@ pub fn preview_edge_texture_trim(
         },
         search_ratios,
     };
+
+    #[cfg(debug_assertions)]
+    {
+        let total = total_start.elapsed();
+        emit_edge_preview_timing(&response.original_image, &timing, total);
+    }
 
     Ok(response)
 }
@@ -1445,6 +1963,7 @@ mod tests {
     use image::DynamicImage;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -1467,6 +1986,7 @@ mod tests {
             white_threshold: None,
             left_search_ratio: None,
             right_search_ratio: None,
+            prefer_downsample_preview: true,
         };
 
         let response =
@@ -1503,6 +2023,7 @@ mod tests {
             white_threshold: None,
             left_search_ratio: None,
             right_search_ratio: None,
+            prefer_downsample_preview: true,
         };
 
         let err = preview_edge_texture_trim(cache_dir.path(), request)
@@ -1524,7 +2045,10 @@ mod tests {
         let entries =
             list_edge_preview_candidates(&directory).expect("preview candidates should load");
 
-        assert!(!entries.is_empty(), "expected test fixture to contain images");
+        assert!(
+            !entries.is_empty(),
+            "expected test fixture to contain images"
+        );
         for entry in entries.iter() {
             assert!(entry.path.starts_with(&canonical_directory));
             assert!(is_supported_image(&entry.path));
@@ -1639,6 +2163,189 @@ mod tests {
             assert_eq!(event.processed_files, index + 1);
             assert!(event.current_file.is_some());
             assert_eq!(event.total_files, total_files);
+        }
+    }
+
+    #[test]
+    fn edge_preview_cache_hits_for_identical_config() {
+        let temp = TempDir::new().expect("temp dir");
+        let image_path = temp.path().join("sample.png");
+        let buffer = image::ImageBuffer::from_pixel(32, 32, image::Rgb([200u8, 150, 90]));
+        DynamicImage::ImageRgb8(buffer)
+            .save(&image_path)
+            .expect("write sample image");
+
+        let canonical = fs::canonicalize(&image_path).expect("canonical path");
+        edge_preview_cache().lock().unwrap().clear();
+
+        let config_edge = SplitConfig::default().edge_texture;
+
+        let (first_session, first_status, _) =
+            get_or_insert_preview_session(&canonical, config_edge, {
+                let canonical = canonical.clone();
+                move || {
+                    let image = image::open(&canonical)?;
+                    let outcome = analyze_edges(&image, config_edge);
+                    let session = EdgePreviewSession {
+                        original_path: canonical.clone(),
+                        image: Arc::new(image),
+                        downsample: None,
+                        downsample_attempted: false,
+                        outcome: Arc::new(outcome),
+                        config: config_edge,
+                        created_at: Instant::now(),
+                    };
+                    Ok((session, EdgePreviewBuildMetrics::default()))
+                }
+            })
+            .expect("first cache insert");
+
+        assert!(matches!(first_status, EdgePreviewCacheStatus::Miss));
+
+        let (second_session, second_status, _) = get_or_insert_preview_session(
+            &canonical,
+            config_edge,
+            || -> Result<_, EdgePreviewError> {
+                panic!("builder should not execute on cache hit");
+            },
+        )
+        .expect("second cache retrieval");
+
+        assert!(matches!(second_status, EdgePreviewCacheStatus::Hit));
+        assert!(Arc::ptr_eq(&first_session, &second_session));
+    }
+
+    #[test]
+    fn edge_preview_cache_miss_when_config_changes() {
+        let temp = TempDir::new().expect("temp dir");
+        let image_path = temp.path().join("variant.png");
+        let buffer = image::ImageBuffer::from_pixel(24, 24, image::Rgb([120u8, 120, 120]));
+        DynamicImage::ImageRgb8(buffer)
+            .save(&image_path)
+            .expect("write variant image");
+
+        let canonical = fs::canonicalize(&image_path).expect("canonical path");
+        edge_preview_cache().lock().unwrap().clear();
+
+        let config_v1 = SplitConfig::default().edge_texture;
+        let mut config_v2 = config_v1;
+        config_v2.white_threshold = (config_v1.white_threshold + 0.1).min(1.0);
+
+        let (session_base, status_base, _) =
+            get_or_insert_preview_session(&canonical, config_v1, {
+                let canonical = canonical.clone();
+                move || {
+                    let image = image::open(&canonical)?;
+                    let outcome = analyze_edges(&image, config_v1);
+                    let session = EdgePreviewSession {
+                        original_path: canonical.clone(),
+                        image: Arc::new(image),
+                        downsample: None,
+                        downsample_attempted: false,
+                        outcome: Arc::new(outcome),
+                        config: config_v1,
+                        created_at: Instant::now(),
+                    };
+                    Ok((session, EdgePreviewBuildMetrics::default()))
+                }
+            })
+            .expect("base insert");
+
+        assert!(matches!(status_base, EdgePreviewCacheStatus::Miss));
+
+        let (session_new, status_new, _) = get_or_insert_preview_session(&canonical, config_v2, {
+            let canonical = canonical.clone();
+            move || {
+                let image = image::open(&canonical)?;
+                let outcome = analyze_edges(&image, config_v2);
+                let session = EdgePreviewSession {
+                    original_path: canonical.clone(),
+                    image: Arc::new(image),
+                    downsample: None,
+                    downsample_attempted: false,
+                    outcome: Arc::new(outcome),
+                    config: config_v2,
+                    created_at: Instant::now(),
+                };
+                Ok((session, EdgePreviewBuildMetrics::default()))
+            }
+        })
+        .expect("rebuild with new config");
+
+        assert!(matches!(status_new, EdgePreviewCacheStatus::Miss));
+        assert!(!Arc::ptr_eq(&session_base, &session_new));
+
+        let (_session_latest, status_latest, _) = get_or_insert_preview_session(
+            &canonical,
+            config_v2,
+            || -> Result<_, EdgePreviewError> {
+                panic!("builder should not execute for cached config");
+            },
+        )
+        .expect("cache hit after config adjustment");
+
+        assert!(matches!(status_latest, EdgePreviewCacheStatus::Hit));
+    }
+
+    #[test]
+    fn downsample_mapping_preserves_coordinates_within_one_pixel() {
+        let width = 4096u32;
+        let height = 256u32;
+        let buffer = image::ImageBuffer::from_fn(width, height, |x, _| {
+            if x < 180 || x >= width - 180 {
+                image::Rgb([240u8, 240, 240])
+            } else if (width / 2 - 3..=width / 2 + 3).contains(&x) {
+                image::Rgb([10u8, 10, 10])
+            } else {
+                image::Rgb([80u8, 80, 80])
+            }
+        });
+
+        let image = DynamicImage::ImageRgb8(buffer);
+        let config_edge = SplitConfig::default().edge_texture;
+
+        let original_outcome = analyze_edges(&image, config_edge);
+
+        let (downsample_image, scale) =
+            downsample_for_preview(&image, EDGE_PREVIEW_DOWNSAMPLE_TARGET_WIDTH)
+                .expect("downsample should be generated");
+        let downsample_outcome = analyze_edges(&downsample_image, config_edge);
+        let mapped_outcome = upscale_edge_texture_outcome(downsample_outcome, scale, image.width())
+            .expect("mapping should succeed");
+
+        if let (Some(original_split), Some(mapped_split)) =
+            (original_outcome.split_x, mapped_outcome.split_x)
+        {
+            assert!(
+                (original_split as i64 - mapped_split as i64).abs() <= 1,
+                "split coordinate should remain within one pixel"
+            );
+        }
+
+        if let (Some(original_left), Some(mapped_left)) =
+            (original_outcome.left_margin, mapped_outcome.left_margin)
+        {
+            assert!(
+                (original_left.start_x as i64 - mapped_left.start_x as i64).abs() <= 1,
+                "left margin start should remain within one pixel"
+            );
+            assert!(
+                (original_left.end_x as i64 - mapped_left.end_x as i64).abs() <= 1,
+                "left margin end should remain within one pixel"
+            );
+        }
+
+        if let (Some(original_right), Some(mapped_right)) =
+            (original_outcome.right_margin, mapped_outcome.right_margin)
+        {
+            assert!(
+                (original_right.start_x as i64 - mapped_right.start_x as i64).abs() <= 1,
+                "right margin start should remain within one pixel"
+            );
+            assert!(
+                (original_right.end_x as i64 - mapped_right.end_x as i64).abs() <= 1,
+                "right margin end should remain within one pixel"
+            );
         }
     }
 
@@ -1808,11 +2515,11 @@ mod tests {
         let mut config = SplitConfig::default();
         config.confidence_threshold = 1.2; // force algorithms to fall back
 
-        let (meta, fallback) = match super::process_image(&fixture, Path::new("story.png"), config)
-        {
-            ProcessResult::Split { meta, fallback, .. } => (meta, fallback),
-            _ => panic!("expected split outcome"),
-        };
+        let (meta, fallback) =
+            match super::process_image(&fixture, Path::new("story.png"), config, None) {
+                ProcessResult::Split { meta, fallback, .. } => (meta, fallback),
+                _ => panic!("expected split outcome"),
+            };
 
         assert!(fallback, "high threshold should force fallback center");
         assert_eq!(meta.split_strategy.as_deref(), Some("fallbackCenter"));
@@ -1836,11 +2543,11 @@ mod tests {
         let mut config = SplitConfig::default();
         config.mode = SplitModeSelector::ProjectionOnly;
 
-        let (meta, fallback) = match super::process_image(&fixture, Path::new("story.png"), config)
-        {
-            ProcessResult::Split { meta, fallback, .. } => (meta, fallback),
-            _ => panic!("expected split outcome"),
-        };
+        let (meta, fallback) =
+            match super::process_image(&fixture, Path::new("story.png"), config, None) {
+                ProcessResult::Split { meta, fallback, .. } => (meta, fallback),
+                _ => panic!("expected split outcome"),
+            };
 
         assert!(!fallback, "projection mode should find confident split");
         assert_eq!(meta.split_strategy.as_deref(), Some("projection"));
@@ -1866,7 +2573,8 @@ mod tests {
     fn tall_image_skip_has_reason_aspect_ratio() {
         let buffer = image::ImageBuffer::from_pixel(400, 900, image::Rgb([255u8, 255, 255]));
         let image = DynamicImage::ImageRgb8(buffer);
-        let outcome = super::process_image(&image, Path::new("dummy.png"), SplitConfig::default());
+        let outcome =
+            super::process_image(&image, Path::new("dummy.png"), SplitConfig::default(), None);
 
         match outcome {
             super::ProcessResult::Skip { metadata, .. } => {
