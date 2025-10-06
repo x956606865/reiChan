@@ -52,7 +52,7 @@ bytemuck = { version = "1.15", features = ["derive"], optional = true }
 httpmock = "0.7"
 
 [features]
-default = ["notion-sqlite", "notion-http"]
+default = ["notion-sqlite", "notion-http", "edge-texture-gpu"]
 notion-sqlite = []
 notion-http = []
 edge-texture-gpu = ["wgpu", "pollster", "bytemuck"]

@@ -126,6 +126,9 @@ type EdgePreviewOutput = EdgePreviewOutputResponse & {
   url: string;
 };
 
+type EdgePreviewAccelerator = 'cpu' | 'gpu';
+type EdgePreviewAcceleratorPreference = 'auto' | EdgePreviewAccelerator;
+
 type EdgePreviewResponsePayload = {
   originalImage: string;
   trimmedImage?: string | null;
@@ -138,6 +141,7 @@ type EdgePreviewResponsePayload = {
   confidenceThreshold: number;
   metrics: EdgePreviewMetrics;
   searchRatios: [number, number];
+  accelerator: EdgePreviewAccelerator;
 };
 
 type EdgePreviewPayload = {
@@ -154,6 +158,9 @@ type EdgePreviewPayload = {
   confidenceThreshold: number;
   metrics: EdgePreviewMetrics;
   searchRatios: [number, number];
+  accelerator: EdgePreviewAccelerator;
+  requestedAccelerator: EdgePreviewAcceleratorPreference;
+  acceleratorMatched: boolean;
   requestedBrightnessThresholds: [number, number];
   thresholdsMatched: boolean;
   requestedSearchRatios: [number, number];
@@ -172,6 +179,19 @@ const formatRatioValue = (value: number): string => {
     return '—';
   }
   return value.toFixed(3);
+};
+
+const describeAccelerator = (
+  value: EdgePreviewAcceleratorPreference
+): string => {
+  switch (value) {
+    case 'gpu':
+      return 'GPU';
+    case 'cpu':
+      return 'CPU';
+    default:
+      return '自动';
+  }
 };
 
 const EDGE_PREVIEW_OUTPUT_LABELS: Record<EdgePreviewOutputRole, string> = {
@@ -658,6 +678,8 @@ const MangaUpscaleAgent = () => {
     DEFAULT_EDGE_SEARCH_RATIO,
     DEFAULT_EDGE_SEARCH_RATIO,
   ]);
+  const [edgeAcceleratorPreference, setEdgeAcceleratorPreference] =
+    useState<EdgePreviewAcceleratorPreference>('auto');
   const [edgeThresholdErrors, setEdgeThresholdErrors] =
     useState<EdgeThresholdErrors>({});
   const [edgeSearchRatioErrors, setEdgeSearchRatioErrors] =
@@ -693,6 +715,10 @@ const MangaUpscaleAgent = () => {
     edgePreview.data?.requestedSearchRatios ?? edgeSearchRatios;
   const previewSearchRatiosMatched =
     edgePreview.data?.searchRatiosMatched ?? true;
+  const requestedAccelerator =
+    edgePreview.data?.requestedAccelerator ?? edgeAcceleratorPreference;
+  const previewAcceleratorMatched =
+    edgePreview.data?.acceleratorMatched ?? true;
   const selectorViewportCount = Math.max(
     1,
     Math.ceil(
@@ -810,6 +836,14 @@ const MangaUpscaleAgent = () => {
         }
         return prev;
       });
+    },
+    []
+  );
+  const handleEdgeAcceleratorChange = useCallback(
+    (event: ChangeEvent<HTMLSelectElement>) => {
+      const value =
+        event.currentTarget.value as EdgePreviewAcceleratorPreference;
+      setEdgeAcceleratorPreference(value);
     },
     []
   );
@@ -1052,6 +1086,7 @@ const MangaUpscaleAgent = () => {
               whiteThreshold: 1.0,
               leftSearchRatio: leftRatio,
               rightSearchRatio: rightRatio,
+              accelerator: edgeAcceleratorPreference,
             },
           }
         );
@@ -1068,6 +1103,10 @@ const MangaUpscaleAgent = () => {
           const expected = requestedRatios[index];
           return Math.abs(value - expected) <= 1e-4;
         });
+        const requestedAcceleratorPref = edgeAcceleratorPreference;
+        const acceleratorMatched =
+          requestedAcceleratorPref === 'auto' ||
+          response.accelerator === requestedAcceleratorPref;
 
         const trimmedUrl = response.trimmedImage
           ? convertFileSrc(response.trimmedImage)
@@ -1091,6 +1130,9 @@ const MangaUpscaleAgent = () => {
           confidenceThreshold: response.confidenceThreshold,
           metrics: response.metrics,
           searchRatios: response.searchRatios,
+          accelerator: response.accelerator,
+          requestedAccelerator: requestedAcceleratorPref,
+          acceleratorMatched,
           requestedBrightnessThresholds: requestedThresholds,
           thresholdsMatched,
           requestedSearchRatios: requestedRatios,
@@ -1116,6 +1158,7 @@ const MangaUpscaleAgent = () => {
       edgeBrightnessThresholds,
       edgeSearchRatios,
       computeEdgeSearchRatioErrors,
+      edgeAcceleratorPreference,
     ]
   );
 
@@ -4280,6 +4323,18 @@ const MangaUpscaleAgent = () => {
                       )}
                     </label>
 
+                    <label className="form-field compact">
+                      <span className="field-label">加速器偏好</span>
+                      <select
+                        value={edgeAcceleratorPreference}
+                        onChange={handleEdgeAcceleratorChange}
+                      >
+                        <option value="auto">自动</option>
+                        <option value="gpu">优先 GPU</option>
+                        <option value="cpu">仅 CPU</option>
+                      </select>
+                    </label>
+
                     <button
                       type="button"
                       className="split-action-button"
@@ -5462,6 +5517,22 @@ const MangaUpscaleAgent = () => {
                           {formatRatioValue(requestedSearchRatios[1])}，后端已调整为上述实际数值。
                         </p>
                       )}
+                      {requestedAccelerator === 'auto' ? (
+                        <p className="status status-tip">
+                          设备偏好为自动模式，实际使用{' '}
+                          {describeAccelerator(edgePreview.data.accelerator)}。
+                        </p>
+                      ) : previewAcceleratorMatched ? (
+                        <p className="status status-tip">
+                          请求的设备偏好 {describeAccelerator(requestedAccelerator)} 已生效（实际使用{' '}
+                          {describeAccelerator(edgePreview.data.accelerator)}）。
+                        </p>
+                      ) : (
+                        <p className="status status-warning">
+                          请求的设备偏好 {describeAccelerator(requestedAccelerator)} 无法满足，已回退为{' '}
+                          {describeAccelerator(edgePreview.data.accelerator)}。
+                        </p>
+                      )}
                     </>
                   )}
                 </>
@@ -5470,7 +5541,8 @@ const MangaUpscaleAgent = () => {
                   当前输入：亮白 {formatThresholdValue(edgeBrightnessThresholds[0])}，留黑{' '}
                   {formatThresholdValue(edgeBrightnessThresholds[1])}；搜索比例 左{' '}
                   {formatRatioValue(edgeSearchRatios[0])}，右{' '}
-                  {formatRatioValue(edgeSearchRatios[1])}
+                  {formatRatioValue(edgeSearchRatios[1])}；加速器偏好{' '}
+                  {describeAccelerator(edgeAcceleratorPreference)}
                 </p>
               )}
             </header>
@@ -5580,6 +5652,16 @@ const MangaUpscaleAgent = () => {
                       <div>
                         <dt>亮度权重</dt>
                         <dd>{edgePreview.data.brightnessWeight.toFixed(2)}</dd>
+                      </div>
+                      <div>
+                        <dt>请求加速器</dt>
+                        <dd>
+                          {describeAccelerator(edgePreview.data.requestedAccelerator)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>实际加速器</dt>
+                        <dd>{describeAccelerator(edgePreview.data.accelerator)}</dd>
                       </div>
                     </dl>
 

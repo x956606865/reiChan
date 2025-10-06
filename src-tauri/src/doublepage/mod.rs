@@ -30,9 +30,11 @@ pub use mask::build_foreground_mask;
 use mask::BoundingBox;
 
 mod edge_texture;
+mod edge_texture_gpu;
 use edge_texture::{
-    analyze_edges, EdgeTextureConfig, EdgeTextureMetrics, EdgeTextureNotes, EdgeTextureOutcome,
-    MarginRegion,
+    analyze_edges, analyze_edges_with_acceleration, EdgeTextureAccelerator,
+    EdgeTextureAcceleratorPreference, EdgeTextureAnalysis, EdgeTextureConfig, EdgeTextureMetrics,
+    EdgeTextureNotes, EdgeTextureOutcome, MarginRegion,
 };
 
 mod projection;
@@ -105,6 +107,8 @@ pub struct EdgePreviewRequest {
     pub left_search_ratio: Option<f32>,
     #[serde(default)]
     pub right_search_ratio: Option<f32>,
+    #[serde(default)]
+    pub accelerator: EdgeTextureAcceleratorPreference,
     #[serde(default = "EdgePreviewRequest::default_prefer_downsample_preview")]
     pub prefer_downsample_preview: bool,
 }
@@ -164,6 +168,7 @@ pub struct EdgePreviewResponse {
     pub confidence_threshold: f32,
     pub metrics: EdgePreviewMetrics,
     pub search_ratios: [f32; 2],
+    pub accelerator: EdgeTextureAccelerator,
 }
 
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -210,6 +215,7 @@ pub struct EdgePreviewSession {
     pub downsample: Option<EdgePreviewDownsample>,
     pub downsample_attempted: bool,
     pub outcome: Arc<EdgeTextureOutcome>,
+    pub accelerator: EdgeTextureAccelerator,
     pub config: EdgeTextureConfig,
     pub created_at: Instant,
 }
@@ -418,6 +424,7 @@ fn edge_preview_cache() -> &'static Mutex<LruCache<PathBuf, Arc<EdgePreviewSessi
 fn get_or_insert_preview_session<F>(
     path: &Path,
     config: EdgeTextureConfig,
+    preference: EdgeTextureAcceleratorPreference,
     builder: F,
 ) -> Result<
     (
@@ -433,7 +440,9 @@ where
     {
         let mut guard = edge_preview_cache().lock().unwrap();
         if let Some(session) = guard.get(path) {
-            if session.config == config {
+            if session.config == config
+                && preference_accepts(preference, session.accelerator)
+            {
                 return Ok((Arc::clone(session), EdgePreviewCacheStatus::Hit, None));
             }
             guard.pop(path);
@@ -449,6 +458,17 @@ where
     }
 
     Ok((session, EdgePreviewCacheStatus::Miss, Some(metrics)))
+}
+
+fn preference_accepts(
+    preference: EdgeTextureAcceleratorPreference,
+    accelerator: EdgeTextureAccelerator,
+) -> bool {
+    match preference {
+        EdgeTextureAcceleratorPreference::Auto => true,
+        EdgeTextureAcceleratorPreference::Cpu => matches!(accelerator, EdgeTextureAccelerator::Cpu),
+        EdgeTextureAcceleratorPreference::Gpu => matches!(accelerator, EdgeTextureAccelerator::Gpu),
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -1740,9 +1760,11 @@ pub fn preview_edge_texture_trim(
     }
 
     let prefer_downsample = request.prefer_downsample_preview;
+    let accelerator_preference = request.accelerator;
     let (session, cache_status, build_metrics_opt) =
-        get_or_insert_preview_session(&canonical_image_path, config_edge, {
+        get_or_insert_preview_session(&canonical_image_path, config_edge, accelerator_preference, {
             let canonical_image_path = canonical_image_path.clone();
+            let accelerator_preference = accelerator_preference;
             move || {
                 #[cfg(debug_assertions)]
                 let load_start = Instant::now();
@@ -1761,16 +1783,23 @@ pub fn preview_edge_texture_trim(
                 let mut downsample_scale: Option<f32> = None;
                 let mut downsample_record: Option<EdgePreviewDownsample> = None;
 
-                let mut outcome: Option<EdgeTextureOutcome> = None;
+                let mut analysis: Option<EdgeTextureAnalysis> = None;
 
                 if prefer_downsample {
                     if let Some((downsample_image, scale)) =
                         downsample_for_preview(&image, EDGE_PREVIEW_DOWNSAMPLE_TARGET_WIDTH)
                     {
                         downsample_attempted = true;
-                        let downsample_outcome = analyze_edges(&downsample_image, config_edge);
-                        match upscale_edge_texture_outcome(downsample_outcome, scale, image.width())
-                        {
+                        let downsample_analysis = analyze_edges_with_acceleration(
+                            &downsample_image,
+                            config_edge,
+                            accelerator_preference,
+                        );
+                        match upscale_edge_texture_outcome(
+                            downsample_analysis.outcome,
+                            scale,
+                            image.width(),
+                        ) {
                             Ok(mapped) => {
                                 downsample_applied = true;
                                 downsample_scale = Some(scale);
@@ -1778,7 +1807,10 @@ pub fn preview_edge_texture_trim(
                                     image: Arc::new(downsample_image),
                                     scale,
                                 });
-                                outcome = Some(mapped);
+                                analysis = Some(EdgeTextureAnalysis {
+                                    outcome: mapped,
+                                    accelerator: downsample_analysis.accelerator,
+                                });
                             }
                             Err(_) => {
                                 downsample_scale = Some(scale);
@@ -1788,11 +1820,16 @@ pub fn preview_edge_texture_trim(
                     }
                 }
 
-                if outcome.is_none() {
-                    outcome = Some(analyze_edges(&image, config_edge));
+                if analysis.is_none() {
+                    analysis = Some(analyze_edges_with_acceleration(
+                        &image,
+                        config_edge,
+                        accelerator_preference,
+                    ));
                 }
 
-                let outcome = outcome.expect("edge preview outcome must exist");
+                let analysis = analysis.expect("edge preview outcome must exist");
+                let EdgeTextureAnalysis { outcome, accelerator } = analysis;
 
                 #[cfg(debug_assertions)]
                 let stage_analyze = analyze_start.elapsed();
@@ -1803,6 +1840,7 @@ pub fn preview_edge_texture_trim(
                     downsample: downsample_record,
                     downsample_attempted,
                     outcome: Arc::new(outcome),
+                    accelerator,
                     config: config_edge,
                     created_at: Instant::now(),
                 };
@@ -1914,6 +1952,7 @@ pub fn preview_edge_texture_trim(
             mean_intensity_avg: avg_intensity,
         },
         search_ratios,
+        accelerator: session.accelerator,
     };
 
     #[cfg(debug_assertions)]
@@ -1963,7 +2002,7 @@ mod tests {
     use image::DynamicImage;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -1986,6 +2025,7 @@ mod tests {
             white_threshold: None,
             left_search_ratio: None,
             right_search_ratio: None,
+            accelerator: EdgeTextureAcceleratorPreference::Auto,
             prefer_downsample_preview: true,
         };
 
@@ -2014,6 +2054,47 @@ mod tests {
     }
 
     #[test]
+    fn preview_respects_cpu_preference() {
+        let cache_dir = TempDir::new().expect("cache dir");
+        let request = EdgePreviewRequest {
+            image_path: fixture_path("double_page_story.png"),
+            brightness_thresholds: [200.0, 75.0],
+            brightness_weight: None,
+            white_threshold: None,
+            left_search_ratio: None,
+            right_search_ratio: None,
+            accelerator: EdgeTextureAcceleratorPreference::Cpu,
+            prefer_downsample_preview: true,
+        };
+
+        let response =
+            preview_edge_texture_trim(cache_dir.path(), request).expect("preview should succeed");
+
+        assert_eq!(response.accelerator, EdgeTextureAccelerator::Cpu);
+    }
+
+    #[cfg(not(feature = "edge-texture-gpu"))]
+    #[test]
+    fn preview_falls_back_to_cpu_without_gpu_feature() {
+        let cache_dir = TempDir::new().expect("cache dir");
+        let request = EdgePreviewRequest {
+            image_path: fixture_path("double_page_story.png"),
+            brightness_thresholds: [200.0, 75.0],
+            brightness_weight: None,
+            white_threshold: None,
+            left_search_ratio: None,
+            right_search_ratio: None,
+            accelerator: EdgeTextureAcceleratorPreference::Gpu,
+            prefer_downsample_preview: true,
+        };
+
+        let response =
+            preview_edge_texture_trim(cache_dir.path(), request).expect("preview should succeed");
+
+        assert_eq!(response.accelerator, EdgeTextureAccelerator::Cpu);
+    }
+
+    #[test]
     fn preview_rejects_invalid_thresholds() {
         let cache_dir = TempDir::new().expect("cache dir");
         let request = EdgePreviewRequest {
@@ -2023,12 +2104,99 @@ mod tests {
             white_threshold: None,
             left_search_ratio: None,
             right_search_ratio: None,
+            accelerator: EdgeTextureAcceleratorPreference::Auto,
             prefer_downsample_preview: true,
         };
 
         let err = preview_edge_texture_trim(cache_dir.path(), request)
             .expect_err("invalid thresholds should fail");
         assert!(matches!(err, EdgePreviewError::InvalidThresholds));
+    }
+
+    #[test]
+    fn cache_respects_accelerator_preference() {
+        let temp = TempDir::new().expect("temp dir");
+        let image_path = temp.path().join("sample.png");
+        let buffer = image::ImageBuffer::from_pixel(16, 16, image::Rgb([160u8, 160, 160]));
+        DynamicImage::ImageRgb8(buffer)
+            .save(&image_path)
+            .expect("write sample image");
+
+        let canonical = fs::canonicalize(&image_path).expect("canonical path");
+        edge_preview_cache().lock().unwrap().clear();
+
+        let config_edge = SplitConfig::default().edge_texture;
+        let build_log: Arc<Mutex<Vec<EdgeTextureAccelerator>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let log_gpu = build_log.clone();
+        let (session_gpu, status_gpu, _) = get_or_insert_preview_session(
+            &canonical,
+            config_edge,
+            EdgeTextureAcceleratorPreference::Auto,
+            {
+                let canonical = canonical.clone();
+                move || {
+                    let image = image::open(&canonical)?;
+                    let outcome = analyze_edges(&image, config_edge);
+                    log_gpu
+                        .lock()
+                        .unwrap()
+                        .push(EdgeTextureAccelerator::Gpu);
+                    let session = EdgePreviewSession {
+                        original_path: canonical.clone(),
+                        image: Arc::new(image),
+                        downsample: None,
+                        downsample_attempted: false,
+                        outcome: Arc::new(outcome),
+                        accelerator: EdgeTextureAccelerator::Gpu,
+                        config: config_edge,
+                        created_at: Instant::now(),
+                    };
+                    Ok((session, EdgePreviewBuildMetrics::default()))
+                }
+            },
+        )
+        .expect("insert gpu session");
+
+        assert!(matches!(status_gpu, EdgePreviewCacheStatus::Miss));
+        assert_eq!(session_gpu.accelerator, EdgeTextureAccelerator::Gpu);
+
+        let log_cpu = build_log.clone();
+        let (session_cpu, status_cpu, _) = get_or_insert_preview_session(
+            &canonical,
+            config_edge,
+            EdgeTextureAcceleratorPreference::Cpu,
+            {
+                let canonical = canonical.clone();
+                move || {
+                    let image = image::open(&canonical)?;
+                    let outcome = analyze_edges(&image, config_edge);
+                    log_cpu
+                        .lock()
+                        .unwrap()
+                        .push(EdgeTextureAccelerator::Cpu);
+                    let session = EdgePreviewSession {
+                        original_path: canonical.clone(),
+                        image: Arc::new(image),
+                        downsample: None,
+                        downsample_attempted: false,
+                        outcome: Arc::new(outcome),
+                        accelerator: EdgeTextureAccelerator::Cpu,
+                        config: config_edge,
+                        created_at: Instant::now(),
+                    };
+                    Ok((session, EdgePreviewBuildMetrics::default()))
+                }
+            },
+        )
+        .expect("rebuild cpu session");
+
+        assert!(matches!(status_cpu, EdgePreviewCacheStatus::Miss));
+        assert_eq!(session_cpu.accelerator, EdgeTextureAccelerator::Cpu);
+
+        let log = build_log.lock().unwrap();
+        assert_eq!(log.as_slice(), &[EdgeTextureAccelerator::Gpu, EdgeTextureAccelerator::Cpu]);
     }
 
     #[test]
@@ -2181,7 +2349,7 @@ mod tests {
         let config_edge = SplitConfig::default().edge_texture;
 
         let (first_session, first_status, _) =
-            get_or_insert_preview_session(&canonical, config_edge, {
+            get_or_insert_preview_session(&canonical, config_edge, EdgeTextureAcceleratorPreference::Auto, {
                 let canonical = canonical.clone();
                 move || {
                     let image = image::open(&canonical)?;
@@ -2192,6 +2360,7 @@ mod tests {
                         downsample: None,
                         downsample_attempted: false,
                         outcome: Arc::new(outcome),
+                        accelerator: EdgeTextureAccelerator::Cpu,
                         config: config_edge,
                         created_at: Instant::now(),
                     };
@@ -2205,6 +2374,7 @@ mod tests {
         let (second_session, second_status, _) = get_or_insert_preview_session(
             &canonical,
             config_edge,
+            EdgeTextureAcceleratorPreference::Auto,
             || -> Result<_, EdgePreviewError> {
                 panic!("builder should not execute on cache hit");
             },
@@ -2232,7 +2402,7 @@ mod tests {
         config_v2.white_threshold = (config_v1.white_threshold + 0.1).min(1.0);
 
         let (session_base, status_base, _) =
-            get_or_insert_preview_session(&canonical, config_v1, {
+            get_or_insert_preview_session(&canonical, config_v1, EdgeTextureAcceleratorPreference::Auto, {
                 let canonical = canonical.clone();
                 move || {
                     let image = image::open(&canonical)?;
@@ -2243,6 +2413,7 @@ mod tests {
                         downsample: None,
                         downsample_attempted: false,
                         outcome: Arc::new(outcome),
+                        accelerator: EdgeTextureAccelerator::Cpu,
                         config: config_v1,
                         created_at: Instant::now(),
                     };
@@ -2253,7 +2424,7 @@ mod tests {
 
         assert!(matches!(status_base, EdgePreviewCacheStatus::Miss));
 
-        let (session_new, status_new, _) = get_or_insert_preview_session(&canonical, config_v2, {
+        let (session_new, status_new, _) = get_or_insert_preview_session(&canonical, config_v2, EdgeTextureAcceleratorPreference::Auto, {
             let canonical = canonical.clone();
             move || {
                 let image = image::open(&canonical)?;
@@ -2264,6 +2435,7 @@ mod tests {
                     downsample: None,
                     downsample_attempted: false,
                     outcome: Arc::new(outcome),
+                    accelerator: EdgeTextureAccelerator::Cpu,
                     config: config_v2,
                     created_at: Instant::now(),
                 };
@@ -2278,6 +2450,7 @@ mod tests {
         let (_session_latest, status_latest, _) = get_or_insert_preview_session(
             &canonical,
             config_v2,
+            EdgeTextureAcceleratorPreference::Auto,
             || -> Result<_, EdgePreviewError> {
                 panic!("builder should not execute for cached config");
             },

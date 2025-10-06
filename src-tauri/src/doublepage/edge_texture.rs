@@ -1,13 +1,26 @@
 use std::cmp::{max, min};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use image::{DynamicImage, ImageBuffer, Luma};
 use serde::{Deserialize, Serialize};
 
 use super::config::EdgeTextureThresholdOverrides;
 
+#[cfg(feature = "edge-texture-gpu")]
+use super::edge_texture_gpu::enabled::{
+    EdgeTextureGpuAnalyzer, EdgeTextureGpuError, EdgeTextureGpuOutputs,
+};
+#[cfg(not(feature = "edge-texture-gpu"))]
+use super::edge_texture_gpu::disabled::{
+    EdgeTextureGpuAnalyzer, EdgeTextureGpuError, EdgeTextureGpuOutputs,
+};
+
 const EPSILON: f32 = 1e-5;
+const EDGE_TEXTURE_ACCELERATOR_ENV: &str = "EDGE_TEXTURE_ACCELERATOR";
 const SOBEL_X: [[f32; 3]; 3] = [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]];
 const SOBEL_Y: [[f32; 3]; 3] = [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]];
+
+static GPU_ANALYZER: OnceLock<Mutex<Option<Arc<EdgeTextureGpuAnalyzer>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,6 +158,124 @@ pub struct EdgeTextureOutcome {
     pub notes: EdgeTextureNotes,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeTextureAccelerator {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeTextureAcceleratorPreference {
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+impl Default for EdgeTextureAcceleratorPreference {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeTextureAnalysis {
+    pub outcome: EdgeTextureOutcome,
+    pub accelerator: EdgeTextureAccelerator,
+}
+
+pub fn analyze_edges_with_acceleration(
+    image: &DynamicImage,
+    config: EdgeTextureConfig,
+    preference: EdgeTextureAcceleratorPreference,
+) -> EdgeTextureAnalysis {
+    match resolve_accelerator_directive(preference) {
+        AcceleratorDirective::ForceCpu =>
+            cpu_analysis(image, config, EdgeTextureAccelerator::Cpu),
+        AcceleratorDirective::MockGpu =>
+            cpu_analysis(image, config, EdgeTextureAccelerator::Gpu),
+        AcceleratorDirective::ForceGpu | AcceleratorDirective::Auto => {
+            match analyze_with_gpu(image, config) {
+                Ok(outcome) => EdgeTextureAnalysis {
+                    outcome,
+                    accelerator: EdgeTextureAccelerator::Gpu,
+                },
+                Err(_) => cpu_analysis(image, config, EdgeTextureAccelerator::Cpu),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceleratorDirective {
+    ForceCpu,
+    ForceGpu,
+    Auto,
+    MockGpu,
+}
+
+fn resolve_accelerator_directive(
+    preference: EdgeTextureAcceleratorPreference,
+) -> AcceleratorDirective {
+    if let Ok(raw) = std::env::var(EDGE_TEXTURE_ACCELERATOR_ENV) {
+        let value = raw.trim().to_ascii_lowercase();
+        return match value.as_str() {
+            "cpu" => AcceleratorDirective::ForceCpu,
+            "gpu" => AcceleratorDirective::ForceGpu,
+            "auto" => AcceleratorDirective::Auto,
+            "mock-gpu" if cfg!(test) => AcceleratorDirective::MockGpu,
+            _ => AcceleratorDirective::Auto,
+        };
+    }
+
+    match preference {
+        EdgeTextureAcceleratorPreference::Cpu => AcceleratorDirective::ForceCpu,
+        EdgeTextureAcceleratorPreference::Gpu => AcceleratorDirective::ForceGpu,
+        EdgeTextureAcceleratorPreference::Auto => AcceleratorDirective::Auto,
+    }
+}
+
+fn cpu_analysis(
+    image: &DynamicImage,
+    config: EdgeTextureConfig,
+    accelerator: EdgeTextureAccelerator,
+) -> EdgeTextureAnalysis {
+    EdgeTextureAnalysis {
+        outcome: analyze_edges(image, config),
+        accelerator,
+    }
+}
+
+fn analyze_with_gpu(
+    image: &DynamicImage,
+    config: EdgeTextureConfig,
+) -> Result<EdgeTextureOutcome, EdgeTextureGpuError> {
+    let analyzer = gpu_analyzer()?;
+    let outputs = analyzer.analyze(image, config)?;
+    Ok(build_outcome_from_gpu(config, outputs))
+}
+
+fn gpu_analyzer() -> Result<Arc<EdgeTextureGpuAnalyzer>, EdgeTextureGpuError> {
+    let cell = GPU_ANALYZER.get_or_init(|| Mutex::new(None));
+
+    {
+        let guard = cell.lock().expect("gpu analyzer mutex poisoned");
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+    }
+
+    let analyzer = Arc::new(EdgeTextureGpuAnalyzer::new()?);
+
+    let mut guard = cell.lock().expect("gpu analyzer mutex poisoned");
+    if let Some(existing) = guard.as_ref() {
+        return Ok(Arc::clone(existing));
+    }
+    *guard = Some(Arc::clone(&analyzer));
+    Ok(analyzer)
+}
+
 pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTextureOutcome {
     let gray = image.to_luma8();
     let width = gray.width();
@@ -154,7 +285,18 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         return empty_outcome(width, &config);
     }
 
-    let gamma_corrected = apply_gamma(&gray, config.gamma);
+    let metrics = compute_cpu_metrics(&gray, config);
+    build_outcome_from_metrics(config, metrics)
+}
+
+fn compute_cpu_metrics(
+    gray: &ImageBuffer<Luma<u8>, Vec<u8>>,
+    config: EdgeTextureConfig,
+) -> EdgeTextureMetrics {
+    let width = gray.width();
+    let height = gray.height();
+
+    let gamma_corrected = apply_gamma(gray, config.gamma);
     let mean_intensity =
         compute_column_mean_intensity(width as usize, height as usize, &gamma_corrected);
     let kernel_size = ensure_odd(config.gaussian_kernel);
@@ -185,6 +327,22 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         config.score_weights,
     );
 
+    EdgeTextureMetrics {
+        width,
+        grad_mean,
+        grad_variance,
+        entropy,
+        white_score,
+        mean_intensity,
+    }
+}
+
+fn build_outcome_from_metrics(
+    config: EdgeTextureConfig,
+    metrics: EdgeTextureMetrics,
+) -> EdgeTextureOutcome {
+    let width = metrics.width;
+
     let mut left_limit = ((width as f32) * config.left_search_ratio).floor() as i32;
     if left_limit <= 0 {
         left_limit = 1;
@@ -208,6 +366,9 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
 
     let min_margin_width = max(3, ((width as f32) * config.min_margin_ratio).floor() as u32);
     let center_max_width = max(3, ((width as f32) * config.center_max_ratio).floor() as u32);
+
+    let white_score = &metrics.white_score;
+    let mean_intensity = &metrics.mean_intensity;
 
     let left_region = if left_limit > 0 {
         let limit = left_limit as usize;
@@ -278,15 +439,6 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         right_region.as_ref(),
     );
 
-    let metrics = EdgeTextureMetrics {
-        width,
-        grad_mean,
-        grad_variance,
-        entropy,
-        white_score: white_score.clone(),
-        mean_intensity: mean_intensity.clone(),
-    };
-
     let notes = EdgeTextureNotes {
         left_limit: left_limit as u32,
         right_start,
@@ -307,6 +459,44 @@ pub fn analyze_edges(image: &DynamicImage, config: EdgeTextureConfig) -> EdgeTex
         metrics,
         notes,
     }
+}
+
+fn build_outcome_from_gpu(
+    config: EdgeTextureConfig,
+    outputs: EdgeTextureGpuOutputs,
+) -> EdgeTextureOutcome {
+    let EdgeTextureGpuOutputs {
+        width,
+        mean_intensity,
+        grad_mean,
+        grad_variance,
+        entropy,
+    } = outputs;
+
+    if width == 0 {
+        return empty_outcome(width, &config);
+    }
+
+    let grad_mean_norm = normalize(&grad_mean);
+    let grad_variance_norm = normalize(&grad_variance);
+    let entropy_norm = normalize(&entropy);
+    let white_score = compute_white_score(
+        &grad_mean_norm,
+        &grad_variance_norm,
+        &entropy_norm,
+        config.score_weights,
+    );
+
+    let metrics = EdgeTextureMetrics {
+        width,
+        grad_mean,
+        grad_variance,
+        entropy,
+        white_score,
+        mean_intensity,
+    };
+
+    build_outcome_from_metrics(config, metrics)
 }
 
 enum SearchDirection {
@@ -640,7 +830,7 @@ fn gaussian_blur(width: usize, height: usize, input: &[f32], kernel_size: u32) -
     output
 }
 
-fn build_gaussian_kernel(size: u32) -> Vec<f32> {
+pub(crate) fn build_gaussian_kernel(size: u32) -> Vec<f32> {
     let size = ensure_odd(size);
     if size <= 1 {
         return vec![1.0];
@@ -1027,5 +1217,41 @@ mod tests {
         assert!(outcome.right_margin.is_none());
         assert!(outcome.center_band.is_none());
         assert_eq!(outcome.split_x, None);
+    }
+
+    #[test]
+    fn analyze_edges_with_acceleration_respects_cpu_preference() {
+        let gray = ImageBuffer::from_pixel(8, 4, Luma([200u8]));
+        let image = DynamicImage::ImageLuma8(gray);
+        let config = EdgeTextureConfig::default();
+
+        let baseline = analyze_edges(&image, config);
+        let analysis = analyze_edges_with_acceleration(
+            &image,
+            config,
+            EdgeTextureAcceleratorPreference::Cpu,
+        );
+
+        assert_eq!(analysis.accelerator, EdgeTextureAccelerator::Cpu);
+        assert_eq!(analysis.outcome.metrics.mean_intensity, baseline.metrics.mean_intensity);
+    }
+
+    #[test]
+    fn analyze_edges_with_acceleration_supports_mock_gpu() {
+        let gray = ImageBuffer::from_pixel(4, 4, Luma([255u8]));
+        let image = DynamicImage::ImageLuma8(gray);
+        let config = EdgeTextureConfig::default();
+
+        std::env::set_var("EDGE_TEXTURE_ACCELERATOR", "mock-gpu");
+
+        let analysis = analyze_edges_with_acceleration(
+            &image,
+            config,
+            EdgeTextureAcceleratorPreference::Auto,
+        );
+
+        std::env::remove_var("EDGE_TEXTURE_ACCELERATOR");
+
+        assert_eq!(analysis.accelerator, EdgeTextureAccelerator::Gpu);
     }
 }
