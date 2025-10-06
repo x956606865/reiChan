@@ -156,6 +156,15 @@ async fn prepare_doublepage_split(
 }
 
 #[tauri::command]
+fn preview_edge_texture_trim(
+    app: tauri::AppHandle,
+    request: doublepage::EdgePreviewRequest,
+) -> Result<doublepage::EdgePreviewResponse, String> {
+    let cache_root = app.path().app_cache_dir().map_err(|err| err.to_string())?;
+    doublepage::preview_edge_texture_trim(&cache_root, request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn analyze_manga_directory(directory: PathBuf) -> Result<manga::MangaSourceAnalysis, String> {
     manga::analyze_manga_directory(directory).map_err(|err| err.to_string())
 }
@@ -779,6 +788,7 @@ pub fn run() {
             update_port_favorite,
             analyze_manga_directory,
             prepare_doublepage_split,
+            preview_edge_texture_trim,
             rename_manga_sequence,
             upload_copyparty,
             create_manga_job,

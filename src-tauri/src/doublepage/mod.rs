@@ -7,8 +7,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use chrono::{SecondsFormat, Utc};
-use image::{DynamicImage, GenericImageView, ImageBuffer, Luma};
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Luma};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 mod config;
 pub use config::{
@@ -81,6 +82,45 @@ pub struct SplitCommandOutcome {
     pub report_path: Option<PathBuf>,
     pub items: Vec<SplitItemReport>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePreviewRequest {
+    pub image_path: PathBuf,
+    pub brightness_thresholds: [f32; 2],
+    #[serde(default)]
+    pub brightness_weight: Option<f32>,
+    #[serde(default)]
+    pub white_threshold: Option<f32>,
+    #[serde(default)]
+    pub left_search_ratio: Option<f32>,
+    #[serde(default)]
+    pub right_search_ratio: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePreviewMetrics {
+    pub width: u32,
+    pub height: u32,
+    pub mean_intensity_min: f32,
+    pub mean_intensity_max: f32,
+    pub mean_intensity_avg: f32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgePreviewResponse {
+    pub original_image: PathBuf,
+    pub trimmed_image: PathBuf,
+    pub left_margin: Option<MarginRegion>,
+    pub right_margin: Option<MarginRegion>,
+    pub brightness_thresholds: [f32; 2],
+    pub brightness_weight: f32,
+    pub confidence_threshold: f32,
+    pub metrics: EdgePreviewMetrics,
+    pub search_ratios: [f32; 2],
 }
 
 pub const SPLIT_PROGRESS_EVENT: &str = "doublepage-split-progress";
@@ -270,6 +310,18 @@ impl From<serde_json::Error> for SplitError {
     fn from(value: serde_json::Error) -> Self {
         SplitError::ReportSerialization(value)
     }
+}
+
+#[derive(Debug, Error)]
+pub enum EdgePreviewError {
+    #[error("所选文件无法读取，请检查路径或格式")]
+    UnsupportedImage,
+    #[error("亮白阈值需在 0-255 范围内，且留黑阈值不得高于亮白阈值")]
+    InvalidThresholds,
+    #[error("图像处理失败: {0}")]
+    Image(#[from] image::ImageError),
+    #[error("文件系统错误: {0}")]
+    Io(#[from] io::Error),
 }
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"];
@@ -1069,19 +1121,11 @@ fn clamp_split_to_center(split_x: u32, width: u32, max_ratio: f32) -> (u32, bool
     }
 }
 
-fn trim_page_with_edge_texture(
-    page: DynamicImage,
-    config: EdgeTextureConfig,
+fn compute_trim_bounds(
+    outcome: &EdgeTextureOutcome,
+    width: u32,
     confidence_threshold: f32,
-) -> DynamicImage {
-    let width = page.width();
-    let height = page.height();
-    if width <= 1 || height == 0 {
-        return page;
-    }
-
-    let outcome = analyze_edges(&page, config);
-
+) -> Option<(u32, u32)> {
     let mut x_start = 0u32;
     let mut x_end = width;
 
@@ -1104,10 +1148,137 @@ fn trim_page_with_edge_texture(
     }
 
     if x_end <= x_start || x_end - x_start < 2 {
+        return None;
+    }
+
+    Some((x_start, x_end))
+}
+
+fn trim_page_with_edge_texture(
+    page: DynamicImage,
+    config: EdgeTextureConfig,
+    confidence_threshold: f32,
+) -> DynamicImage {
+    let width = page.width();
+    let height = page.height();
+    if width <= 1 || height == 0 {
         return page;
     }
 
-    page.crop_imm(x_start, 0, x_end - x_start, height)
+    let outcome = analyze_edges(&page, config);
+
+    if let Some((x_start, x_end)) = compute_trim_bounds(&outcome, width, confidence_threshold) {
+        page.crop_imm(x_start, 0, x_end - x_start, height)
+    } else {
+        page
+    }
+}
+
+pub fn preview_edge_texture_trim(
+    cache_root: &Path,
+    request: EdgePreviewRequest,
+) -> Result<EdgePreviewResponse, EdgePreviewError> {
+    if !request.image_path.exists() || !is_supported_image(&request.image_path) {
+        return Err(EdgePreviewError::UnsupportedImage);
+    }
+
+    let [raw_bright, raw_dark] = request.brightness_thresholds;
+    if raw_dark > raw_bright {
+        return Err(EdgePreviewError::InvalidThresholds);
+    }
+
+    let bright = raw_bright.clamp(0.0, 255.0);
+    let mut dark = raw_dark.clamp(0.0, 255.0);
+    if dark > bright {
+        dark = bright;
+    }
+
+    let canonical_image_path =
+        fs::canonicalize(&request.image_path).map_err(|_| EdgePreviewError::UnsupportedImage)?;
+    let image = image::open(&canonical_image_path)?;
+
+    let mut overrides = EdgeTextureThresholdOverrides::default();
+    overrides.brightness_thresholds = Some([bright, dark]);
+    if let Some(weight) = request.brightness_weight {
+        overrides.brightness_weight = Some(weight.clamp(0.0, 1.0));
+    } else {
+        overrides.brightness_weight = Some(0.5);
+    }
+    if let Some(white_threshold) = request.white_threshold {
+        overrides.white_threshold = Some(white_threshold);
+    }
+    if let Some(left_ratio) = request.left_search_ratio {
+        overrides.left_search_ratio = Some(left_ratio.clamp(0.0, 0.5));
+    }
+    if let Some(right_ratio) = request.right_search_ratio {
+        overrides.right_search_ratio = Some(right_ratio.clamp(0.0, 0.5));
+    }
+
+    let split_config = SplitConfig::default();
+    let confidence_threshold = split_config.confidence_threshold;
+    let padding_ratio = split_config.padding_ratio;
+    let config = EdgeTextureConfig::default().apply_overrides(&overrides);
+    let brightness_weight = config.brightness_weight;
+    let search_ratios = [config.left_search_ratio, config.right_search_ratio];
+    let outcome = analyze_edges(&image, config);
+
+    let width = image.width();
+    let height = image.height();
+    let trimmed = match compute_trim_bounds(&outcome, width, confidence_threshold) {
+        Some((start, end)) if end > start && end - start < width => {
+            let padding_x = (padding_ratio * width as f32).max(1.0) as u32;
+            let padded_start = start.saturating_sub(padding_x);
+            let padded_end = (end + padding_x).min(width);
+            if padded_end > padded_start {
+                image.crop_imm(padded_start, 0, padded_end - padded_start, height)
+            } else {
+                image.clone()
+            }
+        }
+        _ => image.clone(),
+    };
+
+    let preview_dir = cache_root.join("edge-preview");
+    fs::create_dir_all(&preview_dir)?;
+    let file_name = format!("edge-preview-{}.png", Utc::now().format("%Y%m%d%H%M%S%3f"));
+    let trimmed_path = preview_dir.join(file_name);
+    trimmed.save_with_format(&trimmed_path, ImageFormat::Png)?;
+    let trimmed_path = fs::canonicalize(trimmed_path)?;
+
+    let mean_values = &outcome.metrics.mean_intensity;
+    let (min_intensity, max_intensity, avg_intensity) = if mean_values.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        let mut min_v = f32::MAX;
+        let mut max_v = f32::MIN;
+        let mut sum = 0.0f32;
+        for value in mean_values {
+            min_v = min_v.min(*value);
+            max_v = max_v.max(*value);
+            sum += *value;
+        }
+        (min_v, max_v, sum / mean_values.len() as f32)
+    };
+
+    let response = EdgePreviewResponse {
+        original_image: canonical_image_path,
+        trimmed_image: trimmed_path,
+        left_margin: outcome.left_margin,
+        right_margin: outcome.right_margin,
+        brightness_thresholds: [bright, dark],
+        brightness_weight,
+        confidence_threshold,
+        metrics: EdgePreviewMetrics {
+            width,
+            height,
+            mean_intensity_min: min_intensity,
+            mean_intensity_max: max_intensity,
+            mean_intensity_avg: avg_intensity,
+        },
+        search_ratios,
+    };
+
+    Ok(response)
 }
 
 fn save_image(image: &DynamicImage, target: &Path) -> Result<(), SplitError> {
@@ -1158,6 +1329,47 @@ mod tests {
             .join("manga-content-aware-split")
             .join("phase1_input")
             .join(name)
+    }
+
+    #[test]
+    fn preview_generates_trimmed_image() {
+        let cache_dir = TempDir::new().expect("cache dir");
+        let request = EdgePreviewRequest {
+            image_path: fixture_path("double_page_story.png"),
+            brightness_thresholds: [200.0, 75.0],
+            brightness_weight: None,
+            white_threshold: None,
+        };
+
+        let response =
+            preview_edge_texture_trim(cache_dir.path(), request).expect("preview should succeed");
+
+        assert!(response.trimmed_image.exists());
+        let (orig_width, orig_height) =
+            image::image_dimensions(&response.original_image).expect("original dimensions");
+        let (trim_width, _) =
+            image::image_dimensions(&response.trimmed_image).expect("trimmed dimensions");
+
+        assert!(trim_width > 0);
+        assert!(trim_width <= orig_width);
+        assert_eq!(response.brightness_thresholds, [200.0, 75.0]);
+        assert_eq!(response.metrics.width, orig_width);
+        assert_eq!(response.metrics.height, orig_height);
+    }
+
+    #[test]
+    fn preview_rejects_invalid_thresholds() {
+        let cache_dir = TempDir::new().expect("cache dir");
+        let request = EdgePreviewRequest {
+            image_path: fixture_path("double_page_story.png"),
+            brightness_thresholds: [80.0, 120.0],
+            brightness_weight: None,
+            white_threshold: None,
+        };
+
+        let err = preview_edge_texture_trim(cache_dir.path(), request)
+            .expect_err("invalid thresholds should fail");
+        assert!(matches!(err, EdgePreviewError::InvalidThresholds));
     }
 
     #[test]

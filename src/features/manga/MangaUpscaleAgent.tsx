@@ -1,7 +1,8 @@
 import type { ChangeEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { open } from '@tauri-apps/plugin-dialog';
 
 type RenameEntry = {
   originalName: string;
@@ -96,6 +97,73 @@ type SplitCommandOutcome = {
   reportPath?: string | null;
   items: SplitItemReport[];
   warnings: string[];
+};
+
+type EdgeMarginRegion = {
+  startX: number;
+  endX: number;
+  meanScore: number;
+  confidence: number;
+};
+
+type EdgePreviewMetrics = {
+  width: number;
+  height: number;
+  meanIntensityMin: number;
+  meanIntensityMax: number;
+  meanIntensityAvg: number;
+};
+
+type EdgePreviewResponsePayload = {
+  originalImage: string;
+  trimmedImage: string;
+  leftMargin?: EdgeMarginRegion | null;
+  rightMargin?: EdgeMarginRegion | null;
+  brightnessThresholds: [number, number];
+  brightnessWeight: number;
+  confidenceThreshold: number;
+  metrics: EdgePreviewMetrics;
+  searchRatios: [number, number];
+};
+
+type EdgePreviewPayload = EdgePreviewResponsePayload & {
+  originalUrl: string;
+  trimmedUrl: string;
+  requestedBrightnessThresholds: [number, number];
+  thresholdsMatched: boolean;
+  requestedSearchRatios: [number, number];
+  searchRatiosMatched: boolean;
+};
+
+const formatThresholdValue = (value: number): string => {
+  if (!Number.isFinite(value)) {
+    return '—';
+  }
+  return String(Number(value.toFixed(2)));
+};
+
+const formatRatioValue = (value: number): string => {
+  if (!Number.isFinite(value)) {
+    return '—';
+  }
+  return value.toFixed(3);
+};
+
+type EdgePreviewState = {
+  visible: boolean;
+  loading: boolean;
+  data: EdgePreviewPayload | null;
+  error: string | null;
+};
+
+type EdgeThresholdErrors = {
+  bright?: string;
+  dark?: string;
+};
+
+type EdgeSearchRatioErrors = {
+  left?: string;
+  right?: string;
 };
 
 type RenameSplitPayload = {
@@ -424,6 +492,9 @@ const DEFAULT_POLL_INTERVAL = 1000;
 const SETTINGS_KEY = 'manga-upscale-agent:v1';
 const UPLOAD_DEFAULTS_KEY = `${SETTINGS_KEY}:upload-defaults`;
 const SERVICE_ADDRESS_BOOK_KEY = `${SETTINGS_KEY}:service-addresses`;
+const DEFAULT_EDGE_SEARCH_RATIO = 0.18;
+const EDGE_SEARCH_RATIO_MIN = 0.02;
+const EDGE_SEARCH_RATIO_MAX = 0.5;
 
 const LEGACY_SETTINGS_KEY = 'manga-upscale-agent';
 const LEGACY_UPLOAD_DEFAULTS_KEY = `${LEGACY_SETTINGS_KEY}:upload-defaults`;
@@ -525,6 +596,132 @@ const MangaUpscaleAgent = () => {
   const [contentSplitEnabled, setContentSplitEnabled] = useState(false);
   const [splitAlgorithm, setSplitAlgorithm] =
     useState<SplitAlgorithmOption>('edgeTexture');
+  const [edgeBrightnessThresholds, setEdgeBrightnessThresholds] =
+    useState<[number, number]>([200, 75]);
+  const [edgeSearchRatios, setEdgeSearchRatios] = useState<[number, number]>([
+    DEFAULT_EDGE_SEARCH_RATIO,
+    DEFAULT_EDGE_SEARCH_RATIO,
+  ]);
+  const [edgeThresholdErrors, setEdgeThresholdErrors] =
+    useState<EdgeThresholdErrors>({});
+  const [edgeSearchRatioErrors, setEdgeSearchRatioErrors] =
+    useState<EdgeSearchRatioErrors>({});
+  const [edgePreview, setEdgePreview] = useState<EdgePreviewState>({
+    visible: false,
+    loading: false,
+    data: null,
+    error: null,
+  });
+  const appliedBrightnessThresholds =
+    edgePreview.data?.brightnessThresholds ?? edgeBrightnessThresholds;
+  const requestedBrightnessThresholds =
+    edgePreview.data?.requestedBrightnessThresholds ?? edgeBrightnessThresholds;
+  const previewThresholdsMatched =
+    edgePreview.data?.thresholdsMatched ?? true;
+  const appliedSearchRatios = edgePreview.data?.searchRatios ?? edgeSearchRatios;
+  const requestedSearchRatios =
+    edgePreview.data?.requestedSearchRatios ?? edgeSearchRatios;
+  const previewSearchRatiosMatched =
+    edgePreview.data?.searchRatiosMatched ?? true;
+  const computeEdgeThresholdErrors = useCallback(
+    (bright: number, dark: number): EdgeThresholdErrors => {
+      const next: EdgeThresholdErrors = {};
+      if (!Number.isFinite(bright) || bright < 0 || bright > 255) {
+        next.bright = '亮白阈值需在 0-255 范围内';
+      }
+      if (!Number.isFinite(dark) || dark < 0 || dark > 255) {
+        next.dark = '留黑阈值需在 0-255 范围内';
+      }
+      if (!next.bright && !next.dark && dark > bright) {
+        next.dark = '留黑阈值不得高于亮白阈值';
+      }
+      return next;
+    },
+    []
+  );
+  const computeEdgeSearchRatioErrors = useCallback(
+    (left: number, right: number): EdgeSearchRatioErrors => {
+      const next: EdgeSearchRatioErrors = {};
+      if (!Number.isFinite(left) || left < EDGE_SEARCH_RATIO_MIN || left > EDGE_SEARCH_RATIO_MAX) {
+        next.left = `左侧搜索比例需在 ${EDGE_SEARCH_RATIO_MIN} ~ ${EDGE_SEARCH_RATIO_MAX} 之间`;
+      }
+      if (
+        !Number.isFinite(right) ||
+        right < EDGE_SEARCH_RATIO_MIN ||
+        right > EDGE_SEARCH_RATIO_MAX
+      ) {
+        next.right = `右侧搜索比例需在 ${EDGE_SEARCH_RATIO_MIN} ~ ${EDGE_SEARCH_RATIO_MAX} 之间`;
+      }
+      return next;
+    },
+    []
+  );
+
+  const hasEdgeThresholdError = useMemo(
+    () => Boolean(edgeThresholdErrors.bright || edgeThresholdErrors.dark),
+    [edgeThresholdErrors]
+  );
+  const hasEdgeSearchRatioError = useMemo(
+    () => Boolean(edgeSearchRatioErrors.left || edgeSearchRatioErrors.right),
+    [edgeSearchRatioErrors]
+  );
+  const hasEdgeInputError = useMemo(
+    () => hasEdgeThresholdError || hasEdgeSearchRatioError,
+    [hasEdgeSearchRatioError, hasEdgeThresholdError]
+  );
+
+  useEffect(() => {
+    setEdgeThresholdErrors((prev) => {
+      const [bright, dark] = edgeBrightnessThresholds;
+      const next = computeEdgeThresholdErrors(bright, dark);
+      if (prev.bright === next.bright && prev.dark === next.dark) {
+        return prev;
+      }
+      return next;
+    });
+  }, [computeEdgeThresholdErrors, edgeBrightnessThresholds]);
+
+  useEffect(() => {
+    setEdgeSearchRatioErrors((prev) => {
+      const [left, right] = edgeSearchRatios;
+      const next = computeEdgeSearchRatioErrors(left, right);
+      if (prev.left === next.left && prev.right === next.right) {
+        return prev;
+      }
+      return next;
+    });
+  }, [computeEdgeSearchRatioErrors, edgeSearchRatios]);
+
+  const handleEdgeThresholdChange = useCallback(
+    (index: 0 | 1) => (event: ChangeEvent<HTMLInputElement>) => {
+      const raw = event.currentTarget.value;
+      const nextValue = Number(raw);
+      setEdgeBrightnessThresholds((prev) => {
+        const updated: [number, number] = [...prev];
+        if (Number.isFinite(nextValue)) {
+          updated[index] = nextValue;
+          return updated;
+        }
+        return prev;
+      });
+    },
+    []
+  );
+  const handleEdgeSearchRatioChange = useCallback(
+    (index: 0 | 1) => (event: ChangeEvent<HTMLInputElement>) => {
+      const raw = event.currentTarget.value;
+      const nextValue = Number(raw);
+      setEdgeSearchRatios((prev) => {
+        const updated: [number, number] = [...prev];
+        if (Number.isFinite(nextValue)) {
+          updated[index] = nextValue;
+          return updated;
+        }
+        return prev;
+      });
+    },
+    []
+  );
   const [splitWorkspace, setSplitWorkspace] = useState<string | null>(null);
   const [splitSummaryState, setSplitSummaryState] =
     useState<RenameSplitSummary | null>(null);
@@ -589,6 +786,11 @@ const MangaUpscaleAgent = () => {
     setSplitSourceRoot(null);
     setSplitError(null);
     setSplitProgress(null);
+    setEdgePreview({ visible: false, loading: false, data: null, error: null });
+  }, []);
+
+  const handleCloseEdgePreview = useCallback(() => {
+    setEdgePreview({ visible: false, loading: false, data: null, error: null });
   }, []);
 
   const handleSplitAlgorithmChange = useCallback(
@@ -601,9 +803,113 @@ const MangaUpscaleAgent = () => {
       resetSplitState();
       setSplitPreparing(false);
       setSplitEstimate(null);
+      if (value !== 'edgeTexture') {
+        handleCloseEdgePreview();
+      }
     },
-    [resetSplitState, splitAlgorithm]
+    [handleCloseEdgePreview, resetSplitState, splitAlgorithm]
   );
+
+  const handleEdgePreview = useCallback(async () => {
+    const [bright, dark] = edgeBrightnessThresholds;
+    const nextErrors = computeEdgeThresholdErrors(bright, dark);
+    setEdgeThresholdErrors(nextErrors);
+    if (nextErrors.bright || nextErrors.dark) {
+      return;
+    }
+    const [leftRatio, rightRatio] = edgeSearchRatios;
+    const nextRatioErrors = computeEdgeSearchRatioErrors(leftRatio, rightRatio);
+    setEdgeSearchRatioErrors(nextRatioErrors);
+    if (nextRatioErrors.left || nextRatioErrors.right) {
+      return;
+    }
+
+    let selectedPath: string | null = null;
+    try {
+      const selection = await open({
+        multiple: false,
+        filters: [
+          {
+            name: '图片',
+            extensions: ['png', 'jpg', 'jpeg', 'webp', 'avif'],
+          },
+        ],
+      });
+
+      if (Array.isArray(selection)) {
+        selectedPath = selection[0] ?? null;
+      } else {
+        selectedPath = selection ?? null;
+      }
+
+      if (!selectedPath) {
+        return;
+      }
+
+      setEdgePreview((prev) => ({
+        visible: true,
+        loading: true,
+        data: prev.data,
+        error: null,
+      }));
+
+      const response = await invoke<EdgePreviewResponsePayload>(
+        'preview_edge_texture_trim',
+        {
+          request: {
+            imagePath: selectedPath,
+            brightnessThresholds: [bright, dark],
+            brightnessWeight: 0.5,
+            whiteThreshold: 1.0,
+            leftSearchRatio: leftRatio,
+            rightSearchRatio: rightRatio,
+          },
+        }
+      );
+
+      const requestedThresholds: [number, number] = [bright, dark];
+      const appliedThresholds = response.brightnessThresholds;
+      const thresholdsMatched = appliedThresholds.every((value, index) => {
+        const expected = requestedThresholds[index];
+        return Math.abs(value - expected) <= 1e-3;
+      });
+      const requestedRatios: [number, number] = [leftRatio, rightRatio];
+      const appliedRatios = response.searchRatios;
+      const ratiosMatched = appliedRatios.every((value, index) => {
+        const expected = requestedRatios[index];
+        return Math.abs(value - expected) <= 1e-4;
+      });
+
+      const payload: EdgePreviewPayload = {
+        ...response,
+        originalUrl: convertFileSrc(response.originalImage),
+        trimmedUrl: convertFileSrc(response.trimmedImage),
+        requestedBrightnessThresholds: requestedThresholds,
+        thresholdsMatched,
+        requestedSearchRatios: requestedRatios,
+        searchRatiosMatched: ratiosMatched,
+      };
+
+      setEdgePreview({
+        visible: true,
+        loading: false,
+        data: payload,
+        error: null,
+      });
+    } catch (error) {
+      setEdgePreview({
+        visible: true,
+        loading: false,
+        data: null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [
+    computeEdgeThresholdErrors,
+    edgeBrightnessThresholds,
+    edgeSearchRatios,
+    computeEdgeSearchRatioErrors,
+  ]);
 
   const resetWizardState = useCallback(() => {
     setCurrentStep('source');
@@ -827,11 +1133,20 @@ const MangaUpscaleAgent = () => {
       let defaultsServiceUrl: string | null = null;
       let storedAddressBook: ServiceAddressBook | null = null;
       let legacyAddressBook: ServiceAddressBook | null = null;
+      let storedEdgeThresholds: [number, number] | null = null;
+      let storedEdgeSearchRatios: [number, number] | null = null;
 
       if (stored) {
         const parsed = JSON.parse(stored) as {
           uploadForm?: Partial<UploadFormState>;
           jobForm?: Partial<JobFormState>;
+          splitOverrides?: {
+            edgeTexture?: {
+              brightnessThresholds?: [number, number];
+              leftSearchRatio?: number;
+              rightSearchRatio?: number;
+            };
+          };
         };
 
         if (parsed.uploadForm) {
@@ -842,6 +1157,27 @@ const MangaUpscaleAgent = () => {
         }
         if (parsed.jobForm) {
           jobPatch = { ...parsed.jobForm };
+        }
+        const thresholds = parsed.splitOverrides?.edgeTexture?.brightnessThresholds;
+        if (
+          Array.isArray(thresholds) &&
+          thresholds.length === 2 &&
+          typeof thresholds[0] === 'number' &&
+          typeof thresholds[1] === 'number'
+        ) {
+          storedEdgeThresholds = [thresholds[0], thresholds[1]];
+        }
+        const leftRatio = parsed.splitOverrides?.edgeTexture?.leftSearchRatio;
+        const rightRatio = parsed.splitOverrides?.edgeTexture?.rightSearchRatio;
+        if (
+          typeof leftRatio === 'number' &&
+          typeof rightRatio === 'number' &&
+          leftRatio >= EDGE_SEARCH_RATIO_MIN &&
+          leftRatio <= EDGE_SEARCH_RATIO_MAX &&
+          rightRatio >= EDGE_SEARCH_RATIO_MIN &&
+          rightRatio <= EDGE_SEARCH_RATIO_MAX
+        ) {
+          storedEdgeSearchRatios = [leftRatio, rightRatio];
         }
       }
 
@@ -975,6 +1311,12 @@ const MangaUpscaleAgent = () => {
       }
       if (jobPatch && Object.keys(jobPatch).length > 0) {
         setJobForm((prev) => ({ ...prev, ...jobPatch }));
+      }
+      if (storedEdgeThresholds) {
+        setEdgeBrightnessThresholds(storedEdgeThresholds);
+      }
+      if (storedEdgeSearchRatios) {
+        setEdgeSearchRatios(storedEdgeSearchRatios);
       }
       setHasRestoredDefaults(true);
     } catch (storageError) {
@@ -1175,6 +1517,13 @@ const MangaUpscaleAgent = () => {
       uploadForm,
       jobForm,
       jobParams,
+      splitOverrides: {
+        edgeTexture: {
+          brightnessThresholds: edgeBrightnessThresholds,
+          leftSearchRatio: edgeSearchRatios[0],
+          rightSearchRatio: edgeSearchRatios[1],
+        },
+      },
     };
 
     try {
@@ -1182,7 +1531,13 @@ const MangaUpscaleAgent = () => {
     } catch (storageError) {
       console.warn('Failed to persist manga agent settings', storageError);
     }
-  }, [uploadForm, jobForm, jobParams]);
+  }, [
+    edgeBrightnessThresholds,
+    edgeSearchRatios,
+    jobForm,
+    jobParams,
+    uploadForm,
+  ]);
 
   useEffect(() => {
     if (!isMultiVolumeSource) {
@@ -1450,14 +1805,17 @@ const MangaUpscaleAgent = () => {
       setSplitPreparing(true);
       setSplitError(null);
       try {
+        const [brightThreshold, darkThreshold] = edgeBrightnessThresholds;
         const thresholds: SplitThresholdOverrides =
           splitAlgorithm === 'edgeTexture'
             ? {
                 mode: 'edgeTextureOnly',
                 edgeTexture: {
                   whiteThreshold: 1.0,
-                  brightnessThresholds: [200.0, 75.0],
+                  brightnessThresholds: [brightThreshold, darkThreshold],
                   brightnessWeight: 0.5,
+                  leftSearchRatio: edgeSearchRatios[0],
+                  rightSearchRatio: edgeSearchRatios[1],
                 },
               }
             : { mode: 'projectionOnly' };
@@ -1518,6 +1876,8 @@ const MangaUpscaleAgent = () => {
       splitReportPath,
       splitWarningsState,
       splitAlgorithm,
+      edgeBrightnessThresholds,
+      edgeSearchRatios,
     ]
   );
 
@@ -1526,8 +1886,29 @@ const MangaUpscaleAgent = () => {
       setSplitError('请先启用内容感知拆分开关。');
       return;
     }
+    const [bright, dark] = edgeBrightnessThresholds;
+    const nextErrors = computeEdgeThresholdErrors(bright, dark);
+    setEdgeThresholdErrors(nextErrors);
+    if (nextErrors.bright || nextErrors.dark) {
+      setSplitError('请先修复阈值输入错误。');
+      return;
+    }
+    const [leftRatio, rightRatio] = edgeSearchRatios;
+    const nextRatioErrors = computeEdgeSearchRatioErrors(leftRatio, rightRatio);
+    setEdgeSearchRatioErrors(nextRatioErrors);
+    if (nextRatioErrors.left || nextRatioErrors.right) {
+      setSplitError('请先修复搜索比例输入错误。');
+      return;
+    }
     await ensureSplitWorkspace(true);
-  }, [contentSplitEnabled, ensureSplitWorkspace]);
+  }, [
+    computeEdgeThresholdErrors,
+    contentSplitEnabled,
+    edgeBrightnessThresholds,
+    edgeSearchRatios,
+    computeEdgeSearchRatioErrors,
+    ensureSplitWorkspace,
+  ]);
 
   const handleToggleSplit = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => {
@@ -3600,6 +3981,85 @@ const MangaUpscaleAgent = () => {
                     <option value="projection">传统投影</option>
                   </select>
                 </label>
+
+                {splitAlgorithm === 'edgeTexture' && (
+                  <div className="edge-threshold-controls">
+                    <label className="form-field compact">
+                      <span className="field-label">亮白阈值</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={255}
+                        value={edgeBrightnessThresholds[0]}
+                        onChange={handleEdgeThresholdChange(0)}
+                      />
+                      {edgeThresholdErrors.bright && (
+                        <span className="field-error">
+                          {edgeThresholdErrors.bright}
+                        </span>
+                      )}
+                    </label>
+
+                    <label className="form-field compact">
+                      <span className="field-label">留黑阈值</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={255}
+                        value={edgeBrightnessThresholds[1]}
+                        onChange={handleEdgeThresholdChange(1)}
+                      />
+                      {edgeThresholdErrors.dark && (
+                        <span className="field-error">
+                          {edgeThresholdErrors.dark}
+                        </span>
+                      )}
+                    </label>
+
+                    <label className="form-field compact">
+                      <span className="field-label">左侧搜索比例</span>
+                      <input
+                        type="number"
+                        min={EDGE_SEARCH_RATIO_MIN}
+                        max={EDGE_SEARCH_RATIO_MAX}
+                        step={0.01}
+                        value={edgeSearchRatios[0]}
+                        onChange={handleEdgeSearchRatioChange(0)}
+                      />
+                      {edgeSearchRatioErrors.left && (
+                        <span className="field-error">
+                          {edgeSearchRatioErrors.left}
+                        </span>
+                      )}
+                    </label>
+
+                    <label className="form-field compact">
+                      <span className="field-label">右侧搜索比例</span>
+                      <input
+                        type="number"
+                        min={EDGE_SEARCH_RATIO_MIN}
+                        max={EDGE_SEARCH_RATIO_MAX}
+                        step={0.01}
+                        value={edgeSearchRatios[1]}
+                        onChange={handleEdgeSearchRatioChange(1)}
+                      />
+                      {edgeSearchRatioErrors.right && (
+                        <span className="field-error">
+                          {edgeSearchRatioErrors.right}
+                        </span>
+                      )}
+                    </label>
+
+                    <button
+                      type="button"
+                      className="split-action-button"
+                      onClick={handleEdgePreview}
+                      disabled={edgePreview.loading || hasEdgeInputError}
+                    >
+                      {edgePreview.loading ? '预览中…' : '预览阈值效果'}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -4650,6 +5110,177 @@ const MangaUpscaleAgent = () => {
             </button>
           </div>
         </section>
+      )}
+
+      {edgePreview.visible && (
+        <div className="edge-preview-backdrop" role="dialog" aria-modal="true">
+          <div className="edge-preview-dialog">
+            <header className="edge-preview-header">
+              <h3>阈值预览</h3>
+              {edgePreview.data ? (
+                <>
+                  <p>
+                    实际阈值：亮白 {formatThresholdValue(appliedBrightnessThresholds[0])}
+                    ，留黑 {formatThresholdValue(appliedBrightnessThresholds[1])}
+                  </p>
+                  <p>
+                    实际搜索比例：左 {formatRatioValue(appliedSearchRatios[0])}，右{' '}
+                    {formatRatioValue(appliedSearchRatios[1])}
+                  </p>
+                  {!edgePreview.loading && (
+                    <>
+                      {previewThresholdsMatched ? (
+                        <p className="status status-tip">阈值已按照当前输入生效。</p>
+                      ) : (
+                        <p className="status status-warning">
+                          请求阈值为亮白 {formatThresholdValue(requestedBrightnessThresholds[0])}，留黑{' '}
+                          {formatThresholdValue(requestedBrightnessThresholds[1])}，后端已调整为上述实际数值。
+                        </p>
+                      )}
+                      {previewSearchRatiosMatched ? (
+                        <p className="status status-tip">搜索比例已按照当前输入生效。</p>
+                      ) : (
+                        <p className="status status-warning">
+                          请求搜索比例为左 {formatRatioValue(requestedSearchRatios[0])}，右{' '}
+                          {formatRatioValue(requestedSearchRatios[1])}，后端已调整为上述实际数值。
+                        </p>
+                      )}
+                    </>
+                  )}
+                </>
+              ) : (
+                <p>
+                  当前输入：亮白 {formatThresholdValue(edgeBrightnessThresholds[0])}，留黑{' '}
+                  {formatThresholdValue(edgeBrightnessThresholds[1])}；搜索比例 左{' '}
+                  {formatRatioValue(edgeSearchRatios[0])}，右{' '}
+                  {formatRatioValue(edgeSearchRatios[1])}
+                </p>
+              )}
+            </header>
+
+            {edgePreview.loading && (
+              <p className="status status-tip">正在生成预览…</p>
+            )}
+
+            {!edgePreview.loading && edgePreview.error && (
+              <p className="status status-error">{edgePreview.error}</p>
+            )}
+
+            {!edgePreview.loading && !edgePreview.error && edgePreview.data && (
+              <>
+                <div className="edge-preview-images">
+                  <figure>
+                    <img
+                      src={edgePreview.data.originalUrl}
+                      alt="原图预览"
+                    />
+                    <figcaption>原图</figcaption>
+                  </figure>
+                  <figure>
+                    <img
+                      src={edgePreview.data.trimmedUrl}
+                      alt="裁剪结果预览"
+                    />
+                    <figcaption>裁剪结果</figcaption>
+                  </figure>
+                </div>
+
+                <div className="edge-preview-metrics">
+                  <dl>
+                    <div>
+                      <dt>请求阈值</dt>
+                      <dd>
+                        亮白 {formatThresholdValue(requestedBrightnessThresholds[0])}，留黑{' '}
+                        {formatThresholdValue(requestedBrightnessThresholds[1])}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>实际阈值</dt>
+                      <dd>
+                        亮白 {formatThresholdValue(appliedBrightnessThresholds[0])}，留黑{' '}
+                        {formatThresholdValue(appliedBrightnessThresholds[1])}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>请求搜索比例</dt>
+                      <dd>
+                        左 {formatRatioValue(requestedSearchRatios[0])}，右{' '}
+                        {formatRatioValue(requestedSearchRatios[1])}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>实际搜索比例</dt>
+                      <dd>
+                        左 {formatRatioValue(appliedSearchRatios[0])}，右{' '}
+                        {formatRatioValue(appliedSearchRatios[1])}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>图像尺寸</dt>
+                      <dd>
+                        {edgePreview.data.metrics.width} ×{' '}
+                        {edgePreview.data.metrics.height}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>亮度均值</dt>
+                      <dd>
+                        {edgePreview.data.metrics.meanIntensityAvg.toFixed(2)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>亮度范围</dt>
+                      <dd>
+                        {edgePreview.data.metrics.meanIntensityMin.toFixed(2)} ~{' '}
+                        {edgePreview.data.metrics.meanIntensityMax.toFixed(2)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>置信阈值</dt>
+                      <dd>{edgePreview.data.confidenceThreshold.toFixed(2)}</dd>
+                    </div>
+                    <div>
+                      <dt>亮度权重</dt>
+                      <dd>{edgePreview.data.brightnessWeight.toFixed(2)}</dd>
+                    </div>
+                  </dl>
+
+                  <div className="edge-preview-notes">
+                    {edgePreview.data.leftMargin && (
+                      <span>
+                        左侧置信度：
+                        {edgePreview.data.leftMargin.confidence.toFixed(3)}
+                      </span>
+                    )}
+                    {edgePreview.data.rightMargin && (
+                      <span>
+                        右侧置信度：
+                        {edgePreview.data.rightMargin.confidence.toFixed(3)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+
+            <div className="edge-preview-actions">
+              <button
+                type="button"
+                onClick={handleEdgePreview}
+                disabled={edgePreview.loading}
+              >
+                重新选择图片
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={handleCloseEdgePreview}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
