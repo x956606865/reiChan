@@ -12,16 +12,29 @@ interface SplitThumbnailGridProps {
   selection: string[];
   onSelect: (sourcePath: string, multi: boolean) => void;
   loading: boolean;
+  onOpenDetail?: (item: SplitThumbnailGridItem) => void;
 }
 
 const SplitThumbnailGrid: FC<SplitThumbnailGridProps> = memo(
-  ({ items, selection, onSelect, loading }) => {
+  ({ items, selection, onSelect, loading, onOpenDetail }) => {
     const handleClick = useCallback(
-      (sourcePath: string) => (event: MouseEvent<HTMLButtonElement>) => {
+      (sourcePath: string) => (event: MouseEvent<HTMLDivElement>) => {
         const multi = event.metaKey || event.ctrlKey;
         onSelect(sourcePath, multi);
       },
       [onSelect]
+    );
+
+    const handleThumbnailClick = useCallback(
+      (item: SplitThumbnailGridItem) => (event: MouseEvent<HTMLDivElement>) => {
+        if (!onOpenDetail) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        onOpenDetail(item);
+      },
+      [onOpenDetail]
     );
 
     if (items.length === 0) {
@@ -37,16 +50,47 @@ const SplitThumbnailGrid: FC<SplitThumbnailGridProps> = memo(
         {items.map((item) => {
           const isSelected = selection.includes(item.sourcePath);
           return (
-            <button
-              type="button"
+            <div
               key={item.sourcePath}
               role="listitem"
               className={
                 isSelected ? 'split-grid-item selected' : 'split-grid-item'
               }
               onClick={handleClick(item.sourcePath)}
+              title={onOpenDetail ? '点击缩略图可进入细化视图' : undefined}
+              tabIndex={0}
+              data-selected={isSelected ? 'true' : 'false'}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  onSelect(item.sourcePath, event.metaKey || event.ctrlKey);
+                }
+                if ((event.key === 'Enter' || event.key === ' ') && onOpenDetail) {
+                  event.stopPropagation();
+                }
+              }}
             >
-              <div className="split-grid-thumbnail">
+              <div
+                className="split-grid-thumbnail"
+                onClick={handleThumbnailClick(item)}
+                role={onOpenDetail ? 'button' : undefined}
+                tabIndex={onOpenDetail ? 0 : undefined}
+                onKeyDown={
+                  onOpenDetail
+                    ? (event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          onOpenDetail(item);
+                        }
+                      }
+                    : undefined
+                }
+                aria-label={
+                  onOpenDetail
+                    ? `放大查看 ${item.displayName ?? item.sourcePath}`
+                    : undefined
+                }
+              >
                 {item.thumbnailUrl ? (
                   <img src={item.thumbnailUrl} alt={item.displayName} />
                 ) : (
@@ -60,7 +104,7 @@ const SplitThumbnailGrid: FC<SplitThumbnailGridProps> = memo(
                 </span>
               </div>
               {item.locked && <span className="split-grid-lock">已锁定</span>}
-            </button>
+            </div>
           );
         })}
       </div>

@@ -18,7 +18,6 @@ interface SplitSettingsPanelProps {
   totalCount: number;
   staged: boolean;
   stagedAny: boolean;
-  hasPendingChanges: boolean;
   previewLoading: boolean;
   onLinesChange: (lines: ManualSplitLines) => void;
   onImageKindChange: (kind: ManualImageKind) => void;
@@ -28,6 +27,11 @@ interface SplitSettingsPanelProps {
   onClearAllStages: () => void;
   onToggleLock: () => void;
   onGeneratePreview: () => void;
+  onImportTemplate: () => void;
+  onExportTemplate: () => void;
+  importingTemplate: boolean;
+  exportingTemplate: boolean;
+  selectionCount: number;
 }
 
 const LABELS = [
@@ -56,9 +60,13 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
     onToggleLock,
     staged,
     stagedAny,
-    hasPendingChanges,
     previewLoading,
     onGeneratePreview,
+    onImportTemplate,
+    onExportTemplate,
+    importingTemplate,
+    exportingTemplate,
+    selectionCount,
   }) => {
     const values = useMemo(() => {
       if (!lines) {
@@ -108,6 +116,26 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
     const hasFeedback = Boolean(
       applyState.errorBubble || runningSummary || applyState.statusText
     );
+
+    const templateSummary = useMemo(() => {
+      if (selectionCount > 0) {
+        return `当前选中 ${selectionCount} 张，导出时仅包含这些草稿。 / Export will include ${selectionCount} selected draft(s).`;
+      }
+      if (totalCount > 0) {
+        return `未选中时默认导出全部 ${totalCount} 张草稿。 / No selection: export all ${totalCount} drafts.`;
+      }
+      return '暂无可导出的草稿。 / Nothing available for export.';
+    }, [selectionCount, totalCount]);
+
+    const disableImport =
+      isApplying || importingTemplate || totalCount === 0 || previewLoading;
+    const disableExport =
+      isApplying || exportingTemplate || totalCount === 0;
+
+    const exportLabel =
+      selectionCount > 0
+        ? '导出选中 / Export selected'
+        : '导出全部 / Export all';
 
     const handleChange = useCallback(
       (index: number) => (event: ChangeEvent<HTMLInputElement>) => {
@@ -250,6 +278,31 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
           取消全部应用 / Clear staged
         </button>
         </div>
+
+        <details className="split-template-panel" open>
+          <summary>模板操作 / Templates</summary>
+          <p className="split-template-hint">{templateSummary}</p>
+          <div className="split-template-actions">
+            <button
+              type="button"
+              onClick={onImportTemplate}
+              disabled={disableImport}
+            >
+              {importingTemplate
+                ? '导入中… / Importing…'
+                : '导入模板 / Import template'}
+            </button>
+            <button
+              type="button"
+              onClick={onExportTemplate}
+              disabled={disableExport}
+            >
+              {exportingTemplate
+                ? '导出中… / Exporting…'
+                : `${exportLabel}`}
+            </button>
+          </div>
+        </details>
 
         {hasFeedback && (
           <div className="split-settings-feedback" aria-live="polite">

@@ -19,6 +19,15 @@ import SplitSettingsPanel from './SplitSettingsPanel.js';
 import SplitThumbnailGrid, {
   type SplitThumbnailGridItem,
 } from './SplitThumbnailGrid.js';
+import SplitDetailModal from './SplitDetailModal.js';
+import {
+  clearPreviewCache,
+  computePreviewSignature,
+  createPreviewCache,
+  readPreviewCache,
+  type PreviewCacheEntry,
+  writePreviewCache,
+} from './previewCache.js';
 import {
   useCustomSplitStore,
   type ManualSplitDraft,
@@ -175,7 +184,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       updateLines,
       markApplied,
       applyState,
-      beginApply,
       resolveApplySucceeded,
       resolveApplyFailed,
       clearApplyFeedback,
@@ -195,10 +203,12 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
     const [reverting, setReverting] = useState(false);
     const [exportingTemplate, setExportingTemplate] = useState(false);
     const [importingTemplate, setImportingTemplate] = useState(false);
+    const [detailSource, setDetailSource] = useState<string | null>(null);
     const previewRequestRef = useRef(0);
     const previewQueueRef = useRef<PreviewJob[]>([]);
     const activePreviewCountRef = useRef(0);
     const lastPreviewSignatureRef = useRef<Map<string, string>>(new Map());
+    const previewCacheRef = useRef<Map<string, PreviewCacheEntry>>(createPreviewCache());
     const applyStartRef = useRef<number | null>(null);
 
     useEffect(() => {
@@ -274,8 +284,15 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         setPreviewLoading(false);
         previewRequestRef.current = 0;
         lastPreviewSignatureRef.current.clear();
+        clearPreviewCache(previewCacheRef.current);
       }
     }, [workspace]);
+
+    useEffect(() => {
+      if (!drawerOpen) {
+        setDetailSource(null);
+      }
+    }, [drawerOpen]);
 
     const composeApplyStatus = useCallback(
       (
@@ -535,6 +552,13 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       return drafts[selection[0]] ?? null;
     }, [drafts, selection]);
 
+    const detailDraft = useMemo(() => {
+      if (!detailSource) {
+        return null;
+      }
+      return drafts[detailSource] ?? null;
+    }, [detailSource, drafts]);
+
     const activePreview: SplitPreviewPayload | null = useMemo(() => {
       if (!activeDraft) {
         return null;
@@ -546,8 +570,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
 
     const activeImageKind = activeDraft?.imageKind ?? 'content';
     const activeStaged = activeDraft?.staged ?? false;
-    const activeHasPending = activeDraft?.hasPendingChanges ?? false;
-
     const dirtyCount = useMemo(() => {
       let count = 0;
       for (const sourcePath of order) {
@@ -620,6 +642,12 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
               generatedAt: response.generatedAt,
             };
             setPreview(job.sourcePath, payload);
+            writePreviewCache(
+              previewCacheRef.current,
+              job.sourcePath,
+              job.signature,
+              payload
+            );
             const duration = Math.max(0, performance.now() - startedAt);
             void trackManualSplitTelemetry(
               'manual-split/preview',
@@ -627,6 +655,10 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 sourcePath: job.sourcePath,
                 durationMs: Math.round(duration),
                 succeeded: true,
+                cacheHit: false,
+                signature: job.signature,
+                queueDepth: previewQueueRef.current.length,
+                activeRequests: activePreviewCountRef.current,
               },
               job.workspace
             );
@@ -647,6 +679,10 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 succeeded: false,
                 error: err instanceof Error ? err.message : String(err),
                 cancelled: !isActive,
+                cacheHit: false,
+                signature: job.signature,
+                queueDepth: previewQueueRef.current.length,
+                activeRequests: activePreviewCountRef.current,
               },
               job.workspace
             );
@@ -665,20 +701,47 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
           }
         })();
       }
-    }, [setError, setPreview]);
+    }, [setError, setPreview, setPreviewLoading]);
 
     const requestPreview = useCallback(
       (draft: ManualSplitDraft) => {
         if (!workspace) {
           return;
         }
-        const requestId = ++previewRequestRef.current;
         const snapshot = [...draft.lines] as ManualSplitLines;
-        const signature = snapshot.map((value) => value.toFixed(4)).join(':');
+        const signature = computePreviewSignature(snapshot);
+        const cacheResult = readPreviewCache(
+          previewCacheRef.current,
+          draft.sourcePath,
+          signature
+        );
+        if (cacheResult.hit) {
+          lastPreviewSignatureRef.current.set(draft.sourcePath, signature);
+          setPreview(draft.sourcePath, cacheResult.entry.payload);
+          if (
+            activePreviewCountRef.current === 0 &&
+            previewQueueRef.current.length === 0
+          ) {
+            setPreviewLoading(false);
+          }
+          void trackManualSplitTelemetry(
+            'manual-split/preview',
+            {
+              sourcePath: draft.sourcePath,
+              cacheHit: true,
+              cacheAgeMs: Math.round(cacheResult.ageMs),
+              signature,
+              cacheSize: previewCacheRef.current.size,
+            },
+            workspace
+          );
+          return;
+        }
         const lastSignature = lastPreviewSignatureRef.current.get(draft.sourcePath);
         if (lastSignature === signature) {
           return;
         }
+        const requestId = ++previewRequestRef.current;
         previewQueueRef.current = previewQueueRef.current.filter(
           (job) => job.sourcePath !== draft.sourcePath
         );
@@ -693,7 +756,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         setPreviewLoading(true);
         processPreviewQueue();
       },
-      [workspace, processPreviewQueue]
+      [workspace, processPreviewQueue, setPreview, setPreviewLoading]
     );
 
     const handleSelect = useCallback(
@@ -705,6 +768,52 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         }
       },
       [setSelection, toggleSelection]
+    );
+
+    const handleOpenDetail = useCallback(
+      (item: SplitThumbnailGridItem) => {
+        setSelection([item.sourcePath]);
+        setDetailSource(item.sourcePath);
+        if (workspace) {
+          void trackManualSplitTelemetry(
+            'manual-split/detail-opened',
+            {
+              sourcePath: item.sourcePath,
+              locked: item.locked,
+              imageKind: item.imageKind,
+              width: item.width,
+              height: item.height,
+            },
+            workspace
+          );
+        }
+      },
+      [setSelection, workspace]
+    );
+
+    const handleDetailDismiss = useCallback(() => {
+      setDetailSource(null);
+    }, []);
+
+    const handleDetailConfirm = useCallback(
+      (lines: ManualSplitLines) => {
+        if (!detailSource) {
+          return;
+        }
+        updateLines(detailSource, lines);
+        setDetailSource(null);
+        if (workspace) {
+          void trackManualSplitTelemetry(
+            'manual-split/detail-applied',
+            {
+              sourcePath: detailSource,
+              lines,
+            },
+            workspace
+          );
+        }
+      },
+      [detailSource, updateLines, workspace]
     );
 
     const handleLinesChange = useCallback(
@@ -922,6 +1031,9 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         setError('尚未加载手动拆分工作区，无法导出模板。 / Manual workspace unavailable; cannot export template.');
         return;
       }
+      if (exportingTemplate) {
+        return;
+      }
       const targets = selection.length > 0 ? selection : order;
       const draftsToExport = targets
         .map((sourcePath) => drafts[sourcePath])
@@ -1003,6 +1115,9 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
     const handleImportTemplate = useCallback(() => {
       if (!workspace) {
         setError('尚未加载手动拆分工作区，无法导入模板。 / Manual workspace unavailable.');
+        return;
+      }
+      if (importingTemplate) {
         return;
       }
       setImportingTemplate(true);
@@ -1221,9 +1336,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       workspace,
     ]);
 
-    void handleExportTemplate;
-    void handleImportTemplate;
-
     const handleRevert = useCallback(() => {
       if (!workspace) {
         setError('尚未加载手动拆分工作区，无法回滚。 / Manual workspace unavailable; cannot revert.');
@@ -1370,6 +1482,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 selection={selection}
                 onSelect={handleSelect}
                 loading={loading}
+                onOpenDetail={handleOpenDetail}
               />
             </div>
 
@@ -1391,7 +1504,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 totalCount={totalDrafts}
                 staged={activeStaged}
                 stagedAny={stagedAny}
-                hasPendingChanges={activeHasPending}
                 previewLoading={previewLoading}
                 onLinesChange={handleLinesChange}
                 onImageKindChange={handleImageKindChange}
@@ -1401,6 +1513,11 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 onClearAllStages={handleClearAllStages}
                 onToggleLock={handleToggleLock}
                 onGeneratePreview={handleGeneratePreview}
+                onImportTemplate={handleImportTemplate}
+                onExportTemplate={handleExportTemplate}
+                importingTemplate={importingTemplate}
+                exportingTemplate={exportingTemplate}
+                selectionCount={selection.length}
               />
             </div>
 
@@ -1413,6 +1530,14 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
             </div>
           </div>
         </div>
+
+        <SplitDetailModal
+          open={Boolean(detailDraft)}
+          draft={detailDraft}
+          gutterWidthRatio={gutterWidthRatio}
+          onDismiss={handleDetailDismiss}
+          onConfirm={handleDetailConfirm}
+        />
       </aside>
     );
   }

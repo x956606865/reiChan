@@ -2863,6 +2863,56 @@ table td:last-child {
   gap: 8px;
 }
 
+.split-template-panel {
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(241, 245, 249, 0.55);
+  padding: 10px 14px 14px;
+}
+
+.split-template-panel summary {
+  font-weight: 600;
+  color: #1e293b;
+  cursor: pointer;
+  outline: none;
+}
+
+.split-template-panel[open] summary {
+  margin-bottom: 8px;
+}
+
+.split-template-hint {
+  margin: 0 0 10px;
+  font-size: 0.85rem;
+  color: #475569;
+}
+
+.split-template-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.split-template-actions button {
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: #ffffff;
+  color: #1d4ed8;
+  padding: 0.55em 1.1em;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.split-template-actions button:hover:enabled {
+  background: rgba(37, 99, 235, 0.12);
+  border-color: rgba(37, 99, 235, 0.55);
+}
+
+.split-template-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .split-settings-error-bubble {
   padding: 10px 12px;
   border-radius: 10px;
@@ -2917,6 +2967,176 @@ table td:last-child {
   color: #1d4ed8;
   cursor: pointer;
   transition: background 0.18s ease;
+}
+
+.split-detail-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1320;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(15, 23, 42, 0.68);
+  backdrop-filter: blur(2px);
+}
+
+.split-detail-modal {
+  background: #ffffff;
+  border-radius: 18px;
+  width: min(1180px, 95vw);
+  max-height: calc(100vh - 96px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 24px 72px rgba(15, 23, 42, 0.35);
+  overflow: hidden;
+}
+
+.split-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 20px 26px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+  gap: 16px;
+}
+
+.split-detail-header h4 {
+  margin: 0;
+  font-size: 1.2rem;
+  color: #0f172a;
+}
+
+.split-detail-header p {
+  margin: 6px 0 0;
+  color: #475569;
+  font-size: 0.92rem;
+}
+
+.split-detail-close {
+  align-self: flex-start;
+  border: none;
+  background: rgba(37, 99, 235, 0.08);
+  color: #1d4ed8;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.split-detail-close:hover {
+  background: rgba(37, 99, 235, 0.16);
+}
+
+.split-detail-body {
+  display: flex;
+  gap: 24px;
+  padding: 22px 26px 28px;
+  flex: 1;
+  overflow: hidden;
+}
+
+.split-detail-canvas {
+  position: relative;
+  flex: 5;
+  min-width: 0;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #0f172a;
+  display: flex;
+}
+
+.split-detail-canvas .split-canvas {
+  flex: 1;
+  border-radius: 0;
+  min-height: 520px;
+}
+
+.split-detail-magnifier {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  width: 150px;
+  height: 150px;
+  border-radius: 50%;
+  border: 2px solid rgba(148, 163, 184, 0.7);
+  background-size: 220%;
+  background-repeat: no-repeat;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.3);
+  pointer-events: none;
+  backdrop-filter: blur(1px);
+}
+
+.split-detail-sidebar {
+  flex: 3;
+  min-width: 260px;
+  border-radius: 16px;
+  background: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.split-detail-sidebar h5 {
+  margin: 0;
+  font-size: 1.05rem;
+  color: #0f172a;
+}
+
+.split-detail-hint {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #475569;
+}
+
+.split-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.split-detail-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.split-detail-field input {
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  padding: 0.55em 0.7em;
+  font-size: 0.95rem;
+}
+
+.split-detail-actions {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.split-detail-actions button {
+  border-radius: 8px;
+  padding: 0.6em 1.2em;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.split-detail-actions button.primary {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #f8fafc;
+}
+
+.split-detail-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .manual-split-controls .primary {
