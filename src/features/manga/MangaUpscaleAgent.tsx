@@ -3,9 +3,23 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
+import CustomSplitDrawer from './customSplitDrawer/CustomSplitDrawer.js';
+import ManualSplitIntro from './customSplitDrawer/ManualSplitIntro.js';
+import { useManualSplitController } from './customSplitDrawer/useManualSplitController.js';
+import { buildManualCrossModeNotice } from './manualReadiness.js';
+
 type RenameEntry = {
   originalName: string;
   renamedName: string;
+};
+
+type ManifestManualEntry = {
+  source: string;
+  outputs: string[];
+  lines: [number, number, number, number];
+  percentages: [number, number, number, number];
+  accelerator?: string | null;
+  appliedAt?: string | null;
 };
 
 type RenameOutcome = {
@@ -19,6 +33,8 @@ type RenameOutcome = {
   splitReportPath?: string | null;
   splitSummary?: RenameSplitSummary | null;
   sourceDirectory?: string | null;
+  splitManualOverrides?: boolean;
+  manualEntries?: ManifestManualEntry[] | null;
 };
 
 type RenameSplitSummary = {
@@ -83,7 +99,7 @@ type SplitThresholdOverrides = {
   edgeTexture?: any;
 };
 
-type SplitAlgorithmOption = 'edgeTexture' | 'projection';
+type SplitAlgorithmOption = 'edgeTexture' | 'projection' | 'manual';
 
 type SplitCommandOutcome = {
   analyzedFiles: number;
@@ -166,6 +182,8 @@ type EdgePreviewPayload = {
   requestedSearchRatios: [number, number];
   searchRatiosMatched: boolean;
 };
+
+type ManualReadinessResult = { ok: true } | { ok: false; reason: string };
 
 const formatThresholdValue = (value: number): string => {
   if (!Number.isFinite(value)) {
@@ -554,7 +572,7 @@ type RenameSummary =
       dryRun: boolean;
     };
 
-type StepId = 'source' | 'volumes' | 'rename' | 'upload' | 'jobs';
+type StepId = 'source' | 'volumes' | 'rename' | 'split' | 'upload' | 'jobs';
 
 type StepDescriptor = {
   id: StepId;
@@ -859,6 +877,7 @@ const MangaUpscaleAgent = () => {
     useState<SplitDetectionSummary | null>(null);
   const [splitProgress, setSplitProgress] =
     useState<SplitProgressPayload | null>(null);
+  const [manualDrawerOpen, setManualDrawerOpen] = useState(false);
 
   const [currentStep, setCurrentStep] = useState<StepId>('source');
 
@@ -912,6 +931,7 @@ const MangaUpscaleAgent = () => {
     setSplitError(null);
     setSplitProgress(null);
     setEdgePreview({ visible: false, loading: false, data: null, error: null });
+    setManualDrawerOpen(false);
   }, []);
 
   const handleCloseEdgePreview = useCallback(() => {
@@ -941,6 +961,143 @@ const MangaUpscaleAgent = () => {
     }
     return renameForm.directory;
   }, [renameForm.directory, sourceAnalysis]);
+
+  const manualSourceDirectory = useMemo(() => {
+    if (renameSummary?.mode === 'single') {
+      return renameSummary.outcome.directory ?? null;
+    }
+    const fallback = resolveRenameRoot().trim();
+    return fallback.length > 0 ? fallback : null;
+  }, [renameSummary, resolveRenameRoot]);
+
+  const manualController = useManualSplitController({
+    sourceDirectory: manualSourceDirectory,
+    multiVolume: isMultiVolumeSource,
+    onOpenDrawer: () => setManualDrawerOpen(true),
+  });
+
+  const {
+    workspace: manualWorkspace,
+    initializing: manualInitializing,
+    loadingDrafts: manualLoadingDrafts,
+    statusText: manualStatusText,
+    error: manualControllerError,
+    disableInitialize: manualDisableInitialize,
+    disableReason: manualDisableReason,
+    totalDrafts: manualDraftTotal,
+    appliedDrafts: manualAppliedCount,
+    lastAppliedAt: manualLastAppliedAt,
+    pendingDrafts: manualPendingDrafts,
+    manualReportPath,
+    manualReportSummary,
+    initialize: initializeManualWorkspace,
+    openExisting: openManualWorkspace,
+  } = manualController;
+
+  useEffect(() => {
+    if (!manualWorkspace && manualDrawerOpen) {
+      setManualDrawerOpen(false);
+    }
+  }, [manualDrawerOpen, manualWorkspace]);
+
+  const assessManualReadiness = useCallback((): ManualReadinessResult => {
+    const requiresManual =
+      renameSummary?.mode === 'single' &&
+      Boolean(renameSummary.outcome.splitManualOverrides);
+
+    if (!requiresManual) {
+      return { ok: true };
+    }
+
+    if (!manualWorkspace) {
+      return {
+        ok: false,
+        reason:
+          '检测到当前重命名结果依赖手动拆分，但尚未加载手动拆分工作区。请返回“拆分与裁剪”步骤并点击“打开手动拆分”重新载入后再继续。',
+      };
+    }
+
+    const expectedWorkspace =
+      renameSummary?.mode === 'single'
+        ? renameSummary.outcome.splitWorkspace ?? renameSummary.outcome.directory ?? null
+        : null;
+
+    if (
+      expectedWorkspace &&
+      expectedWorkspace.trim().length > 0 &&
+      manualWorkspace.trim().length > 0 &&
+      manualWorkspace !== expectedWorkspace
+    ) {
+      return {
+        ok: false,
+        reason: `手动拆分工作区已变更（当前：${manualWorkspace}，预期：${expectedWorkspace}），请在步骤 2 重新加载正确的工作区后再继续。`,
+      };
+    }
+
+    if (manualDraftTotal === 0) {
+      return {
+        ok: false,
+        reason: '手动拆分工作区尚未准备就绪，请先在步骤 2 初始化并载入图片草稿后再继续。',
+      };
+    }
+
+    if (manualAppliedCount === 0) {
+      return {
+        ok: false,
+        reason:
+          '尚未对任何图片执行“应用”操作，请在手动拆分抽屉中完成应用以生成输出。',
+      };
+    }
+
+    if (manualAppliedCount < manualDraftTotal || manualPendingDrafts > 0) {
+      return {
+        ok: false,
+        reason: `仍有 ${manualPendingDrafts} 张图片未应用最新拆分，请在手动拆分抽屉中执行“应用”操作后再继续。`,
+      };
+    }
+
+    if (!manualReportPath) {
+      return {
+        ok: false,
+        reason:
+          '未找到 manual_split_report.json，请在手动拆分抽屉中重新执行一次“应用”以生成报告后再继续恢复或下载。',
+      };
+    }
+
+    if (
+      manualReportSummary &&
+      manualReportSummary.applied < manualReportSummary.total
+    ) {
+      const remaining = manualReportSummary.total - manualReportSummary.applied;
+      return {
+        ok: false,
+        reason: `手动拆分报告显示仍有 ${remaining} 张图片未完成应用，请在抽屉中重新应用后再继续。`,
+      };
+    }
+
+    return { ok: true };
+  }, [
+    manualAppliedCount,
+    manualPendingDrafts,
+    manualReportPath,
+    manualReportSummary,
+    manualWorkspace,
+    manualDraftTotal,
+    renameSummary,
+  ]);
+
+  const manualReadiness = useMemo(() => assessManualReadiness(), [assessManualReadiness]);
+  const manualReadinessWarning = manualReadiness.ok ? null : manualReadiness.reason;
+
+  const manualCrossModeNotice = useMemo(
+    () =>
+      buildManualCrossModeNotice({
+        autoSummary: renameSummary?.outcome.splitSummary ?? null,
+        manualSummary: manualReportSummary,
+        manualReportPath,
+      }),
+    [manualReportPath, manualReportSummary, renameSummary]
+  );
 
   const handleEdgePreview = useCallback(async () => {
     const [bright, dark] = edgeBrightnessThresholds;
@@ -2063,6 +2220,11 @@ const MangaUpscaleAgent = () => {
         return null;
       }
 
+      if (splitAlgorithm === 'manual') {
+        setSplitError(null);
+        return null;
+      }
+
       if (!overwrite && splitWorkspace && splitSourceRoot === root) {
         return {
           enabled: true,
@@ -2183,6 +2345,14 @@ const MangaUpscaleAgent = () => {
     ensureSplitWorkspace,
   ]);
 
+  const handleOpenManualDrawer = useCallback(() => {
+    void openManualWorkspace();
+  }, [openManualWorkspace]);
+
+  const handleCloseManualDrawer = useCallback(() => {
+    setManualDrawerOpen(false);
+  }, []);
+
   const handleToggleSplit = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => {
       const enabled = event.currentTarget.checked;
@@ -2251,7 +2421,19 @@ const MangaUpscaleAgent = () => {
           const targetDirectory = resolvedRoot;
           let splitPayload: RenameSplitPayload | undefined;
 
-          if (contentSplitEnabled) {
+          if (splitAlgorithm === 'manual') {
+            if (!manualWorkspace) {
+              setRenameError('请先初始化手动拆分工作区并完成至少一次应用。');
+              setRenameLoading(false);
+              return;
+            }
+            splitPayload = {
+              enabled: true,
+              workspace: manualWorkspace,
+              reportPath: null,
+              summary: null,
+            };
+          } else if (contentSplitEnabled) {
             const ensured = await ensureSplitWorkspace(false);
             if (!ensured) {
               return;
@@ -2307,8 +2489,10 @@ const MangaUpscaleAgent = () => {
       ensureSplitWorkspace,
       isMultiVolumeSource,
       mappingConfirmed,
+      manualWorkspace,
       renameForm,
       resolveRenameRoot,
+      splitAlgorithm,
       volumeMappings,
     ]
   );
@@ -2976,6 +3160,14 @@ const MangaUpscaleAgent = () => {
 
   const resumeJob = useCallback(
     async (job: JobRecord, options?: { silent?: boolean }) => {
+      const readiness = assessManualReadiness();
+      if (!readiness.ok) {
+        if (!options?.silent) {
+          setJobError(readiness.reason);
+        }
+        return;
+      }
+
       if (!job.serviceUrl) {
         if (!options?.silent) {
           setJobError('缺少服务地址，无法恢复作业。');
@@ -3021,7 +3213,12 @@ const MangaUpscaleAgent = () => {
         }
       }
     },
-    [buildJobRequest, mapPayloadToRecord, startJobWatcher]
+    [
+      assessManualReadiness,
+      buildJobRequest,
+      mapPayloadToRecord,
+      startJobWatcher,
+    ]
   );
 
   const cancelJob = useCallback(
@@ -3127,6 +3324,14 @@ const MangaUpscaleAgent = () => {
       job: JobRecord,
       options?: { silent?: boolean; targetDir?: string | null }
     ) => {
+      const readiness = assessManualReadiness();
+      if (!readiness.ok) {
+        if (!options?.silent) {
+          setArtifactError(readiness.reason);
+        }
+        return false;
+      }
+
       const silent = options?.silent ?? false;
 
       if (!job.serviceUrl || !job.jobId) {
@@ -3216,7 +3421,12 @@ const MangaUpscaleAgent = () => {
         setArtifactDownloadBusyJob(null);
       }
     },
-    [artifactTargetRoot, buildJobRequest, promptForDirectory]
+    [
+      assessManualReadiness,
+      artifactTargetRoot,
+      buildJobRequest,
+      promptForDirectory,
+    ]
   );
 
   const validateArtifact = useCallback(
@@ -3228,6 +3438,14 @@ const MangaUpscaleAgent = () => {
         manifestPathOverride?: string | null;
       }
     ) => {
+      const readiness = assessManualReadiness();
+      if (!readiness.ok) {
+        if (!options?.silent) {
+          setArtifactError(readiness.reason);
+        }
+        return false;
+      }
+
       const silent = options?.silent ?? false;
 
       if (!job.serviceUrl || !job.jobId) {
@@ -3336,6 +3554,7 @@ const MangaUpscaleAgent = () => {
       }
     },
     [
+      assessManualReadiness,
       artifactTargetRoot,
       buildJobRequest,
       inferManifestForVolume,
@@ -3475,6 +3694,12 @@ const MangaUpscaleAgent = () => {
       setUploadError('请先完成重命名预览或执行，确保本地目录已确认。');
       return;
     }
+    const readiness = assessManualReadiness();
+    if (!readiness.ok) {
+      setUploadError(readiness.reason);
+      setUploadStatus(null);
+      return;
+    }
     const serviceUrl = uploadForm.serviceUrl.trim();
     if (!serviceUrl) {
       setUploadError('请填写 Copyparty 服务地址。');
@@ -3597,6 +3822,7 @@ const MangaUpscaleAgent = () => {
     splitSourceRoot,
     splitWorkspace,
     uploadForm,
+    assessManualReadiness,
   ]);
 
   const beginAddJobService = useCallback(() => {
@@ -3658,6 +3884,7 @@ const MangaUpscaleAgent = () => {
     }
     steps.push(
       { id: 'rename', label: '图片重命名' },
+      { id: 'split', label: '拆分与裁剪（可选）' },
       { id: 'upload', label: '上传到 Copyparty' },
       { id: 'jobs', label: '远端推理' }
     );
@@ -3818,6 +4045,12 @@ const MangaUpscaleAgent = () => {
     const inputPath = jobForm.inputPath.trim();
     const bearer = jobForm.bearerToken.trim();
 
+    const readiness = assessManualReadiness();
+    if (!readiness.ok) {
+      setJobError(readiness.reason);
+      return;
+    }
+
     if (!serviceUrl) {
       setJobError('请填写推理服务地址。');
       return;
@@ -3907,7 +4140,13 @@ const MangaUpscaleAgent = () => {
     } finally {
       setJobLoading(false);
     }
-  }, [inferManifestForVolume, jobForm, jobParams, startJobWatcher]);
+  }, [
+    assessManualReadiness,
+    inferManifestForVolume,
+    jobForm,
+    jobParams,
+    startJobWatcher,
+  ]);
 
   const describeStatus = (status: string) => {
     switch (status.toUpperCase()) {
@@ -4218,6 +4457,190 @@ const MangaUpscaleAgent = () => {
             </label>
           </div>
 
+          <p className="status status-tip">
+            拆分与自定义操作已迁移到下一步“拆分与裁剪（可选）”。
+          </p>
+
+          <div className="button-row">
+            <button
+              type="button"
+              className="primary"
+              onClick={() => runRename(true)}
+              disabled={renameLoading}
+            >
+              {renameLoading ? '处理中…' : '预览重命名'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => runRename(false)}
+              disabled={renameLoading}
+            >
+              {renameLoading ? '处理中…' : '执行重命名'}
+            </button>
+          </div>
+
+          {renameError && <p className="status status-error">{renameError}</p>}
+
+          {renameSummary && renameSummary.mode === 'single' && (
+            <div className="preview-panel">
+              <div className="preview-header">
+                <strong>
+                  {renameSummary.outcome.entries.length} 个文件
+                  {renameSummary.outcome.dryRun ? '（预览）' : '（已重命名）'}
+                </strong>
+                {renameSummary.outcome.manifestPath && (
+                  <span className="manifest-path">
+                    manifest: {renameSummary.outcome.manifestPath}
+                  </span>
+                )}
+              </div>
+
+              {renameSummary.outcome.warnings.length > 0 && (
+                <ul className="status status-warning">
+                  {renameSummary.outcome.warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              )}
+
+              {renameSummary.outcome.splitApplied &&
+                renameSummary.outcome.splitSummary && (
+                  <p className="status status-tip">
+                    内容感知拆分：输出{' '}
+                    {renameSummary.outcome.splitSummary.emittedFiles} 文件，
+                    拆分 {renameSummary.outcome.splitSummary.splitPages} 页。
+                    {renameSummary.outcome.splitWorkspace && (
+                      <span>
+                        {' '}
+                        工作目录：{renameSummary.outcome.splitWorkspace}
+                      </span>
+                    )}
+                  </p>
+                )}
+
+              {renameSummary.outcome.splitManualOverrides && (
+                <p className="status status-tip">
+                  自定义拆分：
+                  {renameSummary.outcome.manualEntries?.length
+                    ? `记录 ${renameSummary.outcome.manualEntries.length} 条手动拆分。`
+                    : '存在手动拆分记录。'}
+                </p>
+              )}
+
+              <table className="preview-table">
+                <thead>
+                  <tr>
+                    <th>原始文件</th>
+                    <th>重命名结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {previewEntries.map((entry) => (
+                    <tr key={`${entry.originalName}-${entry.renamedName}`}>
+                      <td>{entry.originalName}</td>
+                      <td>{entry.renamedName}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              {renameSummary.outcome.entries.length > previewEntries.length && (
+                <p className="preview-more">
+                  其余{' '}
+                  {renameSummary.outcome.entries.length - previewEntries.length}{' '}
+                  条略。
+                </p>
+              )}
+            </div>
+          )}
+
+          {renameSummary && renameSummary.mode === 'multi' && (
+            <div className="preview-panel multi">
+              {renameSummary.volumes.map(({ mapping, outcome }) => (
+                <div key={mapping.directory} className="volume-preview">
+                  <header>
+                    <strong>
+                      卷 {mapping.volumeNumber}: {mapping.volumeName}
+                    </strong>
+                    <span>
+                      {outcome.entries.length} 个文件
+                      {renameSummary.dryRun ? '（预览）' : '（已重命名）'}
+                    </span>
+                    {outcome.manifestPath && (
+                      <span className="manifest-path">
+                        manifest: {outcome.manifestPath}
+                      </span>
+                    )}
+                    {outcome.splitManualOverrides && (
+                      <span className="status status-tip">
+                        自定义拆分：
+                        {outcome.manualEntries?.length
+                          ? `记录 ${outcome.manualEntries.length} 条`
+                          : '存在手动拆分'}
+                      </span>
+                    )}
+                  </header>
+
+                  {outcome.warnings.length > 0 && (
+                    <ul className="status status-warning">
+                      {outcome.warnings.map((warning) => (
+                        <li key={warning}>{warning}</li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <table className="preview-table">
+                    <thead>
+                      <tr>
+                        <th>原始文件</th>
+                        <th>重命名结果</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {outcome.entries.slice(0, 5).map((entry) => (
+                        <tr
+                          key={`${mapping.directory}-${entry.originalName}-${entry.renamedName}`}
+                        >
+                          <td>{entry.originalName}</td>
+                          <td>{entry.renamedName}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  {outcome.entries.length > 5 && (
+                    <p className="preview-more">
+                      其余 {outcome.entries.length - 5} 条略。
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="wizard-controls">
+            <button type="button" onClick={goToPreviousStep}>
+              上一步
+            </button>
+            <button type="button" className="primary" onClick={goToNextStep}>
+              下一步
+            </button>
+          </div>
+
+        </section>
+      )}
+
+      {currentStep === 'split' && (
+        <section className="step-card" aria-label="拆分与裁剪">
+          <header className="step-card-header">
+            <span className="step-index">
+              步骤 {stepIndexMap.get('split') ?? 1}
+            </span>
+            <h3>拆分与裁剪（可选）</h3>
+            <p>生成拆分工作区并按需调整手动裁剪，未使用时可直接跳过。</p>
+          </header>
+
           <div className="split-controls">
             <div className="split-toggle-row">
               <label className="form-field checkbox">
@@ -4230,12 +4653,14 @@ const MangaUpscaleAgent = () => {
                 <span>内容感知双页拆分（实验性）</span>
               </label>
 
-              {contentSplitEnabled && !isMultiVolumeSource && (
-                <button
-                  type="button"
-                  className="split-action-button"
-                  onClick={handlePrepareSplit}
-                  disabled={splitPreparing}
+              {contentSplitEnabled &&
+                !isMultiVolumeSource &&
+                splitAlgorithm !== 'manual' && (
+                  <button
+                    type="button"
+                    className="split-action-button"
+                    onClick={handlePrepareSplit}
+                    disabled={splitPreparing}
                 >
                   {splitPreparing ? '准备中…' : '开始内容拆分'}
                 </button>
@@ -4252,8 +4677,30 @@ const MangaUpscaleAgent = () => {
                   >
                     <option value="edgeTexture">Edge Texture（推荐）</option>
                     <option value="projection">传统投影</option>
+                    <option value="manual">手动（自定义）</option>
                   </select>
                 </label>
+
+                {splitAlgorithm === 'manual' ? (
+                  <ManualSplitIntro
+                    initializing={manualInitializing}
+                    loadingDrafts={manualLoadingDrafts}
+                    statusText={manualStatusText}
+                    error={manualControllerError}
+                    workspace={manualWorkspace}
+                    disableInitialize={manualDisableInitialize}
+                    disableReason={manualDisableReason}
+                    totalDrafts={manualDraftTotal}
+                    appliedDrafts={manualAppliedCount}
+                    lastAppliedAt={manualLastAppliedAt}
+                    onInitialize={() => {
+                      void initializeManualWorkspace(Boolean(manualWorkspace));
+                    }}
+                    onOpenExisting={() => {
+                      void openManualWorkspace();
+                    }}
+                  />
+                ) : null}
 
                 {splitAlgorithm === 'edgeTexture' && (
                   <div className="edge-threshold-controls">
@@ -4348,7 +4795,7 @@ const MangaUpscaleAgent = () => {
               </div>
             )}
 
-            {splitEstimate && (
+            {splitAlgorithm !== 'manual' && splitEstimate && (
               <p className="status status-tip">
                 预估拆分候选：{splitEstimate.candidates} / {splitEstimate.total}
               </p>
@@ -4430,6 +4877,11 @@ const MangaUpscaleAgent = () => {
                   <p className="status status-error">{splitError}</p>
                 )}
 
+                {manualControllerError &&
+                  splitAlgorithm !== 'manual' && (
+                    <p className="status status-error">{manualControllerError}</p>
+                  )}
+
                 {splitWarningsState.length > 0 && (
                   <ul className="status status-warning">
                     {splitWarningsState.map((warning) => (
@@ -4437,159 +4889,53 @@ const MangaUpscaleAgent = () => {
                     ))}
                   </ul>
                 )}
-              </div>
-            )}
-          </div>
 
-          <div className="button-row">
-            <button
-              type="button"
-              className="primary"
-              onClick={() => runRename(true)}
-              disabled={renameLoading}
-            >
-              {renameLoading ? '处理中…' : '预览重命名'}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => runRename(false)}
-              disabled={renameLoading}
-            >
-              {renameLoading ? '处理中…' : '执行重命名'}
-            </button>
-          </div>
-
-          {renameError && <p className="status status-error">{renameError}</p>}
-
-          {renameSummary && renameSummary.mode === 'single' && (
-            <div className="preview-panel">
-              <div className="preview-header">
-                <strong>
-                  {renameSummary.outcome.entries.length} 个文件
-                  {renameSummary.outcome.dryRun ? '（预览）' : '（已重命名）'}
-                </strong>
-                {renameSummary.outcome.manifestPath && (
-                  <span className="manifest-path">
-                    manifest: {renameSummary.outcome.manifestPath}
-                  </span>
-                )}
-              </div>
-
-              {renameSummary.outcome.warnings.length > 0 && (
-                <ul className="status status-warning">
-                  {renameSummary.outcome.warnings.map((warning) => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
-              )}
-
-              {renameSummary.outcome.splitApplied &&
-                renameSummary.outcome.splitSummary && (
-                  <p className="status status-tip">
-                    内容感知拆分：输出{' '}
-                    {renameSummary.outcome.splitSummary.emittedFiles} 文件，
-                    拆分 {renameSummary.outcome.splitSummary.splitPages} 页。
-                    {renameSummary.outcome.splitWorkspace && (
-                      <span>
-                        {' '}
-                        工作目录：{renameSummary.outcome.splitWorkspace}
-                      </span>
-                    )}
+                {manualCrossModeNotice && (
+                  <p
+                    className={`status ${
+                      manualCrossModeNotice.tone === 'warning' ? 'status-warning' : 'status-tip'
+                    }`}
+                  >
+                    {manualCrossModeNotice.message}
                   </p>
                 )}
 
-              <table className="preview-table">
-                <thead>
-                  <tr>
-                    <th>原始文件</th>
-                    <th>重命名结果</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {previewEntries.map((entry) => (
-                    <tr key={`${entry.originalName}-${entry.renamedName}`}>
-                      <td>{entry.originalName}</td>
-                      <td>{entry.renamedName}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-
-              {renameSummary.outcome.entries.length > previewEntries.length && (
-                <p className="preview-more">
-                  其余{' '}
-                  {renameSummary.outcome.entries.length - previewEntries.length}{' '}
-                  条略。
-                </p>
-              )}
-            </div>
-          )}
-
-          {renameSummary && renameSummary.mode === 'multi' && (
-            <div className="preview-panel multi">
-              {renameSummary.volumes.map(({ mapping, outcome }) => (
-                <div key={mapping.directory} className="volume-preview">
-                  <header>
-                    <strong>
-                      卷 {mapping.volumeNumber}: {mapping.volumeName}
-                    </strong>
-                    <span>
-                      {outcome.entries.length} 个文件
-                      {renameSummary.dryRun ? '（预览）' : '（已重命名）'}
+                {manualWorkspace && splitAlgorithm !== 'manual' && (
+                  <div className="manual-split-controls">
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={handleOpenManualDrawer}
+                      disabled={manualInitializing || manualLoadingDrafts}
+                    >
+                      打开手动拆分
+                    </button>
+                    <span className="split-preview-status">
+                      {manualStatusText}
                     </span>
-                    {outcome.manifestPath && (
-                      <span className="manifest-path">
-                        manifest: {outcome.manifestPath}
-                      </span>
-                    )}
-                  </header>
-
-                  {outcome.warnings.length > 0 && (
-                    <ul className="status status-warning">
-                      {outcome.warnings.map((warning) => (
-                        <li key={warning}>{warning}</li>
-                      ))}
-                    </ul>
-                  )}
-
-                  <table className="preview-table">
-                    <thead>
-                      <tr>
-                        <th>原始文件</th>
-                        <th>重命名结果</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {outcome.entries.slice(0, 5).map((entry) => (
-                        <tr
-                          key={`${mapping.directory}-${entry.originalName}-${entry.renamedName}`}
-                        >
-                          <td>{entry.originalName}</td>
-                          <td>{entry.renamedName}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-
-                  {outcome.entries.length > 5 && (
-                    <p className="preview-more">
-                      其余 {outcome.entries.length - 5} 条略。
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           <div className="wizard-controls">
             <button type="button" onClick={goToPreviousStep}>
               上一步
             </button>
+            <button type="button" className="ghost" onClick={goToNextStep}>
+              跳过拆分
+            </button>
             <button type="button" className="primary" onClick={goToNextStep}>
               下一步
             </button>
           </div>
+
+          <CustomSplitDrawer
+            workspace={manualWorkspace}
+            open={manualDrawerOpen}
+            onClose={handleCloseManualDrawer}
+          />
         </section>
       )}
 
@@ -4807,6 +5153,10 @@ const MangaUpscaleAgent = () => {
             <h3>远端推理</h3>
             <p>提交 FastAPI 推理作业并实时查看进度。</p>
           </header>
+
+          {manualReadinessWarning && (
+            <p className="status status-warning">{manualReadinessWarning}</p>
+          )}
 
           <div className="params-panel" aria-label="推理参数配置">
             <div className="params-panel-header">

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use super::config::EdgeTextureThresholdOverrides;
 
-#[cfg(feature = "edge-texture-gpu")]
-use super::edge_texture_gpu::enabled::{
-    EdgeTextureGpuAnalyzer, EdgeTextureGpuError, EdgeTextureGpuOutputs,
-};
 #[cfg(not(feature = "edge-texture-gpu"))]
 use super::edge_texture_gpu::disabled::{
+    EdgeTextureGpuAnalyzer, EdgeTextureGpuError, EdgeTextureGpuOutputs,
+};
+#[cfg(feature = "edge-texture-gpu")]
+use super::edge_texture_gpu::enabled::{
     EdgeTextureGpuAnalyzer, EdgeTextureGpuError, EdgeTextureGpuOutputs,
 };
 
@@ -191,10 +191,8 @@ pub fn analyze_edges_with_acceleration(
     preference: EdgeTextureAcceleratorPreference,
 ) -> EdgeTextureAnalysis {
     match resolve_accelerator_directive(preference) {
-        AcceleratorDirective::ForceCpu =>
-            cpu_analysis(image, config, EdgeTextureAccelerator::Cpu),
-        AcceleratorDirective::MockGpu =>
-            cpu_analysis(image, config, EdgeTextureAccelerator::Gpu),
+        AcceleratorDirective::ForceCpu => cpu_analysis(image, config, EdgeTextureAccelerator::Cpu),
+        AcceleratorDirective::MockGpu => cpu_analysis(image, config, EdgeTextureAccelerator::Gpu),
         AcceleratorDirective::ForceGpu | AcceleratorDirective::Auto => {
             match analyze_with_gpu(image, config) {
                 Ok(outcome) => EdgeTextureAnalysis {
@@ -1226,14 +1224,14 @@ mod tests {
         let config = EdgeTextureConfig::default();
 
         let baseline = analyze_edges(&image, config);
-        let analysis = analyze_edges_with_acceleration(
-            &image,
-            config,
-            EdgeTextureAcceleratorPreference::Cpu,
-        );
+        let analysis =
+            analyze_edges_with_acceleration(&image, config, EdgeTextureAcceleratorPreference::Cpu);
 
         assert_eq!(analysis.accelerator, EdgeTextureAccelerator::Cpu);
-        assert_eq!(analysis.outcome.metrics.mean_intensity, baseline.metrics.mean_intensity);
+        assert_eq!(
+            analysis.outcome.metrics.mean_intensity,
+            baseline.metrics.mean_intensity
+        );
     }
 
     #[test]
@@ -1244,11 +1242,8 @@ mod tests {
 
         std::env::set_var("EDGE_TEXTURE_ACCELERATOR", "mock-gpu");
 
-        let analysis = analyze_edges_with_acceleration(
-            &image,
-            config,
-            EdgeTextureAcceleratorPreference::Auto,
-        );
+        let analysis =
+            analyze_edges_with_acceleration(&image, config, EdgeTextureAcceleratorPreference::Auto);
 
         std::env::remove_var("EDGE_TEXTURE_ACCELERATOR");
 

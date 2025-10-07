@@ -171,6 +171,111 @@ async fn preview_edge_texture_trim(
 }
 
 #[tauri::command]
+async fn load_manual_split_context(
+    request: doublepage::ManualSplitContextRequest,
+) -> Result<doublepage::ManualSplitContext, String> {
+    async_runtime::spawn_blocking(move || doublepage::load_manual_split_context(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn render_manual_split_preview(
+    request: doublepage::ManualSplitPreviewRequest,
+) -> Result<doublepage::ManualSplitPreviewResponse, String> {
+    async_runtime::spawn_blocking(move || doublepage::render_manual_split_preview(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn prepare_manual_split_workspace(
+    request: doublepage::PrepareManualSplitWorkspaceRequest,
+) -> Result<doublepage::PrepareManualSplitWorkspaceResponse, String> {
+    async_runtime::spawn_blocking(move || doublepage::prepare_manual_split_workspace(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn apply_manual_splits(
+    app: tauri::AppHandle,
+    request: doublepage::ManualSplitApplyRequest,
+) -> Result<doublepage::ManualSplitApplyResponse, String> {
+    let workspace = request.workspace.clone();
+    let total = request.overrides.len();
+
+    let _ = app.emit(
+        doublepage::MANUAL_SPLIT_APPLY_STARTED_EVENT,
+        doublepage::ManualSplitApplyStarted {
+            workspace: workspace.clone(),
+            total,
+        },
+    );
+
+    let event_app = app.clone();
+    let result = async_runtime::spawn_blocking(move || {
+        let mut progress_callback = |payload: doublepage::ManualSplitProgress| {
+            let _ = event_app.emit(doublepage::MANUAL_SPLIT_APPLY_PROGRESS_EVENT, payload);
+        };
+        doublepage::apply_manual_splits(request, Some(&mut progress_callback))
+    })
+    .await
+    .map_err(|err| err.to_string())?;
+
+    match result {
+        Ok(response) => {
+            let _ = app.emit(doublepage::MANUAL_SPLIT_APPLY_SUCCEEDED_EVENT, &response);
+            Ok(response)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            let _ = app.emit(
+                doublepage::MANUAL_SPLIT_APPLY_FAILED_EVENT,
+                doublepage::ManualSplitApplyFailed {
+                    workspace,
+                    message: message.clone(),
+                },
+            );
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn revert_manual_splits(
+    request: doublepage::ManualSplitRevertRequest,
+) -> Result<doublepage::ManualSplitRevertResponse, String> {
+    async_runtime::spawn_blocking(move || doublepage::revert_manual_splits(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn export_manual_split_template(
+    request: doublepage::ManualSplitTemplateExportRequest,
+) -> Result<doublepage::ManualSplitTemplateExportResponse, String> {
+    async_runtime::spawn_blocking(move || doublepage::export_manual_split_template(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn track_manual_split_event(
+    request: doublepage::ManualSplitTelemetryRequest,
+) -> Result<(), String> {
+    async_runtime::spawn_blocking(move || doublepage::track_manual_split_event(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn list_edge_preview_candidates(
     directory: PathBuf,
 ) -> Result<Vec<doublepage::EdgePreviewCandidate>, String> {
@@ -242,6 +347,18 @@ fn validate_manga_artifact(
     request: manga::ArtifactDownloadRequest,
 ) -> Result<manga::ArtifactReport, String> {
     manga::validate_artifact(request).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn read_template_file(path: String) -> Result<String, String> {
+    let resolved = PathBuf::from(&path);
+    fs::read_to_string(&resolved).map_err(|err| {
+        format!(
+            "无法读取模板文件 {}: {}",
+            resolved.display(),
+            err
+        )
+    })
 }
 
 fn collect_ports() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
@@ -802,6 +919,13 @@ pub fn run() {
             analyze_manga_directory,
             prepare_doublepage_split,
             preview_edge_texture_trim,
+            load_manual_split_context,
+            render_manual_split_preview,
+            prepare_manual_split_workspace,
+            apply_manual_splits,
+            revert_manual_splits,
+            export_manual_split_template,
+            track_manual_split_event,
             list_edge_preview_candidates,
             rename_manga_sequence,
             upload_copyparty,
@@ -812,6 +936,7 @@ pub fn run() {
             cancel_manga_job,
             download_manga_artifact,
             validate_manga_artifact,
+            read_template_file,
             // Notion Import M1 (skeleton)
             notion::commands::notion_save_token,
             notion::commands::notion_list_tokens,

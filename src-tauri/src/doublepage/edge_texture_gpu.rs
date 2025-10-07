@@ -553,11 +553,9 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let device = &self.device;
             let queue = &self.queue;
 
-            let pixel_bytes =
-                (pixel_count * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+            let pixel_bytes = (pixel_count * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
             let column_count = config.width as usize;
-            let column_bytes =
-                (column_count * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+            let column_bytes = (column_count * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
             let column_stats_bytes =
                 (column_count * std::mem::size_of::<ColumnStat>()) as wgpu::BufferAddress;
 
@@ -569,16 +567,10 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let gamma_buffer =
                 create_storage_buffer(device, pixel_bytes, "edge-texture-gamma-buffer");
-            let gaussian_temp_buffer = create_storage_buffer(
-                device,
-                pixel_bytes,
-                "edge-texture-gaussian-temp-buffer",
-            );
-            let gaussian_buffer = create_storage_buffer(
-                device,
-                pixel_bytes,
-                "edge-texture-gaussian-output-buffer",
-            );
+            let gaussian_temp_buffer =
+                create_storage_buffer(device, pixel_bytes, "edge-texture-gaussian-temp-buffer");
+            let gaussian_buffer =
+                create_storage_buffer(device, pixel_bytes, "edge-texture-gaussian-output-buffer");
             let gradient_buffer =
                 create_storage_buffer(device, pixel_bytes, "edge-texture-gradient-buffer");
             let column_stats_buffer = create_storage_buffer(
@@ -594,11 +586,8 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 column_stats_bytes,
                 "edge-texture-column-stats-readback",
             );
-            let entropy_readback = create_readback_buffer(
-                device,
-                column_bytes,
-                "edge-texture-entropy-readback",
-            );
+            let entropy_readback =
+                create_readback_buffer(device, column_bytes, "edge-texture-entropy-readback");
 
             let kernel = build_gaussian_kernel(config.sanitized_gaussian_kernel());
             let kernel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -632,10 +621,11 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 &[&input_buffer, &gamma_buffer, &info_buffer],
             );
 
-            let gaussian_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("edge-texture-gaussian-shader"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GAUSSIAN_SHADER)),
-            });
+            let gaussian_shader_module =
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("edge-texture-gaussian-shader"),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GAUSSIAN_SHADER)),
+                });
             let gaussian_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("edge-texture-gaussian-bind-group-layout"),
@@ -794,11 +784,8 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             queue.submit(Some(encoder.finish()));
 
-            let column_stats = read_buffer::<ColumnStat>(
-                device,
-                &column_stats_readback,
-                column_count,
-            )?;
+            let column_stats =
+                read_buffer::<ColumnStat>(device, &column_stats_readback, column_count)?;
             let entropy = read_buffer::<f32>(device, &entropy_readback, column_count)?;
 
             let mut mean_intensity = Vec::with_capacity(column_count);
@@ -877,7 +864,11 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 entropy_bins: self.sanitized_entropy_bins(),
                 reserved: 0,
                 gamma: self.gamma,
-                inv_gamma: if self.gamma <= 1e-6 { 1.0 } else { 1.0 / self.gamma },
+                inv_gamma: if self.gamma <= 1e-6 {
+                    1.0
+                } else {
+                    1.0 / self.gamma
+                },
                 inv_height: if self.height == 0 {
                     0.0
                 } else {
@@ -898,7 +889,11 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let gray = image.to_luma8();
         let width = gray.width();
         let height = gray.height();
-        let pixels = gray.into_raw().into_iter().map(|value| value as f32).collect();
+        let pixels = gray
+            .into_raw()
+            .into_iter()
+            .map(|value| value as f32)
+            .collect();
         LoadedSurface {
             width,
             height,
@@ -914,15 +909,15 @@ fn entropy_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     impl GpuOutputs {
-    fn empty(width: u32) -> Self {
-        let len = width as usize;
-        Self {
-            mean_intensity: vec![0.0; len],
-            grad_mean: vec![0.0; len],
-            grad_variance: vec![0.0; len],
-            entropy: vec![0.0; len],
+        fn empty(width: u32) -> Self {
+            let len = width as usize;
+            Self {
+                mean_intensity: vec![0.0; len],
+                grad_mean: vec![0.0; len],
+                grad_variance: vec![0.0; len],
+                entropy: vec![0.0; len],
+            }
         }
-    }
     }
 
     struct PipelineWithBindGroup {

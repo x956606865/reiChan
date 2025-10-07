@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist-tests",
+    "noEmit": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "jsx": "react-jsx",
+    "isolatedModules": false,
+    "allowImportingTsExtensions": false,
+    "sourceMap": false,
+    "declaration": false,
+    "baseUrl": ".",
+    "paths": {
+      "zustand": [
+        "tests/stubs/zustand.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/features/manga/customSplitDrawer/**/*.ts",
+    "src/features/manga/customSplitDrawer/**/*.tsx",
+    "tests/**/*.ts"
+  ]
+}

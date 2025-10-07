@@ -5,7 +5,10 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::doublepage::SplitDetectionSummary;
+use crate::doublepage::{
+    EdgeTextureAcceleratorPreference, ManualOverrideEntry, ManualOverridesFile,
+    SplitDetectionSummary,
+};
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use hex;
@@ -44,7 +47,7 @@ pub struct RenameEntry {
     pub renamed_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RenameOutcome {
     pub directory: PathBuf,
@@ -62,6 +65,10 @@ pub struct RenameOutcome {
     pub split_summary: Option<RenameSplitSummary>,
     #[serde(default)]
     pub source_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub split_manual_overrides: bool,
+    #[serde(default)]
+    pub manual_entries: Option<Vec<ManifestManualEntry>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -348,12 +355,28 @@ struct ManifestFile {
     split_applied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     split: Option<ManifestSplitSection>,
+    #[serde(default)]
+    split_manual_overrides: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_entries: Option<Vec<ManifestManualEntry>>,
 }
 
 #[derive(Serialize)]
 struct ManifestEntryData {
     source: String,
     target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManifestManualEntry {
+    pub source: String,
+    pub outputs: Vec<String>,
+    pub lines: [u32; 4],
+    pub percentages: [f32; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accelerator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
 }
 
 struct FileCandidate {
@@ -368,6 +391,114 @@ struct ManifestSplitSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     report_path: Option<PathBuf>,
     summary: RenameSplitSummary,
+}
+
+fn load_manual_manifest_entries(
+    workspace: &Path,
+    warnings: &mut Vec<String>,
+) -> (bool, Option<Vec<ManifestManualEntry>>) {
+    let overrides_path = workspace
+        .join("manual-overrides")
+        .join("manual_overrides.json");
+
+    if !overrides_path.exists() {
+        return (false, None);
+    }
+
+    let data = match fs::read_to_string(&overrides_path) {
+        Ok(content) => content,
+        Err(err) => {
+            warnings.push(format!("failed to read manual overrides: {}", err));
+            return (false, None);
+        }
+    };
+
+    let overrides: ManualOverridesFile = match serde_json::from_str(&data) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warnings.push(format!("failed to parse manual overrides: {}", err));
+            return (false, None);
+        }
+    };
+
+    if overrides.entries.is_empty() {
+        return (false, None);
+    }
+
+    let manual_report_path = workspace.join("manual_split_report.json");
+    if !manual_report_path.exists() {
+        warnings.push(
+            "manual split report not found; resume/download may ignore manual outputs".to_string(),
+        );
+    }
+
+    let entries = overrides
+        .entries
+        .iter()
+        .map(build_manifest_manual_entry)
+        .collect::<Vec<_>>();
+
+    (true, Some(entries))
+}
+
+fn build_manifest_manual_entry(entry: &ManualOverrideEntry) -> ManifestManualEntry {
+    let source_name = entry
+        .source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| entry.source.to_string_lossy().to_string());
+
+    let width = entry.width.max(1) as f32;
+    let pixels = entry.pixels.unwrap_or_else(|| {
+        [
+            (entry.lines[0].clamp(0.0, 1.0) * width).round() as u32,
+            (entry.lines[1].clamp(0.0, 1.0) * width).round() as u32,
+            (entry.lines[2].clamp(0.0, 1.0) * width).round() as u32,
+            (entry.lines[3].clamp(0.0, 1.0) * width).round() as u32,
+        ]
+    });
+
+    let outputs: Vec<String> = entry
+        .outputs
+        .as_ref()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|path| path.file_name().and_then(|value| value.to_str()))
+                .map(|value| value.to_string())
+                .collect()
+        })
+        .filter(|values: &Vec<String>| !values.is_empty())
+        .unwrap_or_else(|| {
+            let stem = entry
+                .source
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("page");
+            let ext = entry
+                .source
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!(".{}", value))
+                .unwrap_or_else(String::new);
+            vec![format!("{}_R{}", stem, ext), format!("{}_L{}", stem, ext)]
+        });
+
+    let accelerator = entry.accelerator.map(|pref| match pref {
+        EdgeTextureAcceleratorPreference::Auto => "auto".to_string(),
+        EdgeTextureAcceleratorPreference::Cpu => "cpu".to_string(),
+        EdgeTextureAcceleratorPreference::Gpu => "gpu".to_string(),
+    });
+
+    ManifestManualEntry {
+        source: source_name,
+        outputs,
+        lines: pixels,
+        percentages: entry.lines,
+        accelerator,
+        applied_at: entry.last_applied_at.clone(),
+    }
 }
 
 pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameError> {
@@ -505,6 +636,8 @@ pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameErr
             split_report_path,
             split_summary,
             source_directory,
+            split_manual_overrides: false,
+            manual_entries: None,
         });
     }
 
@@ -522,6 +655,9 @@ pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameErr
         let final_path = working_directory.join(&entries[index].renamed_name);
         fs::rename(temp_path, &final_path)?;
     }
+
+    let (split_manual_overrides_flag, manual_manifest_entries) =
+        load_manual_manifest_entries(&working_directory, &mut warnings);
 
     let manifest = ManifestFile {
         version: 1,
@@ -546,6 +682,8 @@ pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameErr
         } else {
             None
         },
+        split_manual_overrides: split_manual_overrides_flag,
+        manual_entries: manual_manifest_entries.clone(),
     };
 
     let manifest_path = working_directory.join("manifest.json");
@@ -564,6 +702,8 @@ pub fn perform_rename(options: RenameOptions) -> Result<RenameOutcome, RenameErr
         split_report_path,
         split_summary,
         source_directory,
+        split_manual_overrides: split_manual_overrides_flag,
+        manual_entries: manual_manifest_entries,
     })
 }
 
@@ -2681,6 +2821,10 @@ impl<R: Read> Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doublepage::{
+        apply_manual_splits, prepare_manual_split_workspace, ManualSplitApplyRequest,
+        ManualSplitLine, PrepareManualSplitWorkspaceRequest,
+    };
     use httpmock::prelude::*;
     use serde_json::json;
     use std::fs::{self, File};
@@ -2760,8 +2904,13 @@ mod tests {
         assert_eq!(result.entries.len(), 3);
         assert!(result.dry_run);
         assert!(result.manifest_path.is_none());
-        assert_eq!(result.entries[0].renamed_name, "0001.jpg");
-        assert_eq!(result.entries[1].renamed_name, "0002.jpg");
+        let mut renamed: Vec<&str> = result
+            .entries
+            .iter()
+            .map(|entry| entry.renamed_name.as_str())
+            .collect();
+        renamed.sort();
+        assert_eq!(renamed, ["0001.jpg", "0002.jpg", "0010.jpg"]);
         assert!(!result.split_applied);
         assert!(result.split_workspace.is_none());
         assert!(temp.path().join("page10.png").exists());
@@ -2823,6 +2972,85 @@ mod tests {
             .collect();
         targets.sort();
         assert_eq!(targets, vec!["0001.jpg", "0010.jpg", "0100.jpg"]);
+    }
+
+    #[test]
+    fn rename_attaches_manual_overrides_when_only_manual_applied() {
+        use image::{ImageBuffer, Rgba};
+
+        fn write_image(path: &Path) {
+            let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
+                ImageBuffer::from_fn(1200, 800, |_, _| Rgba([200, 208, 220, 255]));
+            buffer
+                .save_with_format(path, image::ImageFormat::Png)
+                .expect("save image");
+        }
+
+        let temp = TempDir::new().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).expect("create source");
+        write_image(&source_dir.join("page_001.png"));
+        write_image(&source_dir.join("page_002.png"));
+
+        let setup = prepare_manual_split_workspace(PrepareManualSplitWorkspaceRequest {
+            source_directory: source_dir.clone(),
+            workspace_root: None,
+            overwrite: true,
+        })
+        .expect("prepare manual workspace");
+
+        let overrides: Vec<ManualSplitLine> = setup
+            .entries
+            .iter()
+            .map(|entry| ManualSplitLine {
+                source: entry.source_path.clone(),
+                left_trim: 0.05,
+                left_page_end: 0.48,
+                right_page_start: 0.52,
+                right_trim: 0.95,
+                gutter_ratio: None,
+                locked: false,
+            })
+            .collect();
+
+        apply_manual_splits(
+            ManualSplitApplyRequest {
+                workspace: setup.workspace.clone(),
+                overrides,
+                accelerator: EdgeTextureAcceleratorPreference::Cpu,
+                generate_preview: false,
+            },
+            None,
+        )
+        .expect("apply manual splits");
+
+        let result = perform_rename(RenameOptions {
+            directory: source_dir.clone(),
+            pad: 4,
+            target_extension: "jpg".to_string(),
+            dry_run: false,
+            split: RenameSplitOptions {
+                enabled: true,
+                workspace: Some(setup.workspace.clone()),
+                report_path: None,
+                summary: None,
+                warnings: None,
+            },
+        })
+        .expect("rename with manual workspace");
+
+        assert!(result.split_applied);
+        assert_eq!(result.split_workspace, Some(setup.workspace.clone()));
+        assert!(result.split_manual_overrides);
+        let manual_entries = result.manual_entries.expect("manual entries");
+        assert_eq!(manual_entries.len(), 2);
+        assert!(manual_entries.iter().all(|entry| entry.outputs.len() == 2));
+        assert!(result
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("manual split report not found")));
+        assert!(setup.workspace.join("0001.jpg").exists());
+        assert!(setup.workspace.join("0002.jpg").exists());
     }
 
     #[test]

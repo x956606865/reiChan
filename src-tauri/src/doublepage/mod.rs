@@ -20,9 +20,26 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod config;
+mod manual;
 pub use config::{
     EdgeTextureThresholdOverrides, ProjectionConfig, ProjectionThresholdOverrides, SplitConfig,
     SplitModeSelector, SplitPrimaryMode,
+};
+
+pub use edge_texture::EdgeTextureAcceleratorPreference;
+
+pub use manual::{
+    apply_manual_splits, export_manual_split_template, load_manual_split_context,
+    prepare_manual_split_workspace, render_manual_split_preview, revert_manual_splits,
+    track_manual_split_event, ManualOverrideEntry, ManualOverridesFile, ManualSplitApplyFailed,
+    ManualSplitApplyRequest, ManualSplitApplyResponse, ManualSplitApplyStarted, ManualSplitContext,
+    ManualSplitContextRequest, ManualSplitLine, ManualSplitPreviewRequest, ManualSplitPreviewResponse,
+    ManualSplitProgress, ManualSplitRevertRequest, ManualSplitRevertResponse,
+    ManualSplitTelemetryRequest, ManualSplitTemplateEntry, ManualSplitTemplateExportRequest,
+    ManualSplitTemplateExportResponse, PrepareManualSplitWorkspaceRequest,
+    PrepareManualSplitWorkspaceResponse, MANUAL_SPLIT_APPLY_FAILED_EVENT,
+    MANUAL_SPLIT_APPLY_PROGRESS_EVENT, MANUAL_SPLIT_APPLY_STARTED_EVENT,
+    MANUAL_SPLIT_APPLY_SUCCEEDED_EVENT,
 };
 
 mod mask;
@@ -32,9 +49,8 @@ use mask::BoundingBox;
 mod edge_texture;
 mod edge_texture_gpu;
 use edge_texture::{
-    analyze_edges, analyze_edges_with_acceleration, EdgeTextureAccelerator,
-    EdgeTextureAcceleratorPreference, EdgeTextureAnalysis, EdgeTextureConfig, EdgeTextureMetrics,
-    EdgeTextureNotes, EdgeTextureOutcome, MarginRegion,
+    analyze_edges, analyze_edges_with_acceleration, EdgeTextureAccelerator, EdgeTextureAnalysis,
+    EdgeTextureConfig, EdgeTextureMetrics, EdgeTextureNotes, EdgeTextureOutcome, MarginRegion,
 };
 
 mod projection;
@@ -440,9 +456,7 @@ where
     {
         let mut guard = edge_preview_cache().lock().unwrap();
         if let Some(session) = guard.get(path) {
-            if session.config == config
-                && preference_accepts(preference, session.accelerator)
-            {
+            if session.config == config && preference_accepts(preference, session.accelerator) {
                 return Ok((Arc::clone(session), EdgePreviewCacheStatus::Hit, None));
             }
             guard.pop(path);
@@ -538,7 +552,7 @@ pub enum SplitProgressStage {
     Completed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SplitItemReport {
     pub source: PathBuf,
@@ -550,16 +564,17 @@ pub struct SplitItemReport {
     pub metadata: SplitMetadata,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SplitMode {
     Skip,
     CoverTrim,
     Split,
     FallbackCenter,
+    Manual,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SplitBoundingBox {
     pub x: u32,
@@ -579,7 +594,7 @@ impl From<BoundingBox> for SplitBoundingBox {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EdgeTextureMetadata {
     pub split_x: Option<u32>,
@@ -595,7 +610,7 @@ pub struct EdgeTextureMetadata {
     pub notes: EdgeTextureNotes,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct SplitMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -630,6 +645,16 @@ pub struct SplitMetadata {
     pub edge_texture: Option<EdgeTextureMetadata>,
     #[serde(rename = "splitStrategy", skip_serializing_if = "Option::is_none")]
     pub split_strategy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_lines: Option<[u32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_percentages: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_applied_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_accelerator: Option<String>,
 }
 
 impl SplitMetadata {
@@ -1761,8 +1786,11 @@ pub fn preview_edge_texture_trim(
 
     let prefer_downsample = request.prefer_downsample_preview;
     let accelerator_preference = request.accelerator;
-    let (session, cache_status, build_metrics_opt) =
-        get_or_insert_preview_session(&canonical_image_path, config_edge, accelerator_preference, {
+    let (session, cache_status, build_metrics_opt) = get_or_insert_preview_session(
+        &canonical_image_path,
+        config_edge,
+        accelerator_preference,
+        {
             let canonical_image_path = canonical_image_path.clone();
             let accelerator_preference = accelerator_preference;
             move || {
@@ -1829,7 +1857,10 @@ pub fn preview_edge_texture_trim(
                 }
 
                 let analysis = analysis.expect("edge preview outcome must exist");
-                let EdgeTextureAnalysis { outcome, accelerator } = analysis;
+                let EdgeTextureAnalysis {
+                    outcome,
+                    accelerator,
+                } = analysis;
 
                 #[cfg(debug_assertions)]
                 let stage_analyze = analyze_start.elapsed();
@@ -1858,7 +1889,8 @@ pub fn preview_edge_texture_trim(
 
                 Ok((session, metrics))
             }
-        })?;
+        },
+    )?;
 
     #[cfg(not(debug_assertions))]
     let _ = cache_status;
@@ -2126,8 +2158,7 @@ mod tests {
         edge_preview_cache().lock().unwrap().clear();
 
         let config_edge = SplitConfig::default().edge_texture;
-        let build_log: Arc<Mutex<Vec<EdgeTextureAccelerator>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let build_log: Arc<Mutex<Vec<EdgeTextureAccelerator>>> = Arc::new(Mutex::new(Vec::new()));
 
         let log_gpu = build_log.clone();
         let (session_gpu, status_gpu, _) = get_or_insert_preview_session(
@@ -2139,10 +2170,7 @@ mod tests {
                 move || {
                     let image = image::open(&canonical)?;
                     let outcome = analyze_edges(&image, config_edge);
-                    log_gpu
-                        .lock()
-                        .unwrap()
-                        .push(EdgeTextureAccelerator::Gpu);
+                    log_gpu.lock().unwrap().push(EdgeTextureAccelerator::Gpu);
                     let session = EdgePreviewSession {
                         original_path: canonical.clone(),
                         image: Arc::new(image),
@@ -2172,10 +2200,7 @@ mod tests {
                 move || {
                     let image = image::open(&canonical)?;
                     let outcome = analyze_edges(&image, config_edge);
-                    log_cpu
-                        .lock()
-                        .unwrap()
-                        .push(EdgeTextureAccelerator::Cpu);
+                    log_cpu.lock().unwrap().push(EdgeTextureAccelerator::Cpu);
                     let session = EdgePreviewSession {
                         original_path: canonical.clone(),
                         image: Arc::new(image),
@@ -2196,7 +2221,10 @@ mod tests {
         assert_eq!(session_cpu.accelerator, EdgeTextureAccelerator::Cpu);
 
         let log = build_log.lock().unwrap();
-        assert_eq!(log.as_slice(), &[EdgeTextureAccelerator::Gpu, EdgeTextureAccelerator::Cpu]);
+        assert_eq!(
+            log.as_slice(),
+            &[EdgeTextureAccelerator::Gpu, EdgeTextureAccelerator::Cpu]
+        );
     }
 
     #[test]
@@ -2348,8 +2376,11 @@ mod tests {
 
         let config_edge = SplitConfig::default().edge_texture;
 
-        let (first_session, first_status, _) =
-            get_or_insert_preview_session(&canonical, config_edge, EdgeTextureAcceleratorPreference::Auto, {
+        let (first_session, first_status, _) = get_or_insert_preview_session(
+            &canonical,
+            config_edge,
+            EdgeTextureAcceleratorPreference::Auto,
+            {
                 let canonical = canonical.clone();
                 move || {
                     let image = image::open(&canonical)?;
@@ -2366,8 +2397,9 @@ mod tests {
                     };
                     Ok((session, EdgePreviewBuildMetrics::default()))
                 }
-            })
-            .expect("first cache insert");
+            },
+        )
+        .expect("first cache insert");
 
         assert!(matches!(first_status, EdgePreviewCacheStatus::Miss));
 
@@ -2401,8 +2433,11 @@ mod tests {
         let mut config_v2 = config_v1;
         config_v2.white_threshold = (config_v1.white_threshold + 0.1).min(1.0);
 
-        let (session_base, status_base, _) =
-            get_or_insert_preview_session(&canonical, config_v1, EdgeTextureAcceleratorPreference::Auto, {
+        let (session_base, status_base, _) = get_or_insert_preview_session(
+            &canonical,
+            config_v1,
+            EdgeTextureAcceleratorPreference::Auto,
+            {
                 let canonical = canonical.clone();
                 move || {
                     let image = image::open(&canonical)?;
@@ -2419,29 +2454,35 @@ mod tests {
                     };
                     Ok((session, EdgePreviewBuildMetrics::default()))
                 }
-            })
-            .expect("base insert");
+            },
+        )
+        .expect("base insert");
 
         assert!(matches!(status_base, EdgePreviewCacheStatus::Miss));
 
-        let (session_new, status_new, _) = get_or_insert_preview_session(&canonical, config_v2, EdgeTextureAcceleratorPreference::Auto, {
-            let canonical = canonical.clone();
-            move || {
-                let image = image::open(&canonical)?;
-                let outcome = analyze_edges(&image, config_v2);
-                let session = EdgePreviewSession {
-                    original_path: canonical.clone(),
-                    image: Arc::new(image),
-                    downsample: None,
-                    downsample_attempted: false,
-                    outcome: Arc::new(outcome),
-                    accelerator: EdgeTextureAccelerator::Cpu,
-                    config: config_v2,
-                    created_at: Instant::now(),
-                };
-                Ok((session, EdgePreviewBuildMetrics::default()))
-            }
-        })
+        let (session_new, status_new, _) = get_or_insert_preview_session(
+            &canonical,
+            config_v2,
+            EdgeTextureAcceleratorPreference::Auto,
+            {
+                let canonical = canonical.clone();
+                move || {
+                    let image = image::open(&canonical)?;
+                    let outcome = analyze_edges(&image, config_v2);
+                    let session = EdgePreviewSession {
+                        original_path: canonical.clone(),
+                        image: Arc::new(image),
+                        downsample: None,
+                        downsample_attempted: false,
+                        outcome: Arc::new(outcome),
+                        accelerator: EdgeTextureAccelerator::Cpu,
+                        config: config_v2,
+                        created_at: Instant::now(),
+                    };
+                    Ok((session, EdgePreviewBuildMetrics::default()))
+                }
+            },
+        )
         .expect("rebuild with new config");
 
         assert!(matches!(status_new, EdgePreviewCacheStatus::Miss));
