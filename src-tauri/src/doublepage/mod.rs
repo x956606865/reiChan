@@ -34,9 +34,9 @@ pub use manual::{
     track_manual_split_event, ManualOverrideEntry, ManualOverridesFile, ManualSplitApplyFailed,
     ManualSplitApplyRequest, ManualSplitApplyResponse, ManualSplitApplyStarted, ManualSplitContext,
     ManualSplitContextRequest, ManualSplitLine, ManualSplitPreviewRequest, ManualSplitPreviewResponse,
-    ManualSplitProgress, ManualSplitRevertRequest, ManualSplitRevertResponse,
-    ManualSplitTelemetryRequest, ManualSplitTemplateEntry, ManualSplitTemplateExportRequest,
-    ManualSplitTemplateExportResponse, PrepareManualSplitWorkspaceRequest,
+    ManualSplitProgress, ManualSplitRevertRequest, ManualSplitRevertResponse, ManualImageKind,
+    ManualSplitTelemetryRequest, ManualSplitTemplateExportRequest, ManualSplitTemplateExportResponse,
+    PrepareManualSplitWorkspaceRequest,
     PrepareManualSplitWorkspaceResponse, MANUAL_SPLIT_APPLY_FAILED_EVENT,
     MANUAL_SPLIT_APPLY_PROGRESS_EVENT, MANUAL_SPLIT_APPLY_STARTED_EVENT,
     MANUAL_SPLIT_APPLY_SUCCEEDED_EVENT,
@@ -655,6 +655,10 @@ pub struct SplitMetadata {
     pub manual_applied_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manual_accelerator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_image_kind: Option<ManualImageKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_rotate90: Option<bool>,
 }
 
 impl SplitMetadata {

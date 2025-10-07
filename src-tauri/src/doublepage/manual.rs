@@ -27,9 +27,9 @@ pub struct ManualSplitContextRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ManualSplitContextEntry {
     pub source_path: PathBuf,
-    pub display_name: String,
-    pub width: u32,
-    pub height: u32,
+   pub display_name: String,
+   pub width: u32,
+   pub height: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_lines: Option<[f32; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +40,10 @@ pub struct ManualSplitContextEntry {
     pub last_applied_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_kind: Option<ManualImageKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotate90: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +111,24 @@ pub struct ManualSplitPreviewResponse {
     pub generated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ManualImageKind {
+    Content,
+    Cover,
+    Spread,
+}
+
+impl Default for ManualImageKind {
+    fn default() -> Self {
+        ManualImageKind::Content
+    }
+}
+
+fn default_manual_image_kind() -> ManualImageKind {
+    ManualImageKind::Content
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualSplitLine {
@@ -119,6 +141,10 @@ pub struct ManualSplitLine {
     pub gutter_ratio: Option<f32>,
     #[serde(default)]
     pub locked: bool,
+    #[serde(default = "default_manual_image_kind")]
+    pub image_kind: ManualImageKind,
+    #[serde(default)]
+    pub rotate90: bool,
 }
 
 fn default_manual_accelerator() -> EdgeTextureAcceleratorPreference {
@@ -150,6 +176,8 @@ pub struct ManualSplitApplyEntry {
     pub height: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    pub image_kind: ManualImageKind,
+    pub rotate90: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +241,12 @@ pub struct ManualSplitTemplateEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub image_kind: Option<ManualImageKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub rotate90: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +282,10 @@ struct ManualSplitReportEntry {
     pub applied_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(default = "default_manual_image_kind")]
+    pub image_kind: ManualImageKind,
+    #[serde(default)]
+    pub rotate90: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -507,6 +545,8 @@ pub fn prepare_manual_split_workspace(
             locked: false,
             last_applied_at: None,
             thumbnail_path: None,
+            image_kind: Some(ManualImageKind::Content),
+            rotate90: Some(false),
         });
 
         report_items.push(SplitItemReport {
@@ -588,7 +628,7 @@ pub struct ManualOverridesFile {
 }
 
 fn default_overrides_version() -> u32 {
-    1
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,6 +652,10 @@ pub struct ManualOverrideEntry {
     pub thumbnail_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<PathBuf>>,
+    #[serde(default = "default_manual_image_kind")]
+    pub image_kind: ManualImageKind,
+    #[serde(default)]
+    pub rotate90: bool,
 }
 
 struct ManualWorkItem {
@@ -619,6 +663,8 @@ struct ManualWorkItem {
     lines: [f32; 4],
     locked: bool,
     gutter_ratio: Option<f32>,
+    image_kind: ManualImageKind,
+    rotate90: bool,
 }
 
 struct ManualOutputPaths {
@@ -626,6 +672,11 @@ struct ManualOutputPaths {
     right_root: PathBuf,
     left_manual: PathBuf,
     right_manual: PathBuf,
+}
+
+struct ManualSingleOutputPaths {
+    root: PathBuf,
+    manual: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -742,6 +793,9 @@ pub fn load_manual_split_context(
         let locked = override_entry.map(|entry| entry.locked).unwrap_or(false);
         let last_applied_at = override_entry.and_then(|entry| entry.last_applied_at.clone());
         let thumbnail_path = override_entry.and_then(|entry| entry.thumbnail_path.clone());
+        let (image_kind, rotate90) = override_entry
+            .map(|entry| (entry.image_kind, entry.rotate90))
+            .unwrap_or((ManualImageKind::Content, false));
 
         let recommended_lines = compute_recommended_lines(split_x, width);
 
@@ -761,6 +815,8 @@ pub fn load_manual_split_context(
             locked,
             last_applied_at,
             thumbnail_path,
+            image_kind: Some(image_kind),
+            rotate90: Some(rotate90),
         });
     }
 
@@ -943,6 +999,8 @@ pub fn apply_manual_splits(
             ],
             locked: override_line.locked,
             gutter_ratio: override_line.gutter_ratio,
+            image_kind: override_line.image_kind,
+            rotate90: override_line.rotate90,
         });
     }
 
@@ -1062,72 +1120,127 @@ pub fn apply_manual_splits(
                 EdgeTextureAccelerator::Gpu => "gpu".to_string(),
             };
 
-            let outputs = derive_manual_output_paths(&workspace, &manual_dir, &item.source)
-                .map_err(ManualSplitError::InvalidOverrides)?;
-
-            for path in [
-                &outputs.left_root,
-                &outputs.right_root,
-                &outputs.left_manual,
-                &outputs.right_manual,
-            ] {
-                if let Some(backup) = backup_existing_file(path, &backup_dir)? {
-                    backup_records.push((path.clone(), backup));
-                }
-            }
-
             let mut created_this_round: Vec<PathBuf> = Vec::new();
+            let outputs_for_entry: Vec<PathBuf> = match item.image_kind {
+                ManualImageKind::Content => {
+                    let outputs =
+                        derive_manual_output_paths(&workspace, &manual_dir, &item.source)
+                            .map_err(ManualSplitError::InvalidOverrides)?;
 
-            let left_width = left_end.saturating_sub(left_trim).max(1);
-            let right_width = right_trim.saturating_sub(right_start).max(1);
+                    for path in [
+                        &outputs.left_root,
+                        &outputs.right_root,
+                        &outputs.left_manual,
+                        &outputs.right_manual,
+                    ] {
+                        if let Some(backup) = backup_existing_file(path, &backup_dir)? {
+                            backup_records.push((path.clone(), backup));
+                        }
+                    }
 
-            if let Err(err) = image
-                .crop_imm(left_trim, 0, left_width, height)
-                .save(&outputs.left_manual)
-            {
-                cleanup_files(&created_this_round);
-                return Err(ManualSplitError::OutputWrite(err.to_string()));
-            }
-            created_this_round.push(outputs.left_manual.clone());
+                    let left_width = left_end.saturating_sub(left_trim).max(1);
+                    let right_width = right_trim.saturating_sub(right_start).max(1);
 
-            if let Err(err) = image
-                .crop_imm(right_start, 0, right_width, height)
-                .save(&outputs.right_manual)
-            {
-                cleanup_files(&created_this_round);
-                return Err(ManualSplitError::OutputWrite(err.to_string()));
-            }
-            created_this_round.push(outputs.right_manual.clone());
+                    if let Err(err) = image
+                        .crop_imm(left_trim, 0, left_width, height)
+                        .save(&outputs.left_manual)
+                    {
+                        cleanup_files(&created_this_round);
+                        return Err(ManualSplitError::OutputWrite(err.to_string()));
+                    }
+                    created_this_round.push(outputs.left_manual.clone());
 
-            if let Err(err) = fs::copy(&outputs.left_manual, &outputs.left_root) {
-                cleanup_files(&created_this_round);
-                return Err(ManualSplitError::OutputWrite(err.to_string()));
-            }
-            created_this_round.push(outputs.left_root.clone());
+                    if let Err(err) = image
+                        .crop_imm(right_start, 0, right_width, height)
+                        .save(&outputs.right_manual)
+                    {
+                        cleanup_files(&created_this_round);
+                        return Err(ManualSplitError::OutputWrite(err.to_string()));
+                    }
+                    created_this_round.push(outputs.right_manual.clone());
 
-            if let Err(err) = fs::copy(&outputs.right_manual, &outputs.right_root) {
-                cleanup_files(&created_this_round);
-                return Err(ManualSplitError::OutputWrite(err.to_string()));
-            }
-            created_this_round.push(outputs.right_root.clone());
+                    if let Err(err) = fs::copy(&outputs.left_manual, &outputs.left_root) {
+                        cleanup_files(&created_this_round);
+                        return Err(ManualSplitError::OutputWrite(err.to_string()));
+                    }
+                    created_this_round.push(outputs.left_root.clone());
 
-            created_paths.extend(created_this_round.into_iter());
+                    if let Err(err) = fs::copy(&outputs.right_manual, &outputs.right_root) {
+                        cleanup_files(&created_this_round);
+                        return Err(ManualSplitError::OutputWrite(err.to_string()));
+                    }
+                    created_this_round.push(outputs.right_root.clone());
+
+                    vec![outputs.right_root.clone(), outputs.left_root.clone()]
+                }
+                ManualImageKind::Cover | ManualImageKind::Spread => {
+                    let single_paths = derive_manual_single_output_paths(
+                        &workspace,
+                        &manual_dir,
+                        &item.source,
+                        item.image_kind,
+                    )
+                    .map_err(ManualSplitError::InvalidOverrides)?;
+
+                    for path in [&single_paths.root, &single_paths.manual] {
+                        if let Some(backup) = backup_existing_file(path, &backup_dir)? {
+                            backup_records.push((path.clone(), backup));
+                        }
+                    }
+
+                    let single_width = right_trim.saturating_sub(left_trim).max(1);
+                    let single_image = image.crop_imm(left_trim, 0, single_width, height);
+                    let final_single = if item.rotate90 {
+                        single_image.rotate90()
+                    } else {
+                        single_image
+                    };
+
+                    if let Err(err) = final_single.save(&single_paths.manual) {
+                        cleanup_files(&created_this_round);
+                        return Err(ManualSplitError::OutputWrite(err.to_string()));
+                    }
+                    created_this_round.push(single_paths.manual.clone());
+
+                    if let Err(err) = fs::copy(&single_paths.manual, &single_paths.root) {
+                        cleanup_files(&created_this_round);
+                        return Err(ManualSplitError::OutputWrite(err.to_string()));
+                    }
+                    created_this_round.push(single_paths.root.clone());
+
+                    vec![single_paths.root.clone()]
+                }
+            };
+
+            created_paths.extend(created_this_round.iter().cloned());
 
             let width_f = width as f32;
+            let pixel_values = match item.image_kind {
+                ManualImageKind::Content => [left_trim, left_end, right_start, right_trim],
+                ManualImageKind::Cover | ManualImageKind::Spread => [
+                    left_trim,
+                    left_trim,
+                    right_trim,
+                    right_trim,
+                ],
+            };
             let sanitized = [
-                (left_trim as f32 / width_f).clamp(0.0, 1.0),
-                (left_end as f32 / width_f).clamp(0.0, 1.0),
-                (right_start as f32 / width_f).clamp(0.0, 1.0),
-                (right_trim as f32 / width_f).clamp(0.0, 1.0),
+                (pixel_values[0] as f32 / width_f).clamp(0.0, 1.0),
+                (pixel_values[1] as f32 / width_f).clamp(0.0, 1.0),
+                (pixel_values[2] as f32 / width_f).clamp(0.0, 1.0),
+                (pixel_values[3] as f32 / width_f).clamp(0.0, 1.0),
             ];
 
-            let gutter_ratio = item.gutter_ratio.or_else(|| {
-                if right_start > left_end {
-                    Some((right_start - left_end) as f32 / width_f)
-                } else {
-                    None
-                }
-            });
+            let gutter_ratio = match item.image_kind {
+                ManualImageKind::Content => item.gutter_ratio.or_else(|| {
+                    if right_start > left_end {
+                        Some((right_start - left_end) as f32 / width_f)
+                    } else {
+                        None
+                    }
+                }),
+                ManualImageKind::Cover | ManualImageKind::Spread => item.gutter_ratio,
+            };
 
             let applied_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             let duration_ms = iteration_start.elapsed().as_millis() as u64;
@@ -1140,22 +1253,26 @@ pub fn apply_manual_splits(
                 width,
                 height,
                 lines: sanitized,
-                pixels: Some([left_trim, left_end, right_start, right_trim]),
+                pixels: Some(pixel_values),
                 gutter_ratio,
                 accelerator: Some(accelerator),
                 locked: item.locked,
                 last_applied_at: Some(applied_at.clone()),
                 thumbnail_path: None,
-                outputs: Some(vec![outputs.right_root.clone(), outputs.left_root.clone()]),
+                outputs: Some(outputs_for_entry.clone()),
+                image_kind: item.image_kind,
+                rotate90: item.rotate90,
             });
 
             let apply_metadata = |metadata: &mut SplitMetadata| {
-                metadata.manual_lines = Some([left_trim, left_end, right_start, right_trim]);
+                metadata.manual_lines = Some(pixel_values);
                 metadata.manual_percentages = Some(sanitized);
                 metadata.manual_source = Some("user".to_string());
                 metadata.manual_applied_at = Some(applied_at.clone());
                 metadata.manual_accelerator = Some(accelerator_label.clone());
                 metadata.split_mode = Some(SplitMode::Manual);
+                metadata.manual_image_kind = Some(item.image_kind);
+                metadata.manual_rotate90 = Some(item.rotate90);
             };
 
             if let Some(entry) = report
@@ -1164,11 +1281,15 @@ pub fn apply_manual_splits(
                 .find(|existing| existing.source == item.source)
             {
                 entry.mode = SplitMode::Manual;
-                entry.split_x = Some(right_start);
+                entry.split_x = if matches!(item.image_kind, ManualImageKind::Content) {
+                    Some(right_start)
+                } else {
+                    None
+                };
                 entry.confidence = 1.0;
                 entry.content_width_ratio =
                     (right_trim.saturating_sub(left_trim) as f32 / width_f).clamp(0.0, 1.0);
-                entry.outputs = vec![outputs.right_root.clone(), outputs.left_root.clone()];
+                entry.outputs = outputs_for_entry.clone();
                 apply_metadata(&mut entry.metadata);
             } else {
                 let mut metadata = SplitMetadata::default();
@@ -1176,38 +1297,46 @@ pub fn apply_manual_splits(
                 report.items.push(SplitItemReport {
                     source: item.source.clone(),
                     mode: SplitMode::Manual,
-                    split_x: Some(right_start),
+                    split_x: if matches!(item.image_kind, ManualImageKind::Content) {
+                        Some(right_start)
+                    } else {
+                        None
+                    },
                     confidence: 1.0,
                     content_width_ratio: (right_trim.saturating_sub(left_trim) as f32 / width_f)
                         .clamp(0.0, 1.0),
-                    outputs: vec![outputs.right_root.clone(), outputs.left_root.clone()],
+                    outputs: outputs_for_entry.clone(),
                     metadata,
                 });
             }
 
             applied_entries.push(ManualSplitApplyEntry {
                 source_path: item.source.clone(),
-                outputs: vec![outputs.right_root.clone(), outputs.left_root.clone()],
+                outputs: outputs_for_entry.clone(),
                 applied_at: applied_at.clone(),
                 lines: sanitized,
-                pixels: [left_trim, left_end, right_start, right_trim],
+                pixels: pixel_values,
                 accelerator: accelerator_used,
                 width,
                 height,
                 duration_ms: Some(duration_ms),
+                image_kind: item.image_kind,
+                rotate90: item.rotate90,
             });
 
             report_entries.push(ManualSplitReportEntry {
                 source: item.source.clone(),
-                outputs: vec![outputs.right_root.clone(), outputs.left_root.clone()],
+                outputs: outputs_for_entry.clone(),
                 lines: sanitized,
-                pixels: [left_trim, left_end, right_start, right_trim],
+                pixels: pixel_values,
                 gutter_ratio,
                 accelerator: accelerator_label,
                 width,
                 height,
                 applied_at: applied_at.clone(),
                 duration_ms: Some(duration_ms),
+                image_kind: item.image_kind,
+                rotate90: item.rotate90,
             });
 
             emit_manual_progress(
@@ -1232,7 +1361,7 @@ pub fn apply_manual_splits(
             .map_err(|err| ManualSplitError::ReportWrite(err.to_string()))?;
 
         let manual_report = ManualSplitReportFile {
-            version: 1,
+            version: 2,
             generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             total,
             applied: applied_entries.len(),
@@ -1563,6 +1692,42 @@ fn derive_manual_output_paths(
     })
 }
 
+fn derive_manual_single_output_paths(
+    workspace: &Path,
+    manual_dir: &Path,
+    source: &Path,
+    kind: ManualImageKind,
+) -> Result<ManualSingleOutputPaths, String> {
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid source filename: {}", source.display()))?;
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{}", value))
+        .unwrap_or_else(String::new);
+
+    let suffix = match kind {
+        ManualImageKind::Cover => "cover",
+        ManualImageKind::Spread => "spread",
+        ManualImageKind::Content => {
+            return Err(format!(
+                "unsupported image kind for single output: {:?}",
+                kind
+            ))
+        }
+    };
+
+    let root_name = format!("{}_{}{}", stem, suffix, ext);
+    let manual_name = format!("{}_manual_{}{}", stem, suffix, ext);
+
+    Ok(ManualSingleOutputPaths {
+        root: workspace.join(root_name),
+        manual: manual_dir.join(manual_name),
+    })
+}
+
 fn backup_existing_file(
     path: &Path,
     backup_dir: &Path,
@@ -1835,6 +2000,8 @@ mod tests {
             entry.last_applied_at.as_deref(),
             Some("2025-10-06T12:00:00Z")
         );
+        assert_eq!(entry.image_kind, Some(ManualImageKind::Content));
+        assert_eq!(entry.rotate90, Some(false));
     }
 
     #[test]
@@ -1883,7 +2050,7 @@ mod tests {
         .unwrap();
 
         let manual_report = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "generatedAt": "2025-10-07T03:05:00Z",
             "total": 1,
             "applied": 1,
@@ -1895,6 +2062,8 @@ mod tests {
                     "lines": [0.05, 0.45, 0.55, 0.95],
                     "pixels": [90, 810, 990, 1710],
                     "gutterRatio": 0.1,
+                    "imageKind": "content",
+                    "rotate90": false,
                     "accelerator": "cpu",
                     "width": 1800,
                     "height": 1200,
@@ -1927,6 +2096,12 @@ mod tests {
             report_path.file_name().and_then(|value| value.to_str()),
             Some("manual_split_report.json")
         );
+        let entry = context
+            .entries
+            .first()
+            .expect("expected manual split context entry");
+        assert_eq!(entry.image_kind, Some(ManualImageKind::Content));
+        assert_eq!(entry.rotate90, Some(false));
         assert!(!context.has_revert_history);
     }
 
@@ -1999,6 +2174,8 @@ mod tests {
                 right_trim: 0.95,
                 gutter_ratio: None,
                 locked: false,
+                image_kind: ManualImageKind::Content,
+                rotate90: false,
             }],
             accelerator: EdgeTextureAcceleratorPreference::Auto,
             generate_preview: false,
@@ -2030,6 +2207,8 @@ mod tests {
         let canonical_source = fs::canonicalize(&source_path).unwrap();
         assert_eq!(applied_entry.source_path, canonical_source);
         assert_eq!(applied_entry.outputs.len(), 2);
+        assert_eq!(applied_entry.image_kind, ManualImageKind::Content);
+        assert!(!applied_entry.rotate90);
         assert_eq!(
             applied_entry.accelerator,
             EdgeTextureAccelerator::Cpu,
@@ -2051,6 +2230,8 @@ mod tests {
             .expect("expected override entry for source");
         assert!(override_entry.lines[0] < override_entry.lines[3]);
         assert!(override_entry.pixels.is_some());
+        assert_eq!(override_entry.image_kind, ManualImageKind::Content);
+        assert!(!override_entry.rotate90);
 
         let report_path = response.split_report_path.unwrap();
         let report_data = fs::read_to_string(&report_path).unwrap();
@@ -2063,10 +2244,16 @@ mod tests {
         assert_eq!(updated_item.mode, SplitMode::Manual);
         assert_eq!(updated_item.metadata.manual_source.as_deref(), Some("user"));
         assert!(updated_item.metadata.manual_lines.is_some());
+        assert_eq!(
+            updated_item.metadata.manual_image_kind,
+            Some(ManualImageKind::Content)
+        );
+        assert_eq!(updated_item.metadata.manual_rotate90, Some(false));
 
         let manual_report_data = fs::read_to_string(manual_report_path).unwrap();
         let parsed_manual: ManualSplitReportFile =
             serde_json::from_str(&manual_report_data).unwrap();
+        assert_eq!(parsed_manual.version, 2);
         assert_eq!(parsed_manual.total, 1);
         let report_entry = parsed_manual
             .entries
@@ -2074,6 +2261,8 @@ mod tests {
             .find(|entry| entry.source == canonical_source)
             .expect("expected manual report entry");
         assert_eq!(report_entry.accelerator, "cpu");
+        assert_eq!(report_entry.image_kind, ManualImageKind::Content);
+        assert!(!report_entry.rotate90);
 
         assert!(!progress_events.is_empty());
         assert!(progress_events
@@ -2126,6 +2315,8 @@ mod tests {
                 right_trim: 0.95,
                 gutter_ratio: None,
                 locked: false,
+                image_kind: ManualImageKind::Content,
+                rotate90: false,
             }],
             accelerator: EdgeTextureAcceleratorPreference::Auto,
             generate_preview: false,
@@ -2142,6 +2333,8 @@ mod tests {
             EdgeTextureAccelerator::Gpu,
             "expected GPU accelerator to be recorded when mock GPU is requested"
         );
+        assert_eq!(applied_entry.image_kind, ManualImageKind::Content);
+        assert!(!applied_entry.rotate90);
 
         let manual_report_path = response
             .manual_split_report_path
@@ -2149,6 +2342,7 @@ mod tests {
         let manual_report_data = fs::read_to_string(manual_report_path).unwrap();
         let parsed_manual: ManualSplitReportFile =
             serde_json::from_str(&manual_report_data).unwrap();
+        assert_eq!(parsed_manual.version, 2);
         let canonical_source = fs::canonicalize(&source_path).unwrap();
         let report_entry = parsed_manual
             .entries
@@ -2156,6 +2350,245 @@ mod tests {
             .find(|entry| entry.source == canonical_source)
             .expect("expected manual report entry");
         assert_eq!(report_entry.accelerator, "gpu");
+        assert_eq!(report_entry.image_kind, ManualImageKind::Content);
+        assert!(!report_entry.rotate90);
+    }
+
+    #[test]
+    fn apply_manual_splits_emits_single_output_for_cover_kind() {
+        let _guard = env_lock();
+
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let source_path = workspace.join("page_003.png");
+        write_mock_image(&source_path, 2000, 1400);
+
+        let report = serde_json::json!({
+            "generatedAt": "2025-10-07T04:00:00Z",
+            "items": [
+                {
+                    "source": source_path,
+                    "mode": "manual",
+                    "splitX": 900,
+                    "confidence": 1.0,
+                    "contentWidthRatio": 1.0,
+                    "outputs": [],
+                    "metadata": {}
+                }
+            ]
+        });
+        fs::write(
+            workspace.join("split-report.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+
+        let request = ManualSplitApplyRequest {
+            workspace: workspace.clone(),
+            overrides: vec![ManualSplitLine {
+                source: source_path.clone(),
+                left_trim: 0.1,
+                left_page_end: 0.1,
+                right_page_start: 0.9,
+                right_trim: 0.9,
+                gutter_ratio: None,
+                locked: false,
+                image_kind: ManualImageKind::Cover,
+                rotate90: false,
+            }],
+            accelerator: EdgeTextureAcceleratorPreference::Auto,
+            generate_preview: false,
+        };
+
+        let response = apply_manual_splits(request, None).unwrap();
+        assert_eq!(response.applied.len(), 1);
+        let applied_entry = &response.applied[0];
+        assert_eq!(applied_entry.outputs.len(), 1);
+        assert_eq!(applied_entry.image_kind, ManualImageKind::Cover);
+        assert!(!applied_entry.rotate90);
+
+        let cover_output = workspace.join("page_003_cover.png");
+        assert!(cover_output.exists(), "cover output should exist");
+        let manual_cover = workspace.join("manual").join("page_003_manual_cover.png");
+        assert!(
+            manual_cover.exists(),
+            "manual cover output should exist in manual directory"
+        );
+
+        let overrides_path = response.manual_overrides_path.expect("overrides path");
+        let overrides_data = fs::read_to_string(&overrides_path).unwrap();
+        let overrides: ManualOverridesFile = serde_json::from_str(&overrides_data).unwrap();
+        let canonical_source = fs::canonicalize(&source_path).unwrap();
+        let override_entry = overrides
+            .entries
+            .iter()
+            .find(|entry| entry.source == canonical_source)
+            .expect("expected override entry");
+        let override_outputs = override_entry
+            .outputs
+            .as_ref()
+            .map(|items| items.len())
+            .unwrap_or(0);
+        assert_eq!(override_outputs, 1);
+        assert_eq!(override_entry.image_kind, ManualImageKind::Cover);
+        assert!(!override_entry.rotate90);
+
+        let split_report_path = response.split_report_path.expect("split report path");
+        let split_report_data = fs::read_to_string(&split_report_path).unwrap();
+        let parsed: SplitReportFull = serde_json::from_str(&split_report_data).unwrap();
+        let item = parsed
+            .items
+            .iter()
+            .find(|entry| entry.source == canonical_source)
+            .expect("expected split report item");
+        assert!(item.split_x.is_none());
+        assert_eq!(item.outputs.len(), 1);
+        assert_eq!(
+            item.metadata.manual_image_kind,
+            Some(ManualImageKind::Cover)
+        );
+        assert_eq!(item.metadata.manual_rotate90, Some(false));
+
+        let manual_report_path = response
+            .manual_split_report_path
+            .expect("expected manual report path");
+        let manual_report_data = fs::read_to_string(&manual_report_path).unwrap();
+        let manual_report: ManualSplitReportFile =
+            serde_json::from_str(&manual_report_data).unwrap();
+        assert_eq!(manual_report.version, 2);
+        let report_entry = manual_report
+            .entries
+            .iter()
+            .find(|entry| entry.source == canonical_source)
+            .expect("expected manual report entry");
+        assert_eq!(report_entry.outputs.len(), 1);
+        assert_eq!(report_entry.image_kind, ManualImageKind::Cover);
+        assert!(!report_entry.rotate90);
+    }
+
+    #[test]
+    fn apply_manual_splits_emits_rotated_single_output_for_spread_kind() {
+        let _guard = env_lock();
+
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let source_path = workspace.join("page_004.png");
+        write_mock_image(&source_path, 1600, 900);
+
+        let report = serde_json::json!({
+            "generatedAt": "2025-10-07T05:00:00Z",
+            "items": [
+                {
+                    "source": source_path,
+                    "mode": "manual",
+                    "splitX": 800,
+                    "confidence": 1.0,
+                    "contentWidthRatio": 1.0,
+                    "outputs": [],
+                    "metadata": {}
+                }
+            ]
+        });
+        fs::write(
+            workspace.join("split-report.json"),
+            serde_json::to_string_pretty(&report).unwrap(),
+        )
+        .unwrap();
+
+        let request = ManualSplitApplyRequest {
+            workspace: workspace.clone(),
+            overrides: vec![ManualSplitLine {
+                source: source_path.clone(),
+                left_trim: 0.05,
+                left_page_end: 0.05,
+                right_page_start: 0.95,
+                right_trim: 0.95,
+                gutter_ratio: None,
+                locked: false,
+                image_kind: ManualImageKind::Spread,
+                rotate90: true,
+            }],
+            accelerator: EdgeTextureAcceleratorPreference::Auto,
+            generate_preview: false,
+        };
+
+        let response = apply_manual_splits(request, None).unwrap();
+        assert_eq!(response.applied.len(), 1);
+        let applied_entry = &response.applied[0];
+        assert_eq!(applied_entry.outputs.len(), 1);
+        assert_eq!(applied_entry.image_kind, ManualImageKind::Spread);
+        assert!(applied_entry.rotate90);
+
+        let spread_output = workspace.join("page_004_spread.png");
+        assert!(spread_output.exists(), "spread output should exist");
+        let manual_spread = workspace.join("manual").join("page_004_manual_spread.png");
+        assert!(
+            manual_spread.exists(),
+            "manual spread output should exist in manual directory"
+        );
+
+        let overrides_path = response.manual_overrides_path.expect("overrides path");
+        let overrides_data = fs::read_to_string(&overrides_path).unwrap();
+        let overrides: ManualOverridesFile = serde_json::from_str(&overrides_data).unwrap();
+        let canonical_source = fs::canonicalize(&source_path).unwrap();
+        let override_entry = overrides
+            .entries
+            .iter()
+            .find(|entry| entry.source == canonical_source)
+            .expect("expected override entry");
+        assert_eq!(override_entry.image_kind, ManualImageKind::Spread);
+        assert!(override_entry.rotate90);
+        let override_outputs = override_entry
+            .outputs
+            .as_ref()
+            .map(|items| items.len())
+            .unwrap_or_default();
+        assert_eq!(override_outputs, 1);
+        let override_pixels = override_entry
+            .pixels
+            .expect("expected pixels recorded in override entry");
+
+        let spread_image = image::open(&spread_output).expect("spread output should open");
+        let (rotated_width, rotated_height) = spread_image.dimensions();
+        assert_eq!(rotated_width, 900, "width should match original height");
+        let expected_width = override_pixels[3].saturating_sub(override_pixels[0]);
+        assert_eq!(rotated_height, expected_width, "height should match cropped width");
+
+        let split_report_path = response.split_report_path.expect("split report path");
+        let split_report_data = fs::read_to_string(&split_report_path).unwrap();
+        let parsed: SplitReportFull = serde_json::from_str(&split_report_data).unwrap();
+        let item = parsed
+            .items
+            .iter()
+            .find(|entry| entry.source == canonical_source)
+            .expect("expected split report entry");
+        assert!(item.split_x.is_none());
+        assert_eq!(item.outputs.len(), 1);
+        assert_eq!(
+            item.metadata.manual_image_kind,
+            Some(ManualImageKind::Spread)
+        );
+        assert_eq!(item.metadata.manual_rotate90, Some(true));
+
+        let manual_report_path = response
+            .manual_split_report_path
+            .expect("manual report path");
+        let manual_report_data = fs::read_to_string(&manual_report_path).unwrap();
+        let manual_report: ManualSplitReportFile =
+            serde_json::from_str(&manual_report_data).unwrap();
+        assert_eq!(manual_report.version, 2);
+        let report_entry = manual_report
+            .entries
+            .iter()
+            .find(|entry| entry.source == canonical_source)
+            .expect("expected manual report entry");
+        assert_eq!(report_entry.outputs.len(), 1);
+        assert_eq!(report_entry.image_kind, ManualImageKind::Spread);
+        assert!(report_entry.rotate90);
     }
 
     #[test]
@@ -2200,6 +2633,8 @@ mod tests {
                 right_trim: 0.96,
                 gutter_ratio: None,
                 locked: false,
+                image_kind: ManualImageKind::Content,
+                rotate90: false,
             }],
             accelerator: EdgeTextureAcceleratorPreference::Auto,
             generate_preview: false,
@@ -2225,6 +2660,8 @@ mod tests {
                 right_trim: 0.98,
                 gutter_ratio: None,
                 locked: false,
+                image_kind: ManualImageKind::Content,
+                rotate90: false,
             }],
             accelerator: EdgeTextureAcceleratorPreference::Auto,
             generate_preview: false,

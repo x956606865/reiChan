@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::doublepage::{
-    EdgeTextureAcceleratorPreference, ManualOverrideEntry, ManualOverridesFile,
+    EdgeTextureAcceleratorPreference, ManualImageKind, ManualOverrideEntry, ManualOverridesFile,
     SplitDetectionSummary,
 };
 use chrono::{SecondsFormat, Utc};
@@ -377,6 +377,10 @@ pub struct ManifestManualEntry {
     pub accelerator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_kind: Option<String>,
+    #[serde(default)]
+    pub rotate90: bool,
 }
 
 struct FileCandidate {
@@ -491,6 +495,13 @@ fn build_manifest_manual_entry(entry: &ManualOverrideEntry) -> ManifestManualEnt
         EdgeTextureAcceleratorPreference::Gpu => "gpu".to_string(),
     });
 
+    let image_kind = Some(match entry.image_kind {
+        ManualImageKind::Content => "content",
+        ManualImageKind::Cover => "cover",
+        ManualImageKind::Spread => "spread",
+    }
+    .to_string());
+
     ManifestManualEntry {
         source: source_name,
         outputs,
@@ -498,6 +509,8 @@ fn build_manifest_manual_entry(entry: &ManualOverrideEntry) -> ManifestManualEnt
         percentages: entry.lines,
         accelerator,
         applied_at: entry.last_applied_at.clone(),
+        image_kind,
+        rotate90: entry.rotate90,
     }
 }
 
@@ -3010,6 +3023,8 @@ mod tests {
                 right_trim: 0.95,
                 gutter_ratio: None,
                 locked: false,
+                image_kind: ManualImageKind::Content,
+                rotate90: false,
             })
             .collect();
 

@@ -1,28 +1,33 @@
-import type { ChangeEvent, FC } from 'react';
+import type { ChangeEvent, FC, MouseEvent } from 'react';
 import { memo, useCallback, useMemo } from 'react';
 
 import type {
   ManualApplyState,
+  ManualImageKind,
   ManualSplitLines,
-  SplitApplyTarget,
 } from './store.js';
 
 interface SplitSettingsPanelProps {
   lines: ManualSplitLines | null;
-  accelerator: 'cpu' | 'gpu' | 'auto';
+  imageKind: ManualImageKind;
   gutterWidthRatio: number;
-  pendingApply: SplitApplyTarget;
   applyState: ManualApplyState;
   locked: boolean;
   lockedCount: number;
   actionableCount: number;
   totalCount: number;
-  applyCurrentLabel: string | null;
+  staged: boolean;
+  stagedAny: boolean;
+  hasPendingChanges: boolean;
+  previewLoading: boolean;
   onLinesChange: (lines: ManualSplitLines) => void;
-  onAcceleratorChange: (value: 'cpu' | 'gpu' | 'auto') => void;
-  onApplyCurrent: () => void;
-  onApplyAll: () => void;
+  onImageKindChange: (kind: ManualImageKind) => void;
+  onStageCurrent: () => void;
+  onClearStageCurrent: () => void;
+  onApplyAllUnlocked: () => void;
+  onClearAllStages: () => void;
   onToggleLock: () => void;
+  onGeneratePreview: () => void;
 }
 
 const LABELS = [
@@ -35,20 +40,25 @@ const LABELS = [
 const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
   ({
     lines,
-    accelerator,
+    imageKind,
     gutterWidthRatio,
-    pendingApply,
     applyState,
     locked,
     lockedCount,
     actionableCount,
     totalCount,
-    applyCurrentLabel,
     onLinesChange,
-    onAcceleratorChange,
-    onApplyCurrent,
-    onApplyAll,
+    onImageKindChange,
+    onStageCurrent,
+    onClearStageCurrent,
+    onApplyAllUnlocked,
+    onClearAllStages,
     onToggleLock,
+    staged,
+    stagedAny,
+    hasPendingChanges,
+    previewLoading,
+    onGeneratePreview,
   }) => {
     const values = useMemo(() => {
       if (!lines) {
@@ -109,17 +119,38 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
         if (Number.isNaN(numeric)) {
           return;
         }
-        next[index] = Math.max(0, Math.min(100, numeric)) / 100;
+        const clamped = Math.max(0, Math.min(100, numeric)) / 100;
+        if (imageKind === 'content') {
+          next[index] = clamped;
+        } else if (index === 0) {
+          next[0] = clamped;
+          next[1] = clamped;
+        } else {
+          next[3] = clamped;
+          next[2] = clamped;
+        }
         onLinesChange(next);
       },
-      [lines, onLinesChange]
+      [imageKind, lines, onLinesChange]
     );
 
-    const handleAcceleratorChange = useCallback(
+    const handleImageKindChange = useCallback(
       (event: ChangeEvent<HTMLSelectElement>) => {
-        onAcceleratorChange(event.currentTarget.value as 'cpu' | 'gpu' | 'auto');
+        onImageKindChange(event.currentTarget.value as ManualImageKind);
       },
-      [onAcceleratorChange]
+      [onImageKindChange]
+    );
+
+    const handleStageCurrentClick = useCallback(
+      (event: MouseEvent<HTMLButtonElement>) => {
+        event.preventDefault();
+        if (staged) {
+          onClearStageCurrent();
+        } else {
+          onStageCurrent();
+        }
+      },
+      [onClearStageCurrent, onStageCurrent, staged]
     );
 
     return (
@@ -132,8 +163,33 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
           </span>
         </header>
 
+        <div className="split-settings-row">
+          <label className="split-settings-field">
+            <span className="field-label">图片类型 / Image Kind</span>
+            <select
+              value={imageKind}
+              onChange={handleImageKindChange}
+              disabled={isApplying}
+            >
+              <option value="content">内容页 / Content</option>
+              <option value="cover">封面 / Cover</option>
+              <option value="spread">跨页 / Spread</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            onClick={onGeneratePreview}
+            disabled={!lines || isApplying || previewLoading}
+          >
+            {previewLoading ? '生成预览中… / Rendering…' : '生成预览 / Generate preview'}
+          </button>
+        </div>
+
         <div className="split-settings-grid">
-          {values.map((value: number, index: number) => (
+          {(imageKind === 'content'
+            ? [0, 1, 2, 3]
+            : [0, 3]
+          ).map((index) => (
             <label key={LABELS[index]} className="split-settings-field">
               <span className="field-label">{LABELS[index]}</span>
               <input
@@ -141,28 +197,13 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
                 min={0}
                 max={100}
                 step={0.1}
-                value={value}
+                value={values[index]}
                 onChange={handleChange(index)}
-                disabled={!lines}
+                disabled={!lines || isApplying}
               />
               <span className="field-suffix">%</span>
             </label>
           ))}
-        </div>
-
-        <div className="split-settings-row">
-          <label className="split-settings-field">
-            <span className="field-label">计算加速器 / Accelerator</span>
-            <select
-              value={accelerator}
-              onChange={handleAcceleratorChange}
-              disabled={!lines}
-            >
-              <option value="auto">自动 / Auto</option>
-              <option value="cpu">CPU</option>
-              <option value="gpu">GPU</option>
-            </select>
-          </label>
         </div>
 
         {totalCount > 0 && (
@@ -189,24 +230,25 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
           </button>
           <button
             type="button"
-            className="primary"
-            onClick={onApplyCurrent}
-            disabled={!lines || isApplying || pendingApply === 'single'}
-          >
-            应用到当前 / Apply current
-          </button>
-          <button
-            type="button"
-            onClick={onApplyAll}
-            disabled={
-              !lines ||
-              isApplying ||
-              actionableCount === 0 ||
-              pendingApply === 'all'
-            }
-          >
-            应用全部未锁定 / Apply all unlocked
-          </button>
+          onClick={handleStageCurrentClick}
+          disabled={!lines || isApplying}
+        >
+          {staged ? '取消应用当前 / Unapply current' : '应用当前草稿 / Apply current'}
+        </button>
+        <button
+          type="button"
+          onClick={onApplyAllUnlocked}
+          disabled={!lines || isApplying || actionableCount === 0}
+        >
+          应用到全部未锁定 / Apply to all unlocked
+        </button>
+        <button
+          type="button"
+          onClick={onClearAllStages}
+          disabled={isApplying || !stagedAny}
+        >
+          取消全部应用 / Clear staged
+        </button>
         </div>
 
         {hasFeedback && (
@@ -237,11 +279,6 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
                   <span>
                     {applyState.completed}/{progressTotal}
                   </span>
-                  {applyState.running && applyCurrentLabel && (
-                    <span className="split-settings-progress-current">
-                      正在处理：{applyCurrentLabel}
-                    </span>
-                  )}
                 </div>
               </div>
             )}

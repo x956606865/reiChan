@@ -23,6 +23,7 @@ import {
   useCustomSplitStore,
   type ManualSplitDraft,
   type ManualSplitDraftPayload,
+  type ManualImageKind,
   type ManualSplitLines,
   type SplitPreviewPayload,
   type ManualSplitReportSummary,
@@ -78,6 +79,8 @@ interface ManualSplitApplyEntry {
   width: number;
   height: number;
   durationMs?: number | null;
+  imageKind: ManualImageKind;
+  rotate90: boolean;
 }
 
 interface ManualSplitApplyResponse {
@@ -89,13 +92,6 @@ interface ManualSplitApplyResponse {
   manualSplitReportPath?: string | null;
   manualSplitReportSummary?: ManualSplitReportSummary | null;
   canRevert?: boolean;
-}
-
-interface ManualSplitRevertResponse {
-  workspace: string;
-  restoredOutputs: number;
-  manualSplitReportPath?: string | null;
-  manualSplitReportSummary?: ManualSplitReportSummary | null;
 }
 
 interface ManualSplitTemplateExportResponse {
@@ -110,6 +106,8 @@ interface ManualSplitTemplateEntryPayload {
   displayName?: string | null;
   width?: number | null;
   height?: number | null;
+  imageKind?: ManualImageKind | null;
+  rotate90?: boolean | null;
 }
 
 interface ManualSplitTemplateFile {
@@ -119,6 +117,13 @@ interface ManualSplitTemplateFile {
   gutterRatio?: number | null;
   entryCount?: number;
   entries?: ManualSplitTemplateEntryPayload[];
+}
+
+interface ManualSplitRevertResponse {
+  workspace: string;
+  restoredOutputs: number;
+  manualSplitReportPath?: string | null;
+  manualSplitReportSummary?: ManualSplitReportSummary | null;
 }
 
 interface AcceleratorSummary {
@@ -135,7 +140,6 @@ interface PreviewJob {
   signature: string;
 }
 
-const PREVIEW_DEBOUNCE_MS = 500;
 const PREVIEW_MAX_CONCURRENCY = 6;
 
 const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
@@ -144,7 +148,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       drafts,
       order,
       selection,
-      pendingApply,
       accelerator,
       gutterWidthRatio,
       loading,
@@ -160,7 +163,11 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       hydrateDrafts,
       setAccelerator,
       setPreview,
-      setPendingApply,
+      stageDraft,
+      applyCurrentToAllUnlocked,
+      clearStage,
+      clearAllStages,
+      setImageKind,
       toggleLock,
       setLockState,
       setLoading,
@@ -398,6 +405,9 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                   appliedEntries.map((entry) => ({
                     sourcePath: entry.sourcePath,
                     appliedAt: entry.appliedAt,
+                    lines: entry.lines,
+                    imageKind: entry.imageKind,
+                    rotate90: entry.rotate90,
                   }))
                 );
               }
@@ -534,7 +544,11 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
 
     const totalDrafts = order.length;
 
-    const pendingChangesCount = useMemo(() => {
+    const activeImageKind = activeDraft?.imageKind ?? 'content';
+    const activeStaged = activeDraft?.staged ?? false;
+    const activeHasPending = activeDraft?.hasPendingChanges ?? false;
+
+    const dirtyCount = useMemo(() => {
       let count = 0;
       for (const sourcePath of order) {
         if (drafts[sourcePath]?.hasPendingChanges) {
@@ -543,6 +557,18 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       }
       return count;
     }, [drafts, order]);
+
+    const stagedCount = useMemo(() => {
+      let count = 0;
+      for (const sourcePath of order) {
+        if (drafts[sourcePath]?.staged) {
+          count += 1;
+        }
+      }
+      return count;
+    }, [drafts, order]);
+
+    const stagedAny = stagedCount > 0;
 
     const lockedCount = useMemo(() => {
       let count = 0;
@@ -557,23 +583,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
     const actionableCount = useMemo(() => {
       return Math.max(totalDrafts - lockedCount, 0);
     }, [totalDrafts, lockedCount]);
-
-    const applyCurrentLabel = useMemo(() => {
-      const sourcePath = applyState.currentSource;
-      if (!sourcePath) {
-        return null;
-      }
-      const draft = drafts[sourcePath];
-      if (draft?.displayName) {
-        return draft.displayName;
-      }
-      const fragments = sourcePath.split(/[\\/]/);
-      const name = fragments[fragments.length - 1];
-      if (!name || name.trim().length === 0) {
-        return sourcePath;
-      }
-      return name;
-    }, [applyState.currentSource, drafts]);
 
     const processPreviewQueue = useCallback(() => {
       while (
@@ -687,18 +696,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       [workspace, processPreviewQueue]
     );
 
-    useEffect(() => {
-      if (!open || !workspace || !activeDraft) {
-        return;
-      }
-      const debounce = window.setTimeout(() => {
-        requestPreview(activeDraft);
-      }, PREVIEW_DEBOUNCE_MS);
-      return () => {
-        window.clearTimeout(debounce);
-      };
-    }, [open, workspace, activeDraft, requestPreview, activeDraft?.lines]);
-
     const handleSelect = useCallback(
       (sourcePath: string, multi: boolean) => {
         if (multi) {
@@ -727,14 +724,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       [setAccelerator]
     );
 
-    const handleApplyCurrent = useCallback(() => {
-      setPendingApply('single');
-    }, [setPendingApply]);
-
-    const handleApplyAll = useCallback(() => {
-      setPendingApply('all');
-    }, [setPendingApply]);
-
     const handleToggleLock = useCallback(() => {
       if (!activeDraft) {
         return;
@@ -742,110 +731,108 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       toggleLock(activeDraft.sourcePath);
     }, [activeDraft, toggleLock]);
 
-    useEffect(() => {
-      if (!pendingApply) {
+    const handleStageCurrent = useCallback(() => {
+      if (!activeDraft) {
         return;
       }
+      stageDraft(activeDraft.sourcePath);
+    }, [activeDraft, stageDraft]);
 
-      if (applyState.running) {
-        setPendingApply(null);
+    const handleClearCurrentStage = useCallback(() => {
+      if (!activeDraft) {
         return;
       }
+      clearStage(activeDraft.sourcePath);
+    }, [activeDraft, clearStage]);
 
-      if (!workspace) {
-        setError('请先初始化手动拆分工作区。 / Please initialize the manual workspace first.');
-        setPendingApply(null);
+    const handleApplyAllUnlocked = useCallback(() => {
+      if (!activeDraft) {
         return;
       }
+      applyCurrentToAllUnlocked(activeDraft.sourcePath);
+    }, [activeDraft, applyCurrentToAllUnlocked]);
 
-      const target = pendingApply;
-      setPendingApply(null);
+    const handleClearAllStages = useCallback(() => {
+      clearAllStages();
+    }, [clearAllStages]);
 
-      const buildOverrides = () => {
-        const overrides: Array<{
-          source: string;
-          leftTrim: number;
-          leftPageEnd: number;
-          rightPageStart: number;
-          rightTrim: number;
-          gutterRatio?: number;
-          locked: boolean;
-        }> = [];
-
-        const enqueueDraft = (draft: ManualSplitDraft | undefined) => {
-          if (!draft) {
-            return;
-          }
-          overrides.push({
-            source: draft.sourcePath,
-            leftTrim: draft.lines[0],
-            leftPageEnd: draft.lines[1],
-            rightPageStart: draft.lines[2],
-            rightTrim: draft.lines[3],
-            gutterRatio: Math.max(draft.lines[2] - draft.lines[1], 0),
-            locked: draft.locked,
-          });
-        };
-
-        if (target === 'single') {
-          const active = selection[0];
-          enqueueDraft(active ? drafts[active] : undefined);
-        } else if (target === 'all') {
-          for (const sourcePath of order) {
-            const draft = drafts[sourcePath];
-            if (!draft || draft.locked) {
-              continue;
-            }
-            enqueueDraft(draft);
-          }
-        }
-
-        return overrides;
-      };
-
-      const overridesPayload = buildOverrides();
-      if (!overridesPayload || overridesPayload.length === 0) {
-        resolveApplySucceeded('没有可应用的图片条目。 / No pages to apply.', 0, 0);
-        return;
-      }
-
-      if (target === 'all') {
-        const confirmed = window.confirm(
-          `将对 ${overridesPayload.length} 张图片应用当前拆分，继续吗？ / Apply current split to ${overridesPayload.length} page(s)?`
-        );
-        if (!confirmed) {
-          resolveApplySucceeded(
-            '已取消批量应用。 / Batch apply cancelled.',
-            0,
-            overridesPayload.length
-          );
+    const handleImageKindChange = useCallback(
+      (kind: ManualImageKind) => {
+        if (!activeDraft) {
           return;
         }
+        setImageKind(activeDraft.sourcePath, kind);
+      },
+      [activeDraft, setImageKind]
+    );
+
+    const handleGeneratePreview = useCallback(() => {
+      if (!workspace || !activeDraft) {
+        return;
+      }
+      requestPreview(activeDraft);
+    }, [activeDraft, requestPreview, workspace]);
+
+    const handleComplete = useCallback(() => {
+      if (!workspace) {
+        setError('请先初始化手动拆分工作区。 / Please initialize the manual workspace first.');
+        return;
+      }
+      if (applyState.running) {
+        return;
       }
 
+      const stagedDrafts = order
+        .map((sourcePath) => drafts[sourcePath])
+        .filter((draft): draft is ManualSplitDraft => Boolean(draft && draft.staged));
+
+      if (stagedDrafts.length === 0) {
+        resolveApplySucceeded('没有需要完成的草稿。 / No staged drafts to complete.', 0, 0);
+        return;
+      }
+
+      const confirmed = window.confirm(
+        `将完成 ${stagedDrafts.length} 张手动裁剪草稿，继续吗？ / Complete manual splits for ${stagedDrafts.length} page(s)?`
+      );
+      if (!confirmed) {
+        resolveApplySucceeded('已取消完成操作。 / Completion cancelled.', 0, stagedDrafts.length);
+        return;
+      }
+
+      const overridesPayload = stagedDrafts.map((draft) => ({
+        source: draft.sourcePath,
+        leftTrim: draft.stagedLines[0],
+        leftPageEnd: draft.stagedLines[1],
+        rightPageStart: draft.stagedLines[2],
+        rightTrim: draft.stagedLines[3],
+        gutterRatio: Math.max(draft.stagedLines[2] - draft.stagedLines[1], 0),
+        locked: draft.locked,
+        imageKind: draft.stagedImageKind,
+        rotate90: draft.stagedRotate90,
+      }));
+
       clearApplyFeedback();
-      beginApply(overridesPayload.length);
       setError(null);
 
       void (async () => {
         try {
-          const response = await invoke<ManualSplitApplyResponse>(
-            'apply_manual_splits',
-            {
-              request: {
-                workspace,
-                overrides: overridesPayload,
-                accelerator,
-                generatePreview: false,
-              },
-            }
-          );
+          const response = await invoke<ManualSplitApplyResponse>('apply_manual_splits', {
+            request: {
+              workspace,
+              overrides: overridesPayload,
+              accelerator,
+              generatePreview: false,
+            },
+          });
 
           if (response.applied.length > 0) {
             markApplied(
               response.applied.map((entry) => ({
                 sourcePath: entry.sourcePath,
                 appliedAt: entry.appliedAt,
+                lines: entry.lines,
+                imageKind: entry.imageKind,
+                rotate90: entry.rotate90,
               }))
             );
           }
@@ -859,9 +846,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
           const skipped = response.skipped ?? [];
           const appliedCount = response.applied.length;
           const total = appliedCount + skipped.length;
-          const gpuHits = response.applied.filter(
-            (entry) => entry.accelerator === 'gpu'
-          ).length;
+          const gpuHits = response.applied.filter((entry) => entry.accelerator === 'gpu').length;
           const cpuHits = Math.max(appliedCount - gpuHits, 0);
           const status = composeApplyStatus(
             appliedCount,
@@ -877,31 +862,25 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
           resolveApplySucceeded(status, appliedCount, total);
         } catch (invokeError) {
           const message =
-            invokeError instanceof Error
-              ? invokeError.message
-              : String(invokeError);
+            invokeError instanceof Error ? invokeError.message : String(invokeError);
           resolveApplyFailed(message);
           setError(message);
         }
       })();
     }, [
-      pendingApply,
-      applyState.running,
-      workspace,
-      drafts,
-      order,
-      selection,
       accelerator,
-      markApplied,
-      setError,
-      setPendingApply,
+      applyState.running,
       clearApplyFeedback,
-      beginApply,
       composeApplyStatus,
-      resolveApplySucceeded,
+      drafts,
+      markApplied,
+      order,
       resolveApplyFailed,
+      resolveApplySucceeded,
       setCanRevert,
+      setError,
       setManualReport,
+      workspace,
     ]);
 
     const handleUndo = useCallback(() => {
@@ -926,7 +905,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
     }, [activeDraft, resetLines]);
 
     const handleResetAll = useCallback(() => {
-      if (pendingChangesCount === 0) {
+      if (dirtyCount === 0) {
         return;
       }
       const confirmed = window.confirm(
@@ -936,7 +915,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         return;
       }
       resetAllLines();
-    }, [pendingChangesCount, resetAllLines]);
+    }, [dirtyCount, resetAllLines]);
 
     const handleExportTemplate = useCallback(() => {
       if (!workspace) {
@@ -971,6 +950,8 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
             displayName: draft.displayName,
             width: draft.width,
             height: draft.height,
+            imageKind: draft.imageKind,
+            rotate90: draft.rotate90,
           }));
           const response = await invoke<ManualSplitTemplateExportResponse>(
             'export_manual_split_template',
@@ -1168,6 +1149,14 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
             }
             matchedSources.add(targetDraft.sourcePath);
 
+            if (
+              entry.imageKind === 'content' ||
+              entry.imageKind === 'cover' ||
+              entry.imageKind === 'spread'
+            ) {
+              setImageKind(targetDraft.sourcePath, entry.imageKind);
+            }
+
             if (Array.isArray(entry.lines) && entry.lines.length === 4) {
               const normalizedLines = [
                 Number(entry.lines[0]),
@@ -1225,11 +1214,15 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       setAccelerator,
       setError,
       setGutterWidthRatio,
+      setImageKind,
       setLockState,
       setSelection,
       updateLines,
       workspace,
     ]);
+
+    void handleExportTemplate;
+    void handleImportTemplate;
 
     const handleRevert = useCallback(() => {
       if (!workspace) {
@@ -1314,9 +1307,9 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
     }, [applyState.running, hasRevertHistory, reverting]);
 
     const handleClose = useCallback(() => {
-      if (pendingChangesCount > 0) {
+      if (dirtyCount > 0 || stagedCount > 0) {
         const confirmed = window.confirm(
-          '存在未应用的拆分调整，关闭后请记得稍后应用。仍要关闭吗？ / There are unsaved manual splits. Close anyway?'
+          '存在未保存或未完成的拆分草稿，关闭后请记得稍后完成。仍要关闭吗？ / Unsaved or unstaged drafts detected. Close anyway?'
         );
         if (!confirmed) {
           return;
@@ -1324,7 +1317,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       }
       onClose();
       closeDrawer();
-    }, [closeDrawer, onClose, pendingChangesCount]);
+    }, [closeDrawer, dirtyCount, onClose, stagedCount]);
 
     return (
       <aside
@@ -1352,21 +1345,22 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
           <ManualSplitToolbar
             activeDraft={activeDraft}
             draftsCount={totalDrafts}
-            pendingCount={pendingChangesCount}
+            dirtyCount={dirtyCount}
+            stagedCount={stagedCount}
             applyState={applyState}
+            accelerator={accelerator}
+            onAcceleratorChange={handleAcceleratorChange}
             onUndo={handleUndo}
             onRedo={handleRedo}
             onResetCurrent={handleResetCurrent}
             onResetAll={handleResetAll}
-            onExportTemplate={handleExportTemplate}
-            onImportTemplate={handleImportTemplate}
             onRevert={handleRevert}
             canRevert={canRevert}
             reverting={reverting}
             hasRevertHistory={hasRevertHistory}
             revertHint={revertDisabledReason}
-            exportingTemplate={exportingTemplate}
-            importingTemplate={importingTemplate}
+            onComplete={handleComplete}
+            disableComplete={applyState.running || stagedCount === 0 || !workspace}
           />
 
           <div className="custom-split-body">
@@ -1388,20 +1382,25 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
               />
               <SplitSettingsPanel
                 lines={activeDraft?.lines ?? null}
-                accelerator={accelerator}
+                imageKind={activeImageKind}
                 gutterWidthRatio={gutterWidthRatio}
-                pendingApply={pendingApply}
                 applyState={applyState}
+                locked={Boolean(activeDraft?.locked)}
                 lockedCount={lockedCount}
                 actionableCount={actionableCount}
                 totalCount={totalDrafts}
-                applyCurrentLabel={applyCurrentLabel}
-                locked={Boolean(activeDraft?.locked)}
+                staged={activeStaged}
+                stagedAny={stagedAny}
+                hasPendingChanges={activeHasPending}
+                previewLoading={previewLoading}
                 onLinesChange={handleLinesChange}
-                onAcceleratorChange={handleAcceleratorChange}
-                onApplyCurrent={handleApplyCurrent}
-                onApplyAll={handleApplyAll}
+                onImageKindChange={handleImageKindChange}
+                onStageCurrent={handleStageCurrent}
+                onClearStageCurrent={handleClearCurrentStage}
+                onApplyAllUnlocked={handleApplyAllUnlocked}
+                onClearAllStages={handleClearAllStages}
                 onToggleLock={handleToggleLock}
+                onGeneratePreview={handleGeneratePreview}
               />
             </div>
 

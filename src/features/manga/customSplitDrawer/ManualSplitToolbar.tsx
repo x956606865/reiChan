@@ -1,58 +1,56 @@
-import type { FC } from 'react';
-import { memo, useMemo } from 'react';
+import type { ChangeEvent, FC } from 'react';
+import { memo, useMemo, useCallback } from 'react';
 
 import type { ManualApplyState, ManualSplitDraft } from './store.js';
 
 interface ManualSplitToolbarProps {
   activeDraft: ManualSplitDraft | null;
   draftsCount: number;
-  pendingCount: number;
+  dirtyCount: number;
+  stagedCount: number;
   applyState: ManualApplyState;
+  accelerator: 'cpu' | 'gpu' | 'auto';
+  onAcceleratorChange: (value: 'cpu' | 'gpu' | 'auto') => void;
   onUndo: () => void;
   onRedo: () => void;
   onResetCurrent: () => void;
   onResetAll: () => void;
-  onExportTemplate: () => void;
-  onImportTemplate: () => void;
   onRevert: () => void;
   canRevert: boolean;
   reverting: boolean;
   hasRevertHistory: boolean;
   revertHint?: string | null;
-  exportingTemplate: boolean;
-  importingTemplate: boolean;
+  onComplete: () => void;
+  disableComplete: boolean;
 }
 
 const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
   ({
     activeDraft,
     draftsCount,
-    pendingCount,
+    dirtyCount,
+    stagedCount,
     applyState,
+    accelerator,
+    onAcceleratorChange,
     onUndo,
     onRedo,
     onResetCurrent,
     onResetAll,
-    onExportTemplate,
-    onImportTemplate,
     onRevert,
     canRevert,
     reverting,
     hasRevertHistory,
     revertHint,
-    exportingTemplate,
-    importingTemplate,
+    onComplete,
+    disableComplete,
   }) => {
     const canUndo = Boolean(activeDraft && activeDraft.history.length > 0);
     const canRedo = Boolean(activeDraft && activeDraft.redoStack.length > 0);
     const canResetCurrent = Boolean(activeDraft && activeDraft.hasPendingChanges);
-    const canResetAll = pendingCount > 0;
+    const canResetAll = dirtyCount > 0;
     const canTriggerRevert =
       canRevert && hasRevertHistory && !applyState.running && !reverting;
-    const canExport =
-      draftsCount > 0 && !applyState.running && !reverting && !exportingTemplate && !importingTemplate;
-    const canImport =
-      draftsCount > 0 && !applyState.running && !reverting && !importingTemplate;
     const lastFinishedLabel = useMemo(() => {
       if (!applyState.lastFinishedAt) {
         return null;
@@ -85,16 +83,28 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
       reverting,
     ]);
 
-    const pendingLabel =
-      pendingCount > 0
-        ? `${pendingCount} 张未应用 / ${pendingCount} pending`
-        : '全部已同步 / All synced';
+    const dirtyLabel =
+      dirtyCount > 0
+        ? `${dirtyCount} 张待保存草稿 / ${dirtyCount} dirty`
+        : '草稿已同步 / Drafts clean';
+    const stagedLabel =
+      stagedCount > 0
+        ? `${stagedCount} 张待完成 / ${stagedCount} staged`
+        : '无待完成草稿 / Nothing staged';
+
+    const handleAcceleratorSelect = useCallback(
+      (event: ChangeEvent<HTMLSelectElement>) => {
+        onAcceleratorChange(event.currentTarget.value as 'cpu' | 'gpu' | 'auto');
+      },
+      [onAcceleratorChange]
+    );
 
     return (
       <div className="manual-split-toolbar">
         <div className="manual-split-toolbar-meta" aria-live="polite">
           <span>总计 {draftsCount} 张 / Total {draftsCount}</span>
-          <span>{pendingLabel}</span>
+          <span>{dirtyLabel}</span>
+          <span>{stagedLabel}</span>
           <span className={applyState.errorBubble ? 'toolbar-status error' : 'toolbar-status'}>
             {statusText}
           </span>
@@ -105,6 +115,18 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
           )}
         </div>
         <div className="manual-split-toolbar-actions">
+          <label className="accelerator-select">
+            <span>加速器 / Accelerator</span>
+            <select
+              value={accelerator}
+              onChange={handleAcceleratorSelect}
+              disabled={applyState.running || reverting}
+            >
+              <option value="auto">自动 / Auto</option>
+              <option value="cpu">CPU</option>
+              <option value="gpu">GPU</option>
+            </select>
+          </label>
           <button type="button" onClick={onUndo} disabled={!canUndo || applyState.running}>
             撤销上一步 / Undo
           </button>
@@ -119,27 +141,19 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
           </button>
           <button
             type="button"
-            onClick={onExportTemplate}
-            disabled={!canExport}
-            title={draftsCount === 0 ? '暂无草稿可导出 / No drafts to export' : undefined}
-          >
-            {exportingTemplate ? '导出中… / Exporting…' : '导出模板 / Export Template'}
-          </button>
-          <button
-            type="button"
-            onClick={onImportTemplate}
-            disabled={!canImport}
-            title={draftsCount === 0 ? '暂无草稿可导入 / No drafts to import' : undefined}
-          >
-            {importingTemplate ? '导入中… / Importing…' : '导入模板 / Import Template'}
-          </button>
-          <button
-            type="button"
             onClick={onRevert}
             disabled={!canTriggerRevert}
             title={revertHint ?? undefined}
           >
             {reverting ? '回滚中… / Reverting…' : '回滚上一次应用 / Revert last apply'}
+          </button>
+          <button
+            type="button"
+            className="primary"
+            onClick={onComplete}
+            disabled={disableComplete}
+          >
+            {applyState.running ? '正在完成… / Completing…' : '完成手动拆分 / Complete'}
           </button>
         </div>
         {revertHint && (

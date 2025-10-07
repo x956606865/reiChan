@@ -85,32 +85,50 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
         const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
         const gutter = Math.max(gutterWidthRatio, 0);
         const next = [...currentLines] as ManualSplitLines;
+        const isDoubleMode = currentDraft.imageKind !== 'content';
 
-        switch (dragState.index) {
-          case 0: {
-            const max = Math.max(0, next[1] - gutter);
-            next[0] = clamp(ratio, 0, max);
-            break;
-          }
-          case 1: {
-            const min = Math.min(1, next[0] + gutter);
-            const max = Math.max(min, next[2] - gutter);
-            next[1] = clamp(ratio, min, max);
-            break;
-          }
-          case 2: {
-            const min = Math.min(1, next[1] + gutter);
-            const max = Math.max(min, next[3] - gutter);
-            next[2] = clamp(ratio, min, max);
-            break;
-          }
-          case 3: {
-            const min = Math.min(1, next[2] + gutter);
-            next[3] = clamp(ratio, min, 1);
-            break;
-          }
-          default:
+        if (isDoubleMode) {
+          const guard = Math.max(gutter, 0.001);
+          if (dragState.index === 0 || dragState.index === 1) {
+            const max = Math.max(0, next[2] - guard);
+            const value = clamp(ratio, 0, max);
+            next[0] = value;
+            next[1] = value;
+          } else if (dragState.index === 2 || dragState.index === 3) {
+            const min = Math.min(1, next[0] + guard);
+            const value = clamp(ratio, min, 1);
+            next[2] = value;
+            next[3] = value;
+          } else {
             return;
+          }
+        } else {
+          switch (dragState.index) {
+            case 0: {
+              const max = Math.max(0, next[1] - gutter);
+              next[0] = clamp(ratio, 0, max);
+              break;
+            }
+            case 1: {
+              const min = Math.min(1, next[0] + gutter);
+              const max = Math.max(min, next[2] - gutter);
+              next[1] = clamp(ratio, min, max);
+              break;
+            }
+            case 2: {
+              const min = Math.min(1, next[1] + gutter);
+              const max = Math.max(min, next[3] - gutter);
+              next[2] = clamp(ratio, min, max);
+              break;
+            }
+            case 3: {
+              const min = Math.min(1, next[2] + gutter);
+              next[3] = clamp(ratio, min, 1);
+              break;
+            }
+            default:
+              return;
+          }
         }
 
         let changed = false;

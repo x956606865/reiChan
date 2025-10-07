@@ -2,6 +2,10 @@ import { create } from 'zustand';
 
 export type ManualSplitLines = [number, number, number, number];
 
+export type ManualImageKind = 'content' | 'cover' | 'spread';
+
+type ManualLineMode = 'quad' | 'double';
+
 export interface ManualSplitDraft {
   sourcePath: string;
   displayName: string;
@@ -9,6 +13,14 @@ export interface ManualSplitDraft {
   height: number;
   lines: ManualSplitLines;
   baselineLines: ManualSplitLines;
+  baselineImageKind: ManualImageKind;
+  baselineRotate90: boolean;
+  stagedLines: ManualSplitLines;
+  stagedImageKind: ManualImageKind;
+  stagedRotate90: boolean;
+  staged: boolean;
+  imageKind: ManualImageKind;
+  rotate90: boolean;
   locked: boolean;
   thumbnailPath?: string | null;
   lastAppliedAt?: string;
@@ -43,9 +55,17 @@ export interface ManualSplitDraftPayload {
   locked?: boolean;
   lastAppliedAt?: string | null;
   thumbnailPath?: string | null;
+  imageKind?: ManualImageKind | null;
+  rotate90?: boolean | null;
 }
 
-export type SplitApplyTarget = 'single' | 'all' | null;
+export interface ManualApplyResultEntry {
+  sourcePath: string;
+  appliedAt: string;
+  lines: ManualSplitLines;
+  imageKind: ManualImageKind;
+  rotate90: boolean;
+}
 
 export interface ManualApplyState {
   running: boolean;
@@ -61,7 +81,6 @@ export interface CustomSplitState {
   drafts: Record<string, ManualSplitDraft>;
   order: string[];
   selection: string[];
-  pendingApply: SplitApplyTarget;
   accelerator: 'cpu' | 'gpu' | 'auto';
   gutterWidthRatio: number;
   loading: boolean;
@@ -82,14 +101,18 @@ export interface CustomSplitState {
   hydrateDrafts: (workspace: string, payloads: ManualSplitDraftPayload[]) => void;
   reset: () => void;
   updateLines: (sourcePath: string, lines: ManualSplitLines) => void;
+  setImageKind: (sourcePath: string, kind: ManualImageKind) => void;
   setSelection: (sources: string[]) => void;
   toggleSelection: (sourcePath: string) => void;
   setAccelerator: (accelerator: 'cpu' | 'gpu' | 'auto') => void;
   setPreview: (sourcePath: string, preview: SplitPreviewPayload | null) => void;
-  setPendingApply: (target: SplitApplyTarget) => void;
+  stageDraft: (sourcePath: string) => void;
+  applyCurrentToAllUnlocked: (sourcePath: string) => void;
+  clearStage: (sourcePath: string) => void;
+  clearAllStages: () => void;
   toggleLock: (sourcePath: string) => void;
   setLockState: (sourcePath: string, locked: boolean) => void;
-  markApplied: (entries: Array<{ sourcePath: string; appliedAt: string }>) => void;
+  markApplied: (entries: ManualApplyResultEntry[]) => void;
   undoLines: (sourcePath: string) => void;
   redoLines: (sourcePath: string) => void;
   resetLines: (sourcePath: string) => void;
@@ -118,6 +141,29 @@ export interface CustomSplitState {
 
 const DEFAULT_LINES: ManualSplitLines = [0.02, 0.48, 0.52, 0.98];
 const HISTORY_LIMIT = 20;
+const LINE_PRECISION = 1e-6;
+
+const DEFAULT_IMAGE_KIND: ManualImageKind = 'content';
+
+const asMode = (kind: ManualImageKind): ManualLineMode =>
+  kind === 'content' ? 'quad' : 'double';
+
+const normalizeForKind = (
+  input: ManualSplitLines,
+  gutterWidthRatio: number,
+  kind: ManualImageKind
+): ManualSplitLines => computeNormalizedLines(input, gutterWidthRatio, asMode(kind));
+
+const areLinesEqual = (first: ManualSplitLines, second: ManualSplitLines): boolean => {
+  return (
+    Math.abs(first[0] - second[0]) < LINE_PRECISION &&
+    Math.abs(first[1] - second[1]) < LINE_PRECISION &&
+    Math.abs(first[2] - second[2]) < LINE_PRECISION &&
+    Math.abs(first[3] - second[3]) < LINE_PRECISION
+  );
+};
+
+const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 
 const INITIAL_APPLY_STATE: ManualApplyState = {
   running: false,
@@ -131,15 +177,38 @@ const INITIAL_APPLY_STATE: ManualApplyState = {
 
 export const computeNormalizedLines = (
   input: ManualSplitLines,
-  gutterWidthRatio: number
+  gutterWidthRatio: number,
+  mode: ManualLineMode = 'quad'
 ): ManualSplitLines => {
-  const [rawLeftTrim, rawLeftPageEnd, rawRightPageStart, rawRightTrim] = input;
-  const clamp = (value: number) => Math.min(1, Math.max(0, value));
+  if (mode === 'double') {
+    const guardWidth = Math.max(gutterWidthRatio, 0.001);
+    let leftTrim = clamp01(Number.isFinite(input[0]) ? input[0] : 0);
+    let rightTrim = clamp01(Number.isFinite(input[3]) ? input[3] : 1);
 
-  let leftTrim = clamp(rawLeftTrim);
-  let leftPageEnd = clamp(rawLeftPageEnd);
-  let rightPageStart = clamp(rawRightPageStart);
-  let rightTrim = clamp(rawRightTrim);
+    if (rightTrim - leftTrim < guardWidth) {
+      rightTrim = Math.min(1, leftTrim + guardWidth);
+      if (rightTrim >= 1 && leftTrim > 0) {
+        leftTrim = Math.max(0, 1 - guardWidth);
+      }
+    }
+
+    const normalize = (value: number) => Number(clamp01(value).toFixed(6));
+    const normalizedLeft = normalize(leftTrim);
+    const normalizedRight = normalize(rightTrim);
+    return [
+      normalizedLeft,
+      normalizedLeft,
+      normalizedRight,
+      normalizedRight,
+    ];
+  }
+
+  const [rawLeftTrim, rawLeftPageEnd, rawRightPageStart, rawRightTrim] = input;
+
+  let leftTrim = clamp01(rawLeftTrim);
+  let leftPageEnd = clamp01(rawLeftPageEnd);
+  let rightPageStart = clamp01(rawRightPageStart);
+  let rightTrim = clamp01(rawRightTrim);
 
   if (!Number.isFinite(leftTrim)) leftTrim = 0;
   if (!Number.isFinite(leftPageEnd)) leftPageEnd = leftTrim + gutterWidthRatio;
@@ -181,7 +250,7 @@ export const computeNormalizedLines = (
     }
   }
 
-  const normalize = (value: number) => Number(Math.min(1, Math.max(0, value)).toFixed(6));
+  const normalize = (value: number) => Number(clamp01(value).toFixed(6));
 
   return [
     normalize(leftTrim),
@@ -197,14 +266,18 @@ const createDraftFromPayload = (
 ): ManualSplitDraft => {
   const { sourcePath, width, height } = payload;
   const displayName = payload.displayName ?? buildDisplayName(sourcePath);
+  const baseKind = payload.imageKind ?? DEFAULT_IMAGE_KIND;
+  const rotate90 = payload.rotate90 ?? (baseKind === 'spread');
+
   const recommendedBase = payload.recommendedLines
-    ? computeNormalizedLines(payload.recommendedLines, gutterWidthRatio)
-    : computeNormalizedLines(DEFAULT_LINES, gutterWidthRatio);
+    ? normalizeForKind(payload.recommendedLines, gutterWidthRatio, baseKind)
+    : normalizeForKind(DEFAULT_LINES, gutterWidthRatio, baseKind);
   const existingBase = payload.existingLines
-    ? computeNormalizedLines(payload.existingLines, gutterWidthRatio)
+    ? normalizeForKind(payload.existingLines, gutterWidthRatio, baseKind)
     : null;
-  const initial = [...(existingBase ?? recommendedBase)] as ManualSplitLines;
+
   const baseline = [...(existingBase ?? recommendedBase)] as ManualSplitLines;
+  const initial = [...baseline] as ManualSplitLines;
 
   const normalizedRecommended = payload.recommendedLines
     ? ([...recommendedBase] as ManualSplitLines)
@@ -217,6 +290,14 @@ const createDraftFromPayload = (
     height,
     lines: initial,
     baselineLines: baseline,
+     baselineImageKind: baseKind,
+     baselineRotate90: rotate90,
+     stagedLines: [...baseline] as ManualSplitLines,
+     stagedImageKind: baseKind,
+     stagedRotate90: rotate90,
+     staged: false,
+     imageKind: baseKind,
+     rotate90,
     locked: Boolean(payload.locked),
     lastAppliedAt: payload.lastAppliedAt ?? undefined,
     thumbnailPath: payload.thumbnailPath ?? null,
@@ -239,7 +320,6 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
   drafts: {},
   order: [],
   selection: [],
-  pendingApply: null,
   accelerator: 'auto',
   gutterWidthRatio: 0.01,
   loading: false,
@@ -262,7 +342,6 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
       drafts: {},
       order: [],
       selection: [],
-      pendingApply: null,
       previewMap: {},
       error: null,
       loading: false,
@@ -291,7 +370,6 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
       selection: order.length > 0 ? [order[0]] : [],
       workspace,
       initialized: true,
-      pendingApply: null,
       error: null,
     });
   },
@@ -301,31 +379,21 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
     if (!draft) {
       return;
     }
-    const normalized = computeNormalizedLines(lines, state.gutterWidthRatio);
-    const current = draft.lines;
-    const areSame =
-      normalized[0] === current[0] &&
-      normalized[1] === current[1] &&
-      normalized[2] === current[2] &&
-      normalized[3] === current[3];
-    if (areSame) {
+    const normalized = normalizeForKind(lines, state.gutterWidthRatio, draft.imageKind);
+    if (areLinesEqual(normalized, draft.lines)) {
       return;
     }
 
-    const pushHistory = () => {
-      const snapshot = [...current] as ManualSplitLines;
-      if (draft.history.length >= HISTORY_LIMIT) {
-        return [...draft.history.slice(-HISTORY_LIMIT + 1), snapshot];
-      }
-      return [...draft.history, snapshot];
-    };
-
-    const nextHistory = pushHistory();
-    const hasPendingChanges =
-      normalized[0] !== draft.baselineLines[0] ||
-      normalized[1] !== draft.baselineLines[1] ||
-      normalized[2] !== draft.baselineLines[2] ||
-      normalized[3] !== draft.baselineLines[3];
+    const snapshot = [...draft.lines] as ManualSplitLines;
+    const nextHistory =
+      draft.history.length >= HISTORY_LIMIT
+        ? [...draft.history.slice(-HISTORY_LIMIT + 1), snapshot]
+        : [...draft.history, snapshot];
+    const stagedMatches =
+      draft.staged &&
+      draft.imageKind === draft.stagedImageKind &&
+      draft.rotate90 === draft.stagedRotate90 &&
+      areLinesEqual(normalized, draft.stagedLines);
     set({
       drafts: {
         ...state.drafts,
@@ -334,9 +402,60 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
           lines: normalized,
           history: nextHistory,
           redoStack: [],
-          hasPendingChanges,
+          hasPendingChanges: !stagedMatches,
+          staged: stagedMatches ? draft.staged : false,
         },
       },
+    });
+  },
+  setImageKind: (sourcePath, kind) => {
+    set((state) => {
+      const draft = state.drafts[sourcePath];
+      if (!draft) {
+        return {};
+      }
+      const rotate90 = kind === 'spread' ? true : draft.rotate90;
+      const normalizedLines = normalizeForKind(draft.lines, state.gutterWidthRatio, kind);
+      const normalizedBaseline = normalizeForKind(
+        draft.baselineLines,
+        state.gutterWidthRatio,
+        kind
+      );
+      const normalizedStaged = normalizeForKind(
+        draft.stagedLines,
+        state.gutterWidthRatio,
+        kind
+      );
+      const normalizedRecommended = draft.recommendedLines
+        ? normalizeForKind(draft.recommendedLines, state.gutterWidthRatio, kind)
+        : null;
+
+      const stagedMatches =
+        draft.staged &&
+        kind === draft.stagedImageKind &&
+        rotate90 === draft.stagedRotate90 &&
+        areLinesEqual(normalizedLines, normalizedStaged);
+
+      return {
+        drafts: {
+          ...state.drafts,
+          [sourcePath]: {
+            ...draft,
+            imageKind: kind,
+            rotate90,
+            lines: normalizedLines,
+            baselineLines: normalizedBaseline,
+            stagedLines: normalizedStaged,
+            stagedImageKind: stagedMatches ? kind : draft.stagedImageKind,
+            stagedRotate90: stagedMatches ? rotate90 : draft.stagedRotate90,
+            staged: stagedMatches ? draft.staged : false,
+            hasPendingChanges: !stagedMatches,
+            recommendedLines: normalizedRecommended,
+            history: [],
+            redoStack: [],
+          },
+        },
+      };
     });
   },
   setSelection: (sources) => set({ selection: [...new Set(sources)] }),
@@ -358,7 +477,154 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
     }
     set({ previewMap: nextMap });
   },
-  setPendingApply: (target) => set({ pendingApply: target }),
+  stageDraft: (sourcePath) => {
+    set((state) => {
+      const draft = state.drafts[sourcePath];
+      if (!draft || draft.locked) {
+        return {};
+      }
+      const rotate90 = draft.imageKind === 'spread' ? true : draft.rotate90;
+      const normalized = normalizeForKind(draft.lines, state.gutterWidthRatio, draft.imageKind);
+      const stagedLines = [...normalized] as ManualSplitLines;
+      return {
+        drafts: {
+          ...state.drafts,
+          [sourcePath]: {
+            ...draft,
+            lines: normalized,
+            rotate90,
+            stagedLines,
+            stagedImageKind: draft.imageKind,
+            stagedRotate90: rotate90,
+            staged: true,
+            locked: true,
+            hasPendingChanges: false,
+          },
+        },
+      };
+    });
+  },
+  applyCurrentToAllUnlocked: (sourcePath) => {
+    set((state) => {
+      const baseDraft = state.drafts[sourcePath];
+      if (!baseDraft || baseDraft.locked) {
+        return {};
+      }
+
+      const baseNormalized = normalizeForKind(
+        baseDraft.lines,
+        state.gutterWidthRatio,
+        baseDraft.imageKind
+      );
+
+      let mutated = false;
+      const nextDrafts: Record<string, ManualSplitDraft> = { ...state.drafts };
+
+      for (const draftPath of state.order) {
+        const draft = nextDrafts[draftPath];
+        if (!draft) {
+          continue;
+        }
+
+        const isBase = draftPath === sourcePath;
+        if (!isBase && (draft.locked || draft.staged)) {
+          continue;
+        }
+
+        const targetNormalized = isBase
+          ? baseNormalized
+          : normalizeForKind(baseNormalized, state.gutterWidthRatio, draft.imageKind);
+        const targetLines = [...targetNormalized] as ManualSplitLines;
+        const targetRotate90 = draft.imageKind === 'spread' ? true : draft.rotate90;
+
+        nextDrafts[draftPath] = {
+          ...draft,
+          lines: targetLines,
+          rotate90: targetRotate90,
+          stagedLines: [...targetLines] as ManualSplitLines,
+          stagedImageKind: draft.imageKind,
+          stagedRotate90: targetRotate90,
+          staged: true,
+          locked: true,
+          hasPendingChanges: false,
+        };
+        mutated = true;
+      }
+
+      if (!mutated) {
+        return {};
+      }
+
+      return { drafts: nextDrafts };
+    });
+  },
+  clearStage: (sourcePath) => {
+    set((state) => {
+      const draft = state.drafts[sourcePath];
+      if (!draft) {
+        return {};
+      }
+      const baselineForView = normalizeForKind(
+        draft.baselineLines,
+        state.gutterWidthRatio,
+        draft.imageKind
+      );
+      const stagedLines = normalizeForKind(
+        draft.baselineLines,
+        state.gutterWidthRatio,
+        draft.baselineImageKind
+      );
+      const hasPendingChanges = !areLinesEqual(draft.lines, baselineForView);
+      return {
+        drafts: {
+          ...state.drafts,
+          [sourcePath]: {
+            ...draft,
+            stagedLines,
+            stagedImageKind: draft.baselineImageKind,
+            stagedRotate90: draft.baselineRotate90,
+            staged: false,
+            hasPendingChanges,
+          },
+        },
+      };
+    });
+  },
+  clearAllStages: () => {
+    set((state) => {
+      let mutated = false;
+      const nextDrafts: Record<string, ManualSplitDraft> = { ...state.drafts };
+      for (const sourcePath of state.order) {
+        const draft = nextDrafts[sourcePath];
+        if (!draft || !draft.staged) {
+          continue;
+        }
+        const baselineForView = normalizeForKind(
+          draft.baselineLines,
+          state.gutterWidthRatio,
+          draft.imageKind
+        );
+        const stagedLines = normalizeForKind(
+          draft.baselineLines,
+          state.gutterWidthRatio,
+          draft.baselineImageKind
+        );
+        nextDrafts[sourcePath] = {
+          ...draft,
+          stagedLines,
+          stagedImageKind: draft.baselineImageKind,
+          stagedRotate90: draft.baselineRotate90,
+          staged: false,
+          hasPendingChanges: !areLinesEqual(draft.lines, baselineForView),
+        };
+        mutated = true;
+      }
+      if (!mutated) {
+        return {};
+      }
+      return { drafts: nextDrafts };
+    });
+  },
   toggleLock: (sourcePath) => {
     const draft = get().drafts[sourcePath];
     if (!draft) {
@@ -404,17 +670,17 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
       return;
     }
     const previous = draft.history[draft.history.length - 1];
-    const hasPendingChanges =
-      previous[0] !== draft.baselineLines[0] ||
-      previous[1] !== draft.baselineLines[1] ||
-      previous[2] !== draft.baselineLines[2] ||
-      previous[3] !== draft.baselineLines[3];
     const nextHistory = draft.history.slice(0, -1);
     const redoEntry = [...draft.lines] as ManualSplitLines;
     const nextRedo =
       draft.redoStack.length >= HISTORY_LIMIT
         ? [...draft.redoStack.slice(-HISTORY_LIMIT + 1), redoEntry]
         : [...draft.redoStack, redoEntry];
+    const stagedMatches =
+      draft.staged &&
+      draft.imageKind === draft.stagedImageKind &&
+      draft.rotate90 === draft.stagedRotate90 &&
+      areLinesEqual(previous, draft.stagedLines);
     set({
       drafts: {
         ...get().drafts,
@@ -423,7 +689,8 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
           lines: previous,
           history: nextHistory,
           redoStack: nextRedo,
-          hasPendingChanges,
+          hasPendingChanges: !stagedMatches,
+          staged: stagedMatches ? draft.staged : false,
         },
       },
     });
@@ -440,11 +707,11 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
       draft.history.length >= HISTORY_LIMIT
         ? [...draft.history.slice(-HISTORY_LIMIT + 1), historyEntry]
         : [...draft.history, historyEntry];
-    const hasPendingChanges =
-      nextLines[0] !== draft.baselineLines[0] ||
-      nextLines[1] !== draft.baselineLines[1] ||
-      nextLines[2] !== draft.baselineLines[2] ||
-      nextLines[3] !== draft.baselineLines[3];
+    const stagedMatches =
+      draft.staged &&
+      draft.imageKind === draft.stagedImageKind &&
+      draft.rotate90 === draft.stagedRotate90 &&
+      areLinesEqual(nextLines as ManualSplitLines, draft.stagedLines);
     set({
       drafts: {
         ...get().drafts,
@@ -453,7 +720,8 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
           lines: [...nextLines] as ManualSplitLines,
           history: nextHistory,
           redoStack: nextRedo,
-          hasPendingChanges,
+          hasPendingChanges: !stagedMatches,
+          staged: stagedMatches ? draft.staged : false,
         },
       },
     });
@@ -463,13 +731,13 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
     if (!draft) {
       return;
     }
-    const target = draft.baselineLines;
-    const normalized = [...target] as ManualSplitLines;
-    const isSame =
-      normalized[0] === draft.lines[0] &&
-      normalized[1] === draft.lines[1] &&
-      normalized[2] === draft.lines[2] &&
-      normalized[3] === draft.lines[3];
+    const state = get();
+    const normalized = normalizeForKind(
+      draft.baselineLines,
+      state.gutterWidthRatio,
+      draft.imageKind
+    );
+    const isSame = areLinesEqual(normalized, draft.lines);
     if (isSame) {
       return;
     }
@@ -478,6 +746,11 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
       draft.history.length >= HISTORY_LIMIT
         ? [...draft.history.slice(-HISTORY_LIMIT + 1), historyEntry]
         : [...draft.history, historyEntry];
+    const stagedMatches =
+      draft.staged &&
+      draft.imageKind === draft.stagedImageKind &&
+      draft.rotate90 === draft.stagedRotate90 &&
+      areLinesEqual(normalized, draft.stagedLines);
     set({
       drafts: {
         ...get().drafts,
@@ -486,7 +759,8 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
           lines: normalized,
           history: nextHistory,
           redoStack: [],
-          hasPendingChanges: false,
+          hasPendingChanges: !stagedMatches,
+          staged: stagedMatches ? draft.staged : false,
         },
       },
     });
@@ -496,12 +770,12 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
     const nextDrafts: Record<string, ManualSplitDraft> = {};
     let mutated = false;
     for (const [sourcePath, draft] of Object.entries(state.drafts)) {
-      const target = draft.baselineLines;
-      const isSame =
-        draft.lines[0] === target[0] &&
-        draft.lines[1] === target[1] &&
-        draft.lines[2] === target[2] &&
-        draft.lines[3] === target[3];
+      const normalized = normalizeForKind(
+        draft.baselineLines,
+        state.gutterWidthRatio,
+        draft.imageKind
+      );
+      const isSame = areLinesEqual(draft.lines, normalized);
       if (isSame) {
         nextDrafts[sourcePath] = draft;
         continue;
@@ -512,12 +786,18 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
         draft.history.length >= HISTORY_LIMIT
           ? [...draft.history.slice(-HISTORY_LIMIT + 1), historyEntry]
           : [...draft.history, historyEntry];
+      const stagedMatches =
+        draft.staged &&
+        draft.imageKind === draft.stagedImageKind &&
+        draft.rotate90 === draft.stagedRotate90 &&
+        areLinesEqual(normalized, draft.stagedLines);
       nextDrafts[sourcePath] = {
         ...draft,
-        lines: [...target] as ManualSplitLines,
+        lines: normalized,
         history: nextHistory,
         redoStack: [],
-        hasPendingChanges: false,
+        hasPendingChanges: !stagedMatches,
+        staged: stagedMatches ? draft.staged : false,
       };
     }
     if (mutated) {
@@ -528,29 +808,42 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
     if (!entries || entries.length === 0) {
       return;
     }
-    const appliedMap = new Map(entries.map((entry) => [entry.sourcePath, entry.appliedAt]));
-    const currentDrafts = get().drafts;
-    let mutated = false;
-    const nextDrafts: Record<string, ManualSplitDraft> = {};
-    for (const [sourcePath, draft] of Object.entries(currentDrafts)) {
-      const appliedAt = appliedMap.get(sourcePath);
-      if (appliedAt) {
-        mutated = true;
-        nextDrafts[sourcePath] = {
+    set((state) => {
+      let mutated = false;
+      const nextDrafts: Record<string, ManualSplitDraft> = { ...state.drafts };
+      for (const entry of entries) {
+        const draft = nextDrafts[entry.sourcePath];
+        if (!draft) {
+          continue;
+        }
+        const normalized = normalizeForKind(
+          entry.lines,
+          state.gutterWidthRatio,
+          entry.imageKind
+        );
+        const imageKind = entry.imageKind;
+        const rotate90 = imageKind === 'spread' ? true : entry.rotate90;
+        nextDrafts[entry.sourcePath] = {
           ...draft,
-          lastAppliedAt: appliedAt,
-          baselineLines: [...draft.lines] as ManualSplitLines,
+          lines: normalized,
+          imageKind,
+          rotate90,
+          baselineLines: [...normalized] as ManualSplitLines,
+          baselineImageKind: imageKind,
+          baselineRotate90: rotate90,
+          stagedLines: [...normalized] as ManualSplitLines,
+          stagedImageKind: imageKind,
+          stagedRotate90: rotate90,
+          staged: false,
+          hasPendingChanges: false,
+          lastAppliedAt: entry.appliedAt,
           history: [],
           redoStack: [],
-          hasPendingChanges: false,
         };
-      } else {
-        nextDrafts[sourcePath] = draft;
+        mutated = true;
       }
-    }
-    if (mutated) {
-      set({ drafts: nextDrafts });
-    }
+      return mutated ? { drafts: nextDrafts } : {};
+    });
   },
   beginApply: (total) => {
     const safeTotal = Number.isFinite(total) && total > 0 ? Math.max(1, Math.floor(total)) : 1;
@@ -640,26 +933,41 @@ export const useCustomSplitStore = create<CustomSplitState>((set, get) => ({
     set((state) => {
       const updatedDrafts: Record<string, ManualSplitDraft> = {};
       for (const [sourcePath, draft] of Object.entries(state.drafts)) {
-        const baseline = computeNormalizedLines(draft.baselineLines, clamped);
-        const lines = computeNormalizedLines(draft.lines, clamped);
+        const baseline = normalizeForKind(
+          draft.baselineLines,
+          clamped,
+          draft.baselineImageKind
+        );
+        const lines = normalizeForKind(draft.lines, clamped, draft.imageKind);
         const history = draft.history.map((entry) =>
-          computeNormalizedLines(entry, clamped)
+          normalizeForKind(entry, clamped, draft.imageKind)
         );
         const redoStack = draft.redoStack.map((entry) =>
-          computeNormalizedLines(entry, clamped)
+          normalizeForKind(entry, clamped, draft.imageKind)
         );
-        const hasPendingChanges =
-          lines[0] !== baseline[0] ||
-          lines[1] !== baseline[1] ||
-          lines[2] !== baseline[2] ||
-          lines[3] !== baseline[3];
+        const stagedLines = normalizeForKind(
+          draft.stagedLines,
+          clamped,
+          draft.stagedImageKind
+        );
+        const recommendedLines = draft.recommendedLines
+          ? normalizeForKind(draft.recommendedLines, clamped, draft.imageKind)
+          : null;
+        const stagedMatches =
+          draft.staged &&
+          draft.imageKind === draft.stagedImageKind &&
+          draft.rotate90 === draft.stagedRotate90 &&
+          areLinesEqual(lines, stagedLines);
         updatedDrafts[sourcePath] = {
           ...draft,
           baselineLines: baseline,
           lines,
           history,
           redoStack,
-          hasPendingChanges,
+          stagedLines,
+          recommendedLines,
+          hasPendingChanges: !stagedMatches,
+          staged: stagedMatches ? draft.staged : false,
         };
       }
       return {
