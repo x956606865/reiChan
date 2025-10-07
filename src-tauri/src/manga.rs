@@ -2110,6 +2110,14 @@ fn collect_sorted_files(directory: &Path) -> Result<Vec<(PathBuf, String)>, Uplo
         }
 
         let path = entry.path();
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let file_name = entry
             .file_name()
             .to_str()

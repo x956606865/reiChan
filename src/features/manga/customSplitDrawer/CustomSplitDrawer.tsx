@@ -8,7 +8,6 @@ import {
   useState,
 } from 'react';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-import { save, open as openDialog } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -103,31 +102,6 @@ interface ManualSplitApplyResponse {
   canRevert?: boolean;
 }
 
-interface ManualSplitTemplateExportResponse {
-  outputPath: string;
-  entryCount: number;
-}
-
-interface ManualSplitTemplateEntryPayload {
-  source: string;
-  lines: ManualSplitLines;
-  locked?: boolean;
-  displayName?: string | null;
-  width?: number | null;
-  height?: number | null;
-  imageKind?: ManualImageKind | null;
-  rotate90?: boolean | null;
-}
-
-interface ManualSplitTemplateFile {
-  generatedAt?: string;
-  workspace?: string;
-  accelerator?: string | null;
-  gutterRatio?: number | null;
-  entryCount?: number;
-  entries?: ManualSplitTemplateEntryPayload[];
-}
-
 interface ManualSplitRevertResponse {
   workspace: string;
   restoredOutputs: number;
@@ -196,13 +170,10 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       hasRevertHistory,
       setCanRevert,
       setHasRevertHistory,
-      setGutterWidthRatio,
     } = useCustomSplitStore();
 
     const [previewLoading, setPreviewLoading] = useState(false);
     const [reverting, setReverting] = useState(false);
-    const [exportingTemplate, setExportingTemplate] = useState(false);
-    const [importingTemplate, setImportingTemplate] = useState(false);
     const [detailSource, setDetailSource] = useState<string | null>(null);
     const previewRequestRef = useRef(0);
     const previewQueueRef = useRef<PreviewJob[]>([]);
@@ -236,7 +207,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
 
     const loadContext = useCallback(async () => {
       if (!workspace) {
-        setError('未找到拆分工作区。 / Manual workspace not found.');
+        setError('未找到拆分工作区。');
         return;
       }
       setLoading(true);
@@ -269,7 +240,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         return;
       }
       if (!workspace) {
-        setError('请先初始化手动拆分工作区。 / Please initialize the manual workspace first.');
+        setError('请先初始化手动拆分工作区。');
         return;
       }
       if (!initialized || storeWorkspace !== workspace) {
@@ -303,11 +274,11 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       ): string | null => {
         let message: string | null;
         if (appliedCount === 0 && skippedCount === 0) {
-          message = '未应用任何图片。 / No pages were applied.';
+          message = '未应用任何图片。';
         } else if (skippedCount > 0) {
-          message = `已应用 ${appliedCount} 张图片，跳过 ${skippedCount} 张。 / Applied ${appliedCount} page(s), skipped ${skippedCount}.`;
+          message = `已应用 ${appliedCount} 张图片，跳过 ${skippedCount} 张。`;
         } else {
-          message = `已应用 ${appliedCount} 张图片。 / Applied ${appliedCount} page(s).`;
+          message = `已应用 ${appliedCount} 张图片。`;
         }
 
         if (acceleratorSummary) {
@@ -315,22 +286,22 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
           const segments: string[] = [];
           const preferenceLabel =
             preference === 'gpu'
-              ? '偏好：GPU / Preference: GPU'
+              ? '偏好：GPU'
               : preference === 'cpu'
-              ? '偏好：CPU / Preference: CPU'
-              : '偏好：自动 / Preference: Auto';
+              ? '偏好：CPU'
+              : '偏好：自动';
           segments.push(preferenceLabel);
           if (gpu > 0) {
-            segments.push(`GPU 命中 ${gpu} 张 / GPU hits ${gpu}`);
+            segments.push(`GPU 命中 ${gpu} 张`);
           }
           if (cpu > 0) {
-            segments.push(`CPU 命中 ${cpu} 张 / CPU hits ${cpu}`);
+            segments.push(`CPU 命中 ${cpu} 张`);
           }
           if (appliedCount > 0 && gpu === 0) {
             if (preference === 'gpu') {
-              segments.push('未命中 GPU，已回退至 CPU / GPU unavailable, fell back to CPU');
+              segments.push('未命中 GPU，已回退至 CPU');
             } else if (preference === 'auto') {
-              segments.push('自动模式未命中 GPU / Auto mode ran on CPU');
+              segments.push('自动模式未命中 GPU');
             }
           }
           if (segments.length > 0) {
@@ -341,8 +312,8 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
 
         if (manualReportPath && manualReportPath.trim().length > 0) {
           message = message
-            ? `${message} 报告：${manualReportPath} / Report: ${manualReportPath}`
-            : `报告：${manualReportPath} / Report: ${manualReportPath}`;
+            ? `${message} 报告：${manualReportPath}`
+            : `报告：${manualReportPath}`;
         }
         return message;
       },
@@ -884,7 +855,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
 
     const handleComplete = useCallback(() => {
       if (!workspace) {
-        setError('请先初始化手动拆分工作区。 / Please initialize the manual workspace first.');
+        setError('请先初始化手动拆分工作区。');
         return;
       }
       if (applyState.running) {
@@ -896,15 +867,15 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         .filter((draft): draft is ManualSplitDraft => Boolean(draft && draft.staged));
 
       if (stagedDrafts.length === 0) {
-        resolveApplySucceeded('没有需要完成的草稿。 / No staged drafts to complete.', 0, 0);
+        resolveApplySucceeded('没有需要完成的草稿。', 0, 0);
         return;
       }
 
       const confirmed = window.confirm(
-        `将完成 ${stagedDrafts.length} 张手动裁剪草稿，继续吗？ / Complete manual splits for ${stagedDrafts.length} page(s)?`
+        `将完成 ${stagedDrafts.length} 张手动裁剪草稿，继续吗？`
       );
       if (!confirmed) {
-        resolveApplySucceeded('已取消完成操作。 / Completion cancelled.', 0, stagedDrafts.length);
+        resolveApplySucceeded('已取消完成操作。', 0, stagedDrafts.length);
         return;
       }
 
@@ -1018,7 +989,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
         return;
       }
       const confirmed = window.confirm(
-        '将清除全部未应用的手动拆分修改，确定继续吗？ / This will discard all pending manual splits. Continue?'
+        '将清除全部未应用的手动拆分修改，确定继续吗？'
       );
       if (!confirmed) {
         return;
@@ -1026,323 +997,13 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       resetAllLines();
     }, [dirtyCount, resetAllLines]);
 
-    const handleExportTemplate = useCallback(() => {
-      if (!workspace) {
-        setError('尚未加载手动拆分工作区，无法导出模板。 / Manual workspace unavailable; cannot export template.');
-        return;
-      }
-      if (exportingTemplate) {
-        return;
-      }
-      const targets = selection.length > 0 ? selection : order;
-      const draftsToExport = targets
-        .map((sourcePath) => drafts[sourcePath])
-        .filter((draft): draft is ManualSplitDraft => Boolean(draft));
-      if (draftsToExport.length === 0) {
-        setError('暂无可导出的拆分草稿。 / No drafts available for export.');
-        return;
-      }
-      setExportingTemplate(true);
-      void (async () => {
-        try {
-          const defaultName = `manual-template-${new Date()
-            .toISOString()
-            .replace(/[:.]/g, '-')}.json`;
-          const outputPath = await save({
-            defaultPath: defaultName,
-            filters: [{ name: 'JSON', extensions: ['json'] }],
-          });
-          if (!outputPath) {
-            return;
-          }
-          const entries = draftsToExport.map((draft) => ({
-            source: draft.sourcePath,
-            lines: draft.lines,
-            locked: draft.locked,
-            displayName: draft.displayName,
-            width: draft.width,
-            height: draft.height,
-            imageKind: draft.imageKind,
-            rotate90: draft.rotate90,
-          }));
-          const response = await invoke<ManualSplitTemplateExportResponse>(
-            'export_manual_split_template',
-            {
-              request: {
-                workspace,
-                outputPath,
-                gutterRatio: gutterWidthRatio,
-                accelerator,
-                entries,
-              },
-            }
-          );
-          void trackManualSplitTelemetry(
-            'manual-split/template-exported',
-            {
-              entryCount: response.entryCount,
-              outputPath: response.outputPath,
-              selectionCount: draftsToExport.length,
-            },
-            workspace
-          );
-          window.alert(`模板已导出到：${response.outputPath}`);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-            setError(`模板导出失败：${message} / Template export failed: ${message}`);
-          void trackManualSplitTelemetry(
-            'manual-split/template-exported',
-            {
-              success: false,
-              error: message,
-            },
-            workspace
-          );
-        } finally {
-          setExportingTemplate(false);
-        }
-      })();
-    }, [
-      accelerator,
-      drafts,
-      gutterWidthRatio,
-      order,
-      selection,
-      setError,
-      workspace,
-    ]);
-
-    const handleImportTemplate = useCallback(() => {
-      if (!workspace) {
-        setError('尚未加载手动拆分工作区，无法导入模板。 / Manual workspace unavailable.');
-        return;
-      }
-      if (importingTemplate) {
-        return;
-      }
-      setImportingTemplate(true);
-      void (async () => {
-        try {
-          const selected = await openDialog({
-            multiple: false,
-            filters: [{ name: 'JSON 模板 / Template', extensions: ['json'] }],
-          });
-          const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-          if (!selectedPath) {
-            return;
-          }
-          const content = await invoke<string>('read_template_file', {
-            path: selectedPath,
-          });
-          let parsed: ManualSplitTemplateFile;
-          try {
-            parsed = JSON.parse(content) as ManualSplitTemplateFile;
-          } catch (parseError) {
-            setError('模板解析失败，请检查文件内容。 / Failed to parse template file.');
-            return;
-          }
-
-          const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-          if (entries.length === 0) {
-            setError('模板中没有可导入的条目。 / Template contains no entries.');
-            return;
-          }
-
-          if (
-            typeof parsed.gutterRatio === 'number' &&
-            Number.isFinite(parsed.gutterRatio)
-          ) {
-            setGutterWidthRatio(parsed.gutterRatio);
-          }
-
-          if (parsed.accelerator) {
-            const normalizedPref = parsed.accelerator.toLowerCase();
-            if (
-              normalizedPref === 'auto' ||
-              normalizedPref === 'cpu' ||
-              normalizedPref === 'gpu'
-            ) {
-              setAccelerator(normalizedPref);
-            }
-          }
-
-          const draftsByExact = new Map<string, ManualSplitDraft>();
-          const draftsByNormalized = new Map<string, ManualSplitDraft>();
-          const draftsByBase = new Map<string, ManualSplitDraft[]>();
-
-          for (const sourcePath of order) {
-            const draft = drafts[sourcePath];
-            if (!draft) {
-              continue;
-            }
-            draftsByExact.set(sourcePath, draft);
-            const normalized = sourcePath.replace(/\\/g, '/');
-            draftsByNormalized.set(normalized, draft);
-            draftsByNormalized.set(normalized.toLowerCase(), draft);
-            const base = normalized.split('/').pop();
-            if (base) {
-              const lower = base.toLowerCase();
-              const existing = draftsByBase.get(lower) ?? [];
-              existing.push(draft);
-              draftsByBase.set(lower, existing);
-            }
-          }
-
-          const matchedSources = new Set<string>();
-          let appliedLineUpdates = 0;
-          let lockUpdates = 0;
-          const unmatched: string[] = [];
-
-          const resolveDraft = (entry: ManualSplitTemplateEntryPayload): ManualSplitDraft | null => {
-            const trySource = (value: string | undefined | null): ManualSplitDraft | null => {
-              if (!value) {
-                return null;
-              }
-              if (draftsByExact.has(value)) {
-                return draftsByExact.get(value) ?? null;
-              }
-              const normalized = value.replace(/\\/g, '/');
-              if (draftsByExact.has(normalized)) {
-                return draftsByExact.get(normalized) ?? null;
-              }
-              const lower = normalized.toLowerCase();
-              if (draftsByNormalized.has(lower)) {
-                return draftsByNormalized.get(lower) ?? null;
-              }
-              if (draftsByNormalized.has(normalized)) {
-                return draftsByNormalized.get(normalized) ?? null;
-              }
-              return null;
-            };
-
-            let target = trySource(entry.source);
-            if (target) {
-              return target;
-            }
-
-            const candidates: string[] = [];
-            if (entry.source) {
-              const base = entry.source.split(/[/\\]/).pop();
-              if (base) {
-                candidates.push(base);
-              }
-            }
-            if (entry.displayName) {
-              candidates.push(entry.displayName);
-            }
-
-            for (const candidate of candidates) {
-              const lower = candidate.toLowerCase();
-              const pool = draftsByBase.get(lower);
-              if (!pool || pool.length === 0) {
-                continue;
-              }
-              if (pool.length === 1) {
-                return pool[0];
-              }
-              if (entry.width && entry.height) {
-                const sized = pool.find(
-                  (draft) => draft.width === entry.width && draft.height === entry.height
-                );
-                if (sized) {
-                  return sized;
-                }
-              }
-            }
-
-            return null;
-          };
-
-          for (const entry of entries) {
-            const targetDraft = resolveDraft(entry);
-            if (!targetDraft) {
-              unmatched.push(entry.source ?? entry.displayName ?? '未知条目 / Unknown entry');
-              continue;
-            }
-            if (matchedSources.has(targetDraft.sourcePath)) {
-              continue;
-            }
-            matchedSources.add(targetDraft.sourcePath);
-
-            if (
-              entry.imageKind === 'content' ||
-              entry.imageKind === 'cover' ||
-              entry.imageKind === 'spread'
-            ) {
-              setImageKind(targetDraft.sourcePath, entry.imageKind);
-            }
-
-            if (Array.isArray(entry.lines) && entry.lines.length === 4) {
-              const normalizedLines = [
-                Number(entry.lines[0]),
-                Number(entry.lines[1]),
-                Number(entry.lines[2]),
-                Number(entry.lines[3]),
-              ] as ManualSplitLines;
-              updateLines(targetDraft.sourcePath, normalizedLines);
-              appliedLineUpdates += 1;
-            }
-
-            if (typeof entry.locked === 'boolean') {
-              setLockState(targetDraft.sourcePath, entry.locked);
-              lockUpdates += 1;
-            }
-          }
-
-          if (matchedSources.size > 0) {
-            setSelection([Array.from(matchedSources)[0]]);
-          }
-
-          void trackManualSplitTelemetry(
-            'manual-split/template-imported',
-            {
-              matched: matchedSources.size,
-              unmatched: unmatched.length,
-              appliedLines: appliedLineUpdates,
-              lockUpdates,
-              filePath: selectedPath,
-            },
-            workspace
-          );
-
-          const summaryMessage = `模板导入完成：匹配 ${matchedSources.size} 张，未匹配 ${unmatched.length} 张。/ Template import complete: matched ${matchedSources.size}, unmatched ${unmatched.length}.`;
-          window.alert(summaryMessage);
-          if (unmatched.length > 0) {
-            setError(
-              `以下条目未能匹配：${unmatched.join(
-                ', '
-              )} / Unmatched entries: ${unmatched.join(', ')}`
-            );
-          } else {
-            setError(null);
-          }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          setError(`模板导入失败：${message} / Template import failed: ${message}`);
-        } finally {
-          setImportingTemplate(false);
-        }
-      })();
-    }, [
-      drafts,
-      order,
-      setAccelerator,
-      setError,
-      setGutterWidthRatio,
-      setImageKind,
-      setLockState,
-      setSelection,
-      updateLines,
-      workspace,
-    ]);
-
     const handleRevert = useCallback(() => {
       if (!workspace) {
-        setError('尚未加载手动拆分工作区，无法回滚。 / Manual workspace unavailable; cannot revert.');
+        setError('尚未加载手动拆分工作区，无法回滚。');
         return;
       }
       const confirmed = window.confirm(
-        '将回滚至最近一次应用的状态，此操作会移除当前手动裁剪输出，确定继续吗？ / Revert to the last applied state and remove current outputs?'
+        '将回滚至最近一次应用的状态，此操作会移除当前手动裁剪输出，确定继续吗？'
       );
       if (!confirmed) {
         return;
@@ -1407,13 +1068,13 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
 
     const revertDisabledReason = useMemo(() => {
       if (reverting) {
-        return '正在回滚，请稍候。 / Reverting in progress.';
+        return '正在回滚，请稍候。';
       }
       if (applyState.running) {
-        return '应用进行中，完成后再尝试回滚。 / Apply in progress; retry after completion.';
+        return '应用进行中，完成后再尝试回滚。';
       }
       if (!hasRevertHistory) {
-        return '暂无可回滚记录，请先执行一次“应用”。 / No revert history. Apply once before reverting.';
+        return '暂无可回滚记录，请先执行一次“应用”。';
       }
       return null;
     }, [applyState.running, hasRevertHistory, reverting]);
@@ -1421,7 +1082,7 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
     const handleClose = useCallback(() => {
       if (dirtyCount > 0 || stagedCount > 0) {
         const confirmed = window.confirm(
-          '存在未保存或未完成的拆分草稿，关闭后请记得稍后完成。仍要关闭吗？ / Unsaved or unstaged drafts detected. Close anyway?'
+          '存在未保存或未完成的拆分草稿，关闭后请记得稍后完成。仍要关闭吗？'
         );
         if (!confirmed) {
           return;
@@ -1439,15 +1100,15 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       >
         <header className="custom-split-drawer-header">
           <div>
-            <h3>自定义拆分 / Manual Split</h3>
+            <h3>自定义拆分</h3>
             {workspace && (
               <p className="custom-split-path" title={workspace}>
-                工作目录：{workspace} / Workspace: {workspace}
+                工作目录：{workspace}
               </p>
             )}
           </div>
           <button type="button" onClick={handleClose}>
-            关闭 / Close
+            关闭
           </button>
         </header>
 
@@ -1513,11 +1174,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 onClearAllStages={handleClearAllStages}
                 onToggleLock={handleToggleLock}
                 onGeneratePreview={handleGeneratePreview}
-                onImportTemplate={handleImportTemplate}
-                onExportTemplate={handleExportTemplate}
-                importingTemplate={importingTemplate}
-                exportingTemplate={exportingTemplate}
-                selectionCount={selection.length}
               />
             </div>
 

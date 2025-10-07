@@ -6,8 +6,6 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { convertFileSrc } from '@tauri-apps/api/core';
-
 import SplitCanvas from './SplitCanvas.js';
 import type { ManualSplitDraft, ManualSplitLines } from './store.js';
 
@@ -19,19 +17,13 @@ interface SplitDetailModalProps {
   onConfirm: (lines: ManualSplitLines) => void;
 }
 
-const LABELS = [
-  '左侧留白 / Left Trim',
-  '左页右边界 / Left Page End',
-  '右页左边界 / Right Page Start',
-  '右侧留白 / Right Trim',
-];
+const LABELS = ['左侧留白', '左页右边界', '右页左边界', '右侧留白'];
 
 const DEFAULT_VALUES: ManualSplitLines = [0.02, 0.48, 0.52, 0.98];
 
 const SplitDetailModal: FC<SplitDetailModalProps> = memo(
   ({ open, draft, gutterWidthRatio, onDismiss, onConfirm }) => {
     const [localLines, setLocalLines] = useState<ManualSplitLines>(DEFAULT_VALUES);
-    const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
 
     const locked = Boolean(draft?.locked);
     const imageKind = draft?.imageKind ?? 'content';
@@ -46,12 +38,6 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
       }
       setLocalLines([...draft.lines] as ManualSplitLines);
     }, [draft, open]);
-
-    useEffect(() => {
-      if (!open) {
-        setHover(null);
-      }
-    }, [open]);
 
     useEffect(() => {
       if (!open) {
@@ -78,16 +64,6 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
         lines: localLines,
       };
     }, [draft, localLines]);
-
-    const imageUrl = useMemo(() => {
-      if (!draft) {
-        return null;
-      }
-      if (draft.thumbnailPath) {
-        return convertFileSrc(draft.thumbnailPath);
-      }
-      return convertFileSrc(draft.sourcePath);
-    }, [draft]);
 
     const values = useMemo(() => {
       return localLines.map((value) => Number((value * 100).toFixed(2))) as [
@@ -137,17 +113,6 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
       onDismiss();
     }, [onDismiss]);
 
-    const hoverStyle = useMemo(() => {
-      if (!hover || !imageUrl) {
-        return null;
-      }
-      const backgroundPosition = `${hover.x * 100}% ${hover.y * 100}%`;
-      return {
-        backgroundImage: `url(${imageUrl})`,
-        backgroundPosition,
-      };
-    }, [hover, imageUrl]);
-
     if (!open || !draft || !canvasDraft) {
       return null;
     }
@@ -178,7 +143,7 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
               onClick={handleDismiss}
               className="split-detail-close"
             >
-              关闭 / Close
+              关闭
             </button>
           </header>
 
@@ -189,19 +154,11 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
                 gutterWidthRatio={gutterWidthRatio}
                 locked={locked}
                 onLinesChange={handleLinesChange}
-                onPointerHover={setHover}
               />
-              {hoverStyle && (
-                <div
-                  className="split-detail-magnifier"
-                  style={hoverStyle}
-                  aria-hidden="true"
-                />
-              )}
             </div>
 
             <aside className="split-detail-sidebar">
-              <h5>精确调整 / Fine Tune</h5>
+              <h5>精确调整</h5>
               <p className="split-detail-hint">
                 输入百分比或拖拽线段，确认后将回写至草稿。当前中缝最小值 {gutterPercent}%。
               </p>
@@ -224,7 +181,7 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
               </div>
               <div className="split-detail-actions">
                 <button type="button" onClick={handleDismiss}>
-                  取消 / Cancel
+                  取消
                 </button>
                 <button
                   type="button"
@@ -232,7 +189,7 @@ const SplitDetailModal: FC<SplitDetailModalProps> = memo(
                   onClick={handleConfirm}
                   disabled={locked}
                 >
-                  确认并回写 / Apply
+                  确认并回写
                 </button>
               </div>
             </aside>

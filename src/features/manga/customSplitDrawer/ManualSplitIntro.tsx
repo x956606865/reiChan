@@ -33,22 +33,16 @@ const ManualSplitIntro: FC<ManualSplitIntroProps> = memo(
   }) => {
     const hasWorkspace = Boolean(workspace);
     const primaryLabel = hasWorkspace
-      ? '重新扫描目录并打开 / Rescan & open'
-      : '创建手动拆分工作区 / Create manual workspace';
-    const secondaryLabel = hasWorkspace
-      ? '打开已有工作区 / Open existing workspace'
-      : '稍后再说 / Maybe later';
+      ? '重新扫描目录并打开'
+      : '创建手动拆分工作区';
+    const secondaryLabel = hasWorkspace ? '打开已有工作区' : '稍后再说';
 
     return (
       <div className="manual-split-intro">
         <header>
-          <h4>手动拆分工作区 / Manual Split Workspace</h4>
+          <h4>手动拆分工作区</h4>
           <p>
-            直接使用重命名后的原图进行分割，无需运行自动算法。初始化后即可在抽屉内拖拽裁剪线、应用并生成输出。{' '}
-            <span>
-              Work directly on renamed originals without running automation. Initialize once, then
-              adjust splits and export results inside the drawer.
-            </span>
+            直接基于重命名后的原图执行手动裁剪，无需先运行自动算法。初始化一次后，即可在抽屉中调整裁剪线并导出结果。
           </p>
         </header>
 
@@ -59,7 +53,7 @@ const ManualSplitIntro: FC<ManualSplitIntroProps> = memo(
             onClick={onInitialize}
             disabled={initializing || disableInitialize}
           >
-            {initializing ? '准备中… / Preparing…' : primaryLabel}
+            {initializing ? '准备中…' : primaryLabel}
           </button>
           <button
             type="button"
@@ -79,18 +73,14 @@ const ManualSplitIntro: FC<ManualSplitIntroProps> = memo(
 
         <div className="manual-split-status">
           <p className="status">
-            {loadingDrafts || initializing
-              ? '正在载入手动拆分数据… / Loading manual split data…'
-              : statusText}
+            {loadingDrafts || initializing ? '正在载入手动拆分数据…' : statusText}
           </p>
           {hasWorkspace && (
             <ul className="status status-tip">
-              <li>工作目录：{workspace} / Workspace: {workspace}</li>
+              <li>工作目录：{workspace}</li>
               <li>
                 草稿进度：{appliedDrafts}/{totalDrafts}
-                {lastAppliedAt ? `（最近 ${lastAppliedAt}）` : ''} / Progress:{' '}
-                {appliedDrafts}/{totalDrafts}
-                {lastAppliedAt ? ` (last ${lastAppliedAt})` : ''}
+                {lastAppliedAt ? `（最近 ${lastAppliedAt}）` : ''}
               </li>
             </ul>
           )}

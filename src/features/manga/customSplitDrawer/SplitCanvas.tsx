@@ -15,14 +15,13 @@ interface SplitCanvasProps {
   gutterWidthRatio: number;
   locked: boolean;
   onLinesChange: (lines: ManualSplitLines) => void;
-  onPointerHover?: (payload: { x: number; y: number } | null) => void;
 }
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
 const SplitCanvas: FC<SplitCanvasProps> = memo(
-  ({ draft, gutterWidthRatio, locked, onLinesChange, onPointerHover }) => {
+  ({ draft, gutterWidthRatio, locked, onLinesChange }) => {
     const canvasRef = useRef<HTMLDivElement | null>(null);
     const dragStateRef = useRef<{ index: number; pointerId: number } | null>(
       null
@@ -40,13 +39,6 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
       }
     }, [draft]);
 
-    useEffect(() => {
-      if (locked) {
-        dragStateRef.current = null;
-        onPointerHover?.(null);
-      }
-    }, [locked, onPointerHover]);
-
     const handlePointerDown = useCallback(
       (index: number) => (event: ReactPointerEvent<HTMLSpanElement>) => {
         if (!draft || locked) {
@@ -62,37 +54,13 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
       [draft, locked]
     );
 
-    const emitPointerHover = useCallback(
-      (event: PointerEvent | ReactPointerEvent<HTMLDivElement>) => {
-        if (!onPointerHover) {
-          return;
-        }
-        const canvas = canvasRef.current;
-        if (!canvas) {
-          onPointerHover(null);
-          return;
-        }
-        const rect = canvas.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) {
-          onPointerHover(null);
-          return;
-        }
-        const ratioX = clamp((event.clientX - rect.left) / rect.width, 0, 1);
-        const ratioY = clamp((event.clientY - rect.top) / rect.height, 0, 1);
-        onPointerHover({ x: ratioX, y: ratioY });
-      },
-      [onPointerHover]
-    );
-
     useEffect(() => {
       const handlePointerMove = (event: PointerEvent) => {
         const dragState = dragStateRef.current;
         if (!dragState || event.pointerId !== dragState.pointerId) {
-          emitPointerHover(event);
           return;
         }
         if (locked) {
-          onPointerHover?.(null);
           return;
         }
         const currentDraft = latestDraftRef.current;
@@ -108,7 +76,6 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
         if (rect.width <= 0) {
           return;
         }
-        emitPointerHover(event);
         const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
         const gutter = Math.max(gutterWidthRatio, 0);
         const next = [...currentLines] as ManualSplitLines;
@@ -178,7 +145,6 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
           return;
         }
         dragStateRef.current = null;
-        onPointerHover?.(null);
       };
 
       window.addEventListener('pointermove', handlePointerMove);
@@ -190,7 +156,7 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
         window.removeEventListener('pointerup', handlePointerUp);
         window.removeEventListener('pointercancel', handlePointerUp);
       };
-    }, [emitPointerHover, gutterWidthRatio, locked, onLinesChange, onPointerHover]);
+    }, [gutterWidthRatio, locked, onLinesChange]);
 
     const imageUrl = useMemo(() => {
       if (!draft) {
@@ -213,8 +179,6 @@ const SplitCanvas: FC<SplitCanvasProps> = memo(
         className="split-canvas"
         ref={canvasRef}
         data-locked={locked ? 'true' : 'false'}
-        onPointerMove={(event) => emitPointerHover(event)}
-        onPointerLeave={() => onPointerHover?.(null)}
       >
         {imageUrl ? (
           <img src={imageUrl} alt={draft.displayName} className="split-canvas-image" />

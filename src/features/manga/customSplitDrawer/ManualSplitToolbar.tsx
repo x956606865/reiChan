@@ -60,12 +60,12 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
 
     const statusText = useMemo(() => {
       if (reverting) {
-        return '正在回滚至上一次应用… / Reverting to last apply…';
+        return '正在回滚至上一次应用…';
       }
       if (applyState.running) {
         const total = applyState.total > 0 ? applyState.total : Math.max(applyState.completed, 1);
         const completed = Math.min(applyState.completed, total);
-        return `正在应用 ${completed}/${total} / Applying ${completed}/${total}`;
+        return `正在应用 ${completed}/${total}`;
       }
       if (applyState.errorBubble) {
         return applyState.errorBubble;
@@ -73,7 +73,7 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
       if (applyState.statusText) {
         return applyState.statusText;
       }
-      return '等待操作 / Idle';
+      return '等待操作';
     }, [
       applyState.completed,
       applyState.errorBubble,
@@ -85,12 +85,12 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
 
     const dirtyLabel =
       dirtyCount > 0
-        ? `${dirtyCount} 张待保存草稿 / ${dirtyCount} dirty`
-        : '草稿已同步 / Drafts clean';
+        ? `${dirtyCount} 张待保存草稿`
+        : '草稿已同步';
     const stagedLabel =
       stagedCount > 0
-        ? `${stagedCount} 张待完成 / ${stagedCount} staged`
-        : '无待完成草稿 / Nothing staged';
+        ? `${stagedCount} 张待完成`
+        : '无待完成草稿';
 
     const handleAcceleratorSelect = useCallback(
       (event: ChangeEvent<HTMLSelectElement>) => {
@@ -102,42 +102,44 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
     return (
       <div className="manual-split-toolbar">
         <div className="manual-split-toolbar-meta" aria-live="polite">
-          <span>总计 {draftsCount} 张 / Total {draftsCount}</span>
+          <span>总计 {draftsCount} 张</span>
           <span>{dirtyLabel}</span>
           <span>{stagedLabel}</span>
           <span className={applyState.errorBubble ? 'toolbar-status error' : 'toolbar-status'}>
             {statusText}
           </span>
           {lastFinishedLabel && !applyState.running && (
-            <span className="toolbar-status-subtle">
-              上次完成：{lastFinishedLabel} / Last finished: {lastFinishedLabel}
-            </span>
+            <span className="toolbar-status-subtle">上次完成：{lastFinishedLabel}</span>
           )}
         </div>
         <div className="manual-split-toolbar-actions">
           <label className="accelerator-select">
-            <span>加速器 / Accelerator</span>
+            <span>加速器</span>
             <select
               value={accelerator}
               onChange={handleAcceleratorSelect}
               disabled={applyState.running || reverting}
             >
-              <option value="auto">自动 / Auto</option>
+              <option value="auto">自动</option>
               <option value="cpu">CPU</option>
               <option value="gpu">GPU</option>
             </select>
           </label>
           <button type="button" onClick={onUndo} disabled={!canUndo || applyState.running}>
-            撤销上一步 / Undo
+            撤销上一步
           </button>
           <button type="button" onClick={onRedo} disabled={!canRedo || applyState.running}>
-            重做一步 / Redo
+            重做一步
           </button>
-          <button type="button" onClick={onResetCurrent} disabled={!canResetCurrent || applyState.running}>
-            重置当前 / Reset Current
+          <button
+            type="button"
+            onClick={onResetCurrent}
+            disabled={!canResetCurrent || applyState.running}
+          >
+            重置当前
           </button>
           <button type="button" onClick={onResetAll} disabled={!canResetAll || applyState.running}>
-            重置全部 / Reset All
+            重置全部
           </button>
           <button
             type="button"
@@ -145,7 +147,7 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
             disabled={!canTriggerRevert}
             title={revertHint ?? undefined}
           >
-            {reverting ? '回滚中… / Reverting…' : '回滚上一次应用 / Revert last apply'}
+            {reverting ? '回滚中…' : '回滚上一次应用'}
           </button>
           <button
             type="button"
@@ -153,7 +155,7 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
             onClick={onComplete}
             disabled={disableComplete}
           >
-            {applyState.running ? '正在完成… / Completing…' : '完成手动拆分 / Complete'}
+            {applyState.running ? '正在完成…' : '完成手动拆分'}
           </button>
         </div>
         {revertHint && (

@@ -2863,56 +2863,6 @@ table td:last-child {
   gap: 8px;
 }
 
-.split-template-panel {
-  border-radius: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  background: rgba(241, 245, 249, 0.55);
-  padding: 10px 14px 14px;
-}
-
-.split-template-panel summary {
-  font-weight: 600;
-  color: #1e293b;
-  cursor: pointer;
-  outline: none;
-}
-
-.split-template-panel[open] summary {
-  margin-bottom: 8px;
-}
-
-.split-template-hint {
-  margin: 0 0 10px;
-  font-size: 0.85rem;
-  color: #475569;
-}
-
-.split-template-actions {
-  display: flex;
-  gap: 12px;
-  justify-content: flex-end;
-}
-
-.split-template-actions button {
-  border-radius: 8px;
-  border: 1px solid rgba(148, 163, 184, 0.45);
-  background: #ffffff;
-  color: #1d4ed8;
-  padding: 0.55em 1.1em;
-  cursor: pointer;
-  transition: background 0.18s ease, border-color 0.18s ease;
-}
-
-.split-template-actions button:hover:enabled {
-  background: rgba(37, 99, 235, 0.12);
-  border-color: rgba(37, 99, 235, 0.55);
-}
-
-.split-template-actions button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
 .split-settings-error-bubble {
   padding: 10px 12px;
   border-radius: 10px;
@@ -3050,21 +3000,6 @@ table td:last-child {
   flex: 1;
   border-radius: 0;
   min-height: 520px;
-}
-
-.split-detail-magnifier {
-  position: absolute;
-  bottom: 24px;
-  right: 24px;
-  width: 150px;
-  height: 150px;
-  border-radius: 50%;
-  border: 2px solid rgba(148, 163, 184, 0.7);
-  background-size: 220%;
-  background-repeat: no-repeat;
-  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.3);
-  pointer-events: none;
-  backdrop-filter: blur(1px);
 }
 
 .split-detail-sidebar {

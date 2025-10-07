@@ -44,7 +44,7 @@ export interface ManualSplitController {
   clearError: () => void;
 }
 
-const DEFAULT_STATUS = '尚未创建手动拆分工作区。 / Manual workspace not created.';
+const DEFAULT_STATUS = '尚未创建手动拆分工作区。';
 
 export const useManualSplitController = (
   options: ManualSplitControllerOptions
@@ -124,10 +124,10 @@ export const useManualSplitController = (
 
   const disableReason = useMemo(() => {
     if (multiVolume) {
-      return '多卷目录暂不支持手动拆分，请切换单卷模式。 / Manual split is unavailable for multi-volume batches; switch to single-volume mode.';
+      return '多卷目录暂不支持手动拆分，请切换单卷模式。';
     }
     if (!sourceDirectory || sourceDirectory.trim().length === 0) {
-      return '请先完成目录选择或重命名。 / Select or rename the directory first.';
+      return '请先完成目录选择或重命名。';
     }
     return null;
   }, [multiVolume, sourceDirectory]);
@@ -137,20 +137,20 @@ export const useManualSplitController = (
       return DEFAULT_STATUS;
     }
     if (initializing) {
-      return '正在初始化手动拆分工作区… / Initializing manual workspace…';
+      return '正在初始化手动拆分工作区…';
     }
     if (manualState.loading) {
-      return '正在载入手动拆分数据… / Loading manual split data…';
+      return '正在载入手动拆分数据…';
     }
     if (!manualState.initialized) {
-      return '工作区已创建，等待载入草稿。 / Workspace created, awaiting drafts.';
+      return '工作区已创建，等待载入草稿。';
     }
     if (totalDrafts === 0) {
-      return '工作区已就绪，但目录中未找到可用图片。 / Workspace ready, but no images were found.';
+      return '工作区已就绪，但目录中未找到可用图片。';
     }
-    const appliedInfo = `已应用 ${appliedDrafts}/${totalDrafts} 张 / Applied ${appliedDrafts}/${totalDrafts}`;
+    const appliedInfo = `已应用 ${appliedDrafts}/${totalDrafts} 张`;
     if (lastAppliedAt) {
-      return `${appliedInfo}（最近 ${lastAppliedAt}） / Last applied ${lastAppliedAt}`;
+      return `${appliedInfo}（最近 ${lastAppliedAt}）`;
     }
     return appliedInfo;
   }, [
@@ -172,7 +172,7 @@ export const useManualSplitController = (
         return;
       }
       if (!sourceDirectory) {
-        setError('缺少重命名输出目录，无法创建工作区。 / Missing renamed output directory; cannot create workspace.');
+        setError('缺少重命名输出目录，无法创建工作区。');
         return;
       }
 

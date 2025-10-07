@@ -3724,6 +3724,27 @@ const MangaUpscaleAgent = () => {
         metadataEntries.volume = trimmedVolume;
       }
 
+      const requiresManualOverrides =
+        !isMultiVolumeSource &&
+        renameSummary?.mode === 'single' &&
+        Boolean(renameSummary.outcome.splitManualOverrides);
+
+      const manualWorkspaceReady =
+        !isMultiVolumeSource &&
+        manualWorkspace &&
+        manualWorkspace.trim().length > 0 &&
+        manualDraftTotal > 0 &&
+        manualAppliedCount >= manualDraftTotal &&
+        Boolean(manualReportPath && manualReportPath.trim().length > 0);
+
+      const manualWorkspaceCandidate =
+        manualWorkspaceReady ||
+        (requiresManualOverrides &&
+          manualWorkspace &&
+          manualWorkspace.trim().length > 0)
+          ? manualWorkspace
+          : null;
+
       let localPath = renameForm.directory;
       let splitSourceAnchor: string | null = null;
 
@@ -3764,7 +3785,9 @@ const MangaUpscaleAgent = () => {
         splitSourceAnchor = renameForm.directory;
       }
 
-      if (
+      if (manualWorkspaceCandidate) {
+        localPath = manualWorkspaceCandidate;
+      } else if (
         !isMultiVolumeSource &&
         splitWorkspace &&
         splitSourceRoot &&
@@ -3822,6 +3845,10 @@ const MangaUpscaleAgent = () => {
     splitSourceRoot,
     splitWorkspace,
     uploadForm,
+    manualWorkspace,
+    manualAppliedCount,
+    manualDraftTotal,
+    manualReportPath,
     assessManualReadiness,
   ]);
 
