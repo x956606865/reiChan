@@ -35,41 +35,37 @@ const ManualSplitIntro: FC<ManualSplitIntroProps> = memo(
     const primaryLabel = hasWorkspace
       ? '重新扫描目录并打开'
       : '创建手动拆分工作区';
-    const secondaryLabel = hasWorkspace ? '打开已有工作区' : '稍后再说';
 
     return (
-      <div className="manual-split-intro">
-        <header>
-          <h4>手动拆分工作区</h4>
-          <p>
-            直接基于重命名后的原图执行手动裁剪，无需先运行自动算法。初始化一次后，即可在抽屉中调整裁剪线并导出结果。
-          </p>
-        </header>
+      <>
+        <div className="manual-split-intro">
+          <div className="manual-split-actions button-row">
+            <button
+              type="button"
+              className="split-action-button primary"
+              onClick={onInitialize}
+              disabled={initializing || disableInitialize}
+            >
+              {initializing ? '准备中…' : primaryLabel}
+            </button>
+            {hasWorkspace && (
+              <button
+                type="button"
+                className="split-action-button"
+                onClick={onOpenExisting}
+                disabled={initializing}
+              >
+                打开已有工作区
+              </button>
+            )}
+          </div>
 
-        <div className="manual-split-actions">
-          <button
-            type="button"
-            className="primary"
-            onClick={onInitialize}
-            disabled={initializing || disableInitialize}
-          >
-            {initializing ? '准备中…' : primaryLabel}
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            onClick={onOpenExisting}
-            disabled={!hasWorkspace || initializing}
-          >
-            {secondaryLabel}
-          </button>
+          {disableReason && (
+            <p className="status status-warning">{disableReason}</p>
+          )}
+
+          {error && <p className="status status-error">{error}</p>}
         </div>
-
-        {disableReason && (
-          <p className="status status-warning">{disableReason}</p>
-        )}
-
-        {error && <p className="status status-error">{error}</p>}
 
         <div className="manual-split-status">
           <p className="status">
@@ -85,7 +81,7 @@ const ManualSplitIntro: FC<ManualSplitIntroProps> = memo(
             </ul>
           )}
         </div>
-      </div>
+      </>
     );
   }
 );

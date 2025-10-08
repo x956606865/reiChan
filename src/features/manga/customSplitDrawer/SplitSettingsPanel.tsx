@@ -18,18 +18,13 @@ interface SplitSettingsPanelProps {
   totalCount: number;
   staged: boolean;
   stagedAny: boolean;
-  previewLoading: boolean;
-  onLinesChange: (lines: ManualSplitLines) => void;
   onImageKindChange: (kind: ManualImageKind) => void;
   onStageCurrent: () => void;
   onClearStageCurrent: () => void;
   onApplyAllUnlocked: () => void;
   onClearAllStages: () => void;
   onToggleLock: () => void;
-  onGeneratePreview: () => void;
 }
-
-const LABELS = ['左侧留白', '左页右边界', '右页左边界', '右侧留白'];
 
 const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
   ({
@@ -41,7 +36,6 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
     lockedCount,
     actionableCount,
     totalCount,
-    onLinesChange,
     onImageKindChange,
     onStageCurrent,
     onClearStageCurrent,
@@ -50,21 +44,7 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
     onToggleLock,
     staged,
     stagedAny,
-    previewLoading,
-    onGeneratePreview,
   }) => {
-    const values = useMemo(() => {
-      if (!lines) {
-        return [0, 48, 52, 100];
-      }
-      return lines.map((value: number) => Number((value * 100).toFixed(2))) as [
-        number,
-        number,
-        number,
-        number,
-      ];
-    }, [lines]);
-
     const isApplying = applyState.running;
 
     const progressTotal = useMemo(() => {
@@ -102,31 +82,6 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
       applyState.errorBubble || runningSummary || applyState.statusText
     );
 
-    const handleChange = useCallback(
-      (index: number) => (event: ChangeEvent<HTMLInputElement>) => {
-        if (!lines) {
-          return;
-        }
-        const next = [...lines] as ManualSplitLines;
-        const numeric = Number.parseFloat(event.currentTarget.value);
-        if (Number.isNaN(numeric)) {
-          return;
-        }
-        const clamped = Math.max(0, Math.min(100, numeric)) / 100;
-        if (imageKind === 'content') {
-          next[index] = clamped;
-        } else if (index === 0) {
-          next[0] = clamped;
-          next[1] = clamped;
-        } else {
-          next[3] = clamped;
-          next[2] = clamped;
-        }
-        onLinesChange(next);
-      },
-      [imageKind, lines, onLinesChange]
-    );
-
     const handleImageKindChange = useCallback(
       (event: ChangeEvent<HTMLSelectElement>) => {
         onImageKindChange(event.currentTarget.value as ManualImageKind);
@@ -156,7 +111,7 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
         </header>
 
         <div className="split-settings-row">
-          <label className="split-settings-field">
+          <label className="split-settings-field form-field">
             <span className="field-label">图片类型</span>
             <select
               value={imageKind}
@@ -164,35 +119,10 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
               disabled={isApplying}
             >
               <option value="content">内容页</option>
-              <option value="cover">封面</option>
-              <option value="spread">跨页</option>
-            </select>
-          </label>
-          <button
-            type="button"
-            onClick={onGeneratePreview}
-            disabled={!lines || isApplying || previewLoading}
-          >
-            {previewLoading ? '生成预览中…' : '生成预览'}
-          </button>
-        </div>
-
-        <div className="split-settings-grid">
-          {(imageKind === 'content' ? [0, 1, 2, 3] : [0, 3]).map((index) => (
-            <label key={LABELS[index]} className="split-settings-field">
-              <span className="field-label">{LABELS[index]}</span>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={0.1}
-                value={values[index]}
-                onChange={handleChange(index)}
-                disabled={!lines || isApplying}
-              />
-              <span className="field-suffix">%</span>
+                <option value="cover">封面</option>
+                <option value="spread">跨页</option>
+              </select>
             </label>
-          ))}
         </div>
 
         {totalCount > 0 && (
@@ -211,6 +141,7 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
         <div className="split-settings-actions">
           <button
             type="button"
+            className="split-action-button"
             onClick={onToggleLock}
             disabled={!lines || isApplying}
           >
@@ -218,6 +149,7 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
           </button>
           <button
             type="button"
+            className="split-action-button"
             onClick={handleStageCurrentClick}
             disabled={!lines || isApplying}
           >
@@ -225,6 +157,7 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
           </button>
           <button
             type="button"
+            className="split-action-button"
             onClick={onApplyAllUnlocked}
             disabled={!lines || isApplying || actionableCount === 0}
           >
@@ -232,6 +165,7 @@ const SplitSettingsPanel: FC<SplitSettingsPanelProps> = memo(
           </button>
           <button
             type="button"
+            className="split-action-button"
             onClick={onClearAllStages}
             disabled={isApplying || !stagedAny}
           >

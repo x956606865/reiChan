@@ -846,13 +846,6 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
       [activeDraft, setImageKind]
     );
 
-    const handleGeneratePreview = useCallback(() => {
-      if (!workspace || !activeDraft) {
-        return;
-      }
-      requestPreview(activeDraft);
-    }, [activeDraft, requestPreview, workspace]);
-
     const handleComplete = useCallback(() => {
       if (!workspace) {
         setError('请先初始化手动拆分工作区。');
@@ -1165,15 +1158,12 @@ const CustomSplitDrawer: FC<CustomSplitDrawerProps> = memo(
                 totalCount={totalDrafts}
                 staged={activeStaged}
                 stagedAny={stagedAny}
-                previewLoading={previewLoading}
-                onLinesChange={handleLinesChange}
                 onImageKindChange={handleImageKindChange}
                 onStageCurrent={handleStageCurrent}
                 onClearStageCurrent={handleClearCurrentStage}
                 onApplyAllUnlocked={handleApplyAllUnlocked}
                 onClearAllStages={handleClearAllStages}
                 onToggleLock={handleToggleLock}
-                onGeneratePreview={handleGeneratePreview}
               />
             </div>
 

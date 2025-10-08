@@ -739,29 +739,10 @@ body {
   gap: 6px;
 }
 
-.form-field.checkbox {
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-}
-
-.form-field.checkbox input[type="checkbox"] {
-  margin: 0;
-}
-
-.form-field.checkbox span {
-  flex: 1;
-}
-
 .split-toggle-row {
   display: flex;
   align-items: center;
   gap: 12px;
-}
-
-.split-toggle-row .form-field.checkbox {
-  flex: 1;
-  min-width: 0;
 }
 
 .split-progress {
@@ -1123,9 +1104,9 @@ body {
   transition: transform 0.15s ease, box-shadow 0.2s ease;
 }
 
-.form-field button:hover,
-.button-row button:hover,
-.split-action-button:hover {
+.form-field button:hover:not(:disabled),
+.button-row button:hover:not(:disabled),
+.split-action-button:hover:not(:disabled) {
   transform: translateY(-1px);
   box-shadow: 0 8px 18px rgba(37, 99, 235, 0.16);
 }
@@ -1142,6 +1123,22 @@ body {
 
 .button-row .primary:hover {
   box-shadow: 0 12px 24px rgba(37, 99, 235, 0.25);
+}
+
+.split-action-button.primary {
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
+  color: #f8fafc;
+}
+
+.split-action-button.primary:hover {
+  box-shadow: 0 12px 24px rgba(37, 99, 235, 0.25);
+}
+
+.split-action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  box-shadow: none;
+  transform: none;
 }
 
 .status {
@@ -2499,27 +2496,17 @@ table td:last-child {
 
 .manual-split-toolbar-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
   gap: 10px;
 }
 
-.manual-split-toolbar-actions button {
-  border: 1px solid rgba(148, 163, 184, 0.6);
-  background: #ffffff;
-  color: #1e3a8a;
-  padding: 6px 14px;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: background 0.18s ease, border-color 0.18s ease;
+.manual-split-toolbar-actions .form-field {
+  min-width: 150px;
 }
 
-.manual-split-toolbar-actions button:hover:enabled {
-  background: rgba(59, 130, 246, 0.1);
-  border-color: rgba(59, 130, 246, 0.6);
-}
-
-.manual-split-toolbar-actions button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
+.manual-split-toolbar-actions .split-action-button {
+  flex-shrink: 0;
 }
 
 .manual-split-toolbar-hint {
@@ -2792,6 +2779,55 @@ table td:last-child {
   color: #475569;
 }
 
+.split-settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.split-settings-row .split-settings-field {
+  flex: 1;
+  min-width: 200px;
+}
+
+.manual-split-row {
+  align-items: flex-end;
+}
+
+.manual-split-row .manual-split-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 260px;
+}
+
+.manual-split-row .manual-split-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.manual-split-row .manual-split-status {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.manual-split-row .manual-split-status > .status {
+  margin: 0;
+}
+
+.split-action-buttons {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
 .split-settings-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2799,17 +2835,13 @@ table td:last-child {
 }
 
 .split-settings-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex: 1;
+  min-width: 0;
 }
 
 .split-settings-field input,
 .split-settings-field select {
-  border-radius: 8px;
-  border: 1px solid rgba(148, 163, 184, 0.6);
-  padding: 0.55em 0.75em;
-  font-size: 0.95rem;
+  width: 100%;
 }
 
 .field-suffix {
@@ -2821,10 +2853,11 @@ table td:last-child {
   display: flex;
   gap: 12px;
   justify-content: flex-end;
+  flex-wrap: wrap;
 }
 
 .split-settings-actions .primary {
-  background: #2563eb;
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
   color: #f8fafc;
   border: none;
 }
@@ -2901,22 +2934,6 @@ table td:last-child {
 
 .split-settings-progress-current {
   color: #1d4ed8;
-}
-
-.manual-split-controls {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-
-.manual-split-controls button {
-  padding: 0.6em 1.1em;
-  border-radius: 10px;
-  border: none;
-  background: rgba(37, 99, 235, 0.1);
-  color: #1d4ed8;
-  cursor: pointer;
-  transition: background 0.18s ease;
 }
 
 .split-detail-backdrop {
@@ -3072,16 +3089,6 @@ table td:last-child {
 .split-detail-actions button:disabled {
   cursor: not-allowed;
   opacity: 0.6;
-}
-
-.manual-split-controls .primary {
-  background: #2563eb;
-  color: #ffffff;
-}
-
-.manual-split-controls button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
 }
 
 .split-grid,

@@ -113,8 +113,8 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
           )}
         </div>
         <div className="manual-split-toolbar-actions">
-          <label className="accelerator-select">
-            <span>加速器</span>
+          <label className="accelerator-select form-field">
+            <span className="field-label">加速器</span>
             <select
               value={accelerator}
               onChange={handleAcceleratorSelect}
@@ -125,24 +125,41 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
               <option value="gpu">GPU</option>
             </select>
           </label>
-          <button type="button" onClick={onUndo} disabled={!canUndo || applyState.running}>
+          <button
+            type="button"
+            className="split-action-button"
+            onClick={onUndo}
+            disabled={!canUndo || applyState.running}
+          >
             撤销上一步
           </button>
-          <button type="button" onClick={onRedo} disabled={!canRedo || applyState.running}>
+          <button
+            type="button"
+            className="split-action-button"
+            onClick={onRedo}
+            disabled={!canRedo || applyState.running}
+          >
             重做一步
           </button>
           <button
             type="button"
+            className="split-action-button"
             onClick={onResetCurrent}
             disabled={!canResetCurrent || applyState.running}
           >
             重置当前
           </button>
-          <button type="button" onClick={onResetAll} disabled={!canResetAll || applyState.running}>
+          <button
+            type="button"
+            className="split-action-button"
+            onClick={onResetAll}
+            disabled={!canResetAll || applyState.running}
+          >
             重置全部
           </button>
           <button
             type="button"
+            className="split-action-button"
             onClick={onRevert}
             disabled={!canTriggerRevert}
             title={revertHint ?? undefined}
@@ -151,7 +168,7 @@ const ManualSplitToolbar: FC<ManualSplitToolbarProps> = memo(
           </button>
           <button
             type="button"
-            className="primary"
+            className="split-action-button primary"
             onClick={onComplete}
             disabled={disableComplete}
           >

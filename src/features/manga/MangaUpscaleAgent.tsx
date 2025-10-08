@@ -6,7 +6,6 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import CustomSplitDrawer from './customSplitDrawer/CustomSplitDrawer.js';
 import ManualSplitIntro from './customSplitDrawer/ManualSplitIntro.js';
 import { useManualSplitController } from './customSplitDrawer/useManualSplitController.js';
-import { buildManualCrossModeNotice } from './manualReadiness.js';
 
 type RenameEntry = {
   originalName: string;
@@ -1088,16 +1087,6 @@ const MangaUpscaleAgent = () => {
 
   const manualReadiness = useMemo(() => assessManualReadiness(), [assessManualReadiness]);
   const manualReadinessWarning = manualReadiness.ok ? null : manualReadiness.reason;
-
-  const manualCrossModeNotice = useMemo(
-    () =>
-      buildManualCrossModeNotice({
-        autoSummary: renameSummary?.outcome.splitSummary ?? null,
-        manualSummary: manualReportSummary,
-        manualReportPath,
-      }),
-    [manualReportPath, manualReportSummary, renameSummary]
-  );
 
   const handleEdgePreview = useCallback(async () => {
     const [bright, dark] = edgeBrightnessThresholds;
@@ -2344,10 +2333,6 @@ const MangaUpscaleAgent = () => {
     computeEdgeSearchRatioErrors,
     ensureSplitWorkspace,
   ]);
-
-  const handleOpenManualDrawer = useCallback(() => {
-    void openManualWorkspace();
-  }, [openManualWorkspace]);
 
   const handleCloseManualDrawer = useCallback(() => {
     setManualDrawerOpen(false);
@@ -4361,7 +4346,7 @@ const MangaUpscaleAgent = () => {
                     )}
                   </ul>
                 </details>
-              )}
+                )}
             </div>
           )}
 
@@ -4668,147 +4653,141 @@ const MangaUpscaleAgent = () => {
             <p>生成拆分工作区并按需调整手动裁剪，未使用时可直接跳过。</p>
           </header>
 
-          <div className="split-controls">
-            <div className="split-toggle-row">
-              <label className="form-field checkbox">
-                <input
-                  type="checkbox"
-                  checked={contentSplitEnabled}
-                  onChange={handleToggleSplit}
-                  disabled={isMultiVolumeSource}
-                />
-                <span>内容感知双页拆分（实验性）</span>
+        <div className="split-controls">
+          <div className="split-toggle-row">
+            <label className="form-field checkbox">
+              <input
+                type="checkbox"
+                checked={contentSplitEnabled}
+                onChange={handleToggleSplit}
+                disabled={isMultiVolumeSource}
+              />
+              <span>内容感知双页拆分（实验性）</span>
+            </label>
+          </div>
+
+          {isMultiVolumeSource && (
+            <p className="status status-tip">
+              多卷来源暂不支持内容感知拆分。
+            </p>
+          )}
+
+          {contentSplitEnabled && !isMultiVolumeSource && (
+            <div className="split-settings-row manual-split-row">
+              <label className="form-field compact split-settings-field">
+                <span className="field-label">拆分算法</span>
+                <select
+                  value={splitAlgorithm}
+                  onChange={handleSplitAlgorithmChange}
+                >
+                  <option value="edgeTexture">Edge Texture（推荐）</option>
+                  <option value="projection">传统投影</option>
+                  <option value="manual">手动（自定义）</option>
+                </select>
               </label>
 
-              {contentSplitEnabled &&
-                !isMultiVolumeSource &&
-                splitAlgorithm !== 'manual' && (
-                  <button
-                    type="button"
-                    className="split-action-button"
-                    onClick={handlePrepareSplit}
-                    disabled={splitPreparing}
-                >
-                  {splitPreparing ? '准备中…' : '开始内容拆分'}
-                </button>
-              )}
-            </div>
+              {splitAlgorithm === 'manual' ? (
+                <ManualSplitIntro
+                  initializing={manualInitializing}
+                  loadingDrafts={manualLoadingDrafts}
+                  statusText={manualStatusText}
+                  error={manualControllerError}
+                  workspace={manualWorkspace}
+                  disableInitialize={manualDisableInitialize}
+                  disableReason={manualDisableReason}
+                  totalDrafts={manualDraftTotal}
+                  appliedDrafts={manualAppliedCount}
+                  lastAppliedAt={manualLastAppliedAt}
+                  onInitialize={() => {
+                    void initializeManualWorkspace(Boolean(manualWorkspace));
+                  }}
+                  onOpenExisting={() => {
+                    void openManualWorkspace();
+                  }}
+                />
+              ) : null}
 
-            {contentSplitEnabled && !isMultiVolumeSource && (
-              <div className="split-settings-row">
-                <label className="form-field compact">
-                  <span className="field-label">拆分算法</span>
-                  <select
-                    value={splitAlgorithm}
-                    onChange={handleSplitAlgorithmChange}
-                  >
-                    <option value="edgeTexture">Edge Texture（推荐）</option>
-                    <option value="projection">传统投影</option>
-                    <option value="manual">手动（自定义）</option>
-                  </select>
-                </label>
+              {splitAlgorithm === 'edgeTexture' && (
+                <div className="edge-threshold-controls">
+                  <label className="form-field compact">
+                    <span className="field-label">亮白阈值</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={255}
+                      value={edgeBrightnessThresholds[0]}
+                      onChange={handleEdgeThresholdChange(0)}
+                    />
+                    {edgeThresholdErrors.bright && (
+                      <span className="field-error">
+                        {edgeThresholdErrors.bright}
+                      </span>
+                    )}
+                  </label>
 
-                {splitAlgorithm === 'manual' ? (
-                  <ManualSplitIntro
-                    initializing={manualInitializing}
-                    loadingDrafts={manualLoadingDrafts}
-                    statusText={manualStatusText}
-                    error={manualControllerError}
-                    workspace={manualWorkspace}
-                    disableInitialize={manualDisableInitialize}
-                    disableReason={manualDisableReason}
-                    totalDrafts={manualDraftTotal}
-                    appliedDrafts={manualAppliedCount}
-                    lastAppliedAt={manualLastAppliedAt}
-                    onInitialize={() => {
-                      void initializeManualWorkspace(Boolean(manualWorkspace));
-                    }}
-                    onOpenExisting={() => {
-                      void openManualWorkspace();
-                    }}
-                  />
-                ) : null}
+                  <label className="form-field compact">
+                    <span className="field-label">留黑阈值</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={255}
+                      value={edgeBrightnessThresholds[1]}
+                      onChange={handleEdgeThresholdChange(1)}
+                    />
+                    {edgeThresholdErrors.dark && (
+                      <span className="field-error">
+                        {edgeThresholdErrors.dark}
+                      </span>
+                    )}
+                  </label>
 
-                {splitAlgorithm === 'edgeTexture' && (
-                  <div className="edge-threshold-controls">
-                    <label className="form-field compact">
-                      <span className="field-label">亮白阈值</span>
-                      <input
-                        type="number"
-                        min={0}
-                        max={255}
-                        value={edgeBrightnessThresholds[0]}
-                        onChange={handleEdgeThresholdChange(0)}
-                      />
-                      {edgeThresholdErrors.bright && (
-                        <span className="field-error">
-                          {edgeThresholdErrors.bright}
-                        </span>
-                      )}
-                    </label>
+                  <label className="form-field compact">
+                    <span className="field-label">左侧搜索比例</span>
+                    <input
+                      type="number"
+                      min={EDGE_SEARCH_RATIO_MIN}
+                      max={EDGE_SEARCH_RATIO_MAX}
+                      step={0.01}
+                      value={edgeSearchRatios[0]}
+                      onChange={handleEdgeSearchRatioChange(0)}
+                    />
+                    {edgeSearchRatioErrors.left && (
+                      <span className="field-error">
+                        {edgeSearchRatioErrors.left}
+                      </span>
+                    )}
+                  </label>
 
-                    <label className="form-field compact">
-                      <span className="field-label">留黑阈值</span>
-                      <input
-                        type="number"
-                        min={0}
-                        max={255}
-                        value={edgeBrightnessThresholds[1]}
-                        onChange={handleEdgeThresholdChange(1)}
-                      />
-                      {edgeThresholdErrors.dark && (
-                        <span className="field-error">
-                          {edgeThresholdErrors.dark}
-                        </span>
-                      )}
-                    </label>
+                  <label className="form-field compact">
+                    <span className="field-label">右侧搜索比例</span>
+                    <input
+                      type="number"
+                      min={EDGE_SEARCH_RATIO_MIN}
+                      max={EDGE_SEARCH_RATIO_MAX}
+                      step={0.01}
+                      value={edgeSearchRatios[1]}
+                      onChange={handleEdgeSearchRatioChange(1)}
+                    />
+                    {edgeSearchRatioErrors.right && (
+                      <span className="field-error">
+                        {edgeSearchRatioErrors.right}
+                      </span>
+                    )}
+                  </label>
 
-                    <label className="form-field compact">
-                      <span className="field-label">左侧搜索比例</span>
-                      <input
-                        type="number"
-                        min={EDGE_SEARCH_RATIO_MIN}
-                        max={EDGE_SEARCH_RATIO_MAX}
-                        step={0.01}
-                        value={edgeSearchRatios[0]}
-                        onChange={handleEdgeSearchRatioChange(0)}
-                      />
-                      {edgeSearchRatioErrors.left && (
-                        <span className="field-error">
-                          {edgeSearchRatioErrors.left}
-                        </span>
-                      )}
-                    </label>
+                  <label className="form-field compact">
+                    <span className="field-label">加速器偏好</span>
+                    <select
+                      value={edgeAcceleratorPreference}
+                      onChange={handleEdgeAcceleratorChange}
+                    >
+                      <option value="auto">自动</option>
+                      <option value="gpu">优先 GPU</option>
+                      <option value="cpu">仅 CPU</option>
+                    </select>
+                  </label>
 
-                    <label className="form-field compact">
-                      <span className="field-label">右侧搜索比例</span>
-                      <input
-                        type="number"
-                        min={EDGE_SEARCH_RATIO_MIN}
-                        max={EDGE_SEARCH_RATIO_MAX}
-                        step={0.01}
-                        value={edgeSearchRatios[1]}
-                        onChange={handleEdgeSearchRatioChange(1)}
-                      />
-                      {edgeSearchRatioErrors.right && (
-                        <span className="field-error">
-                          {edgeSearchRatioErrors.right}
-                        </span>
-                      )}
-                    </label>
-
-                    <label className="form-field compact">
-                      <span className="field-label">加速器偏好</span>
-                      <select
-                        value={edgeAcceleratorPreference}
-                        onChange={handleEdgeAcceleratorChange}
-                      >
-                        <option value="auto">自动</option>
-                        <option value="gpu">优先 GPU</option>
-                        <option value="cpu">仅 CPU</option>
-                      </select>
-                    </label>
-
+                  <div className="split-action-buttons">
                     <button
                       type="button"
                       className="split-action-button"
@@ -4817,10 +4796,32 @@ const MangaUpscaleAgent = () => {
                     >
                       {edgePreview.loading ? '预览中…' : '预览阈值效果'}
                     </button>
+                    <button
+                      type="button"
+                      className="split-action-button"
+                      onClick={handlePrepareSplit}
+                      disabled={splitPreparing}
+                    >
+                      {splitPreparing ? '准备中…' : '开始内容拆分'}
+                    </button>
                   </div>
-                )}
-              </div>
-            )}
+                </div>
+              )}
+
+              {splitAlgorithm === 'projection' && (
+                <div className="split-action-buttons">
+                  <button
+                    type="button"
+                    className="split-action-button"
+                    onClick={handlePrepareSplit}
+                    disabled={splitPreparing}
+                  >
+                    {splitPreparing ? '准备中…' : '开始内容拆分'}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
 
             {splitAlgorithm !== 'manual' && splitEstimate && (
               <p className="status status-tip">
@@ -4904,43 +4905,12 @@ const MangaUpscaleAgent = () => {
                   <p className="status status-error">{splitError}</p>
                 )}
 
-                {manualControllerError &&
-                  splitAlgorithm !== 'manual' && (
-                    <p className="status status-error">{manualControllerError}</p>
-                  )}
-
                 {splitWarningsState.length > 0 && (
                   <ul className="status status-warning">
                     {splitWarningsState.map((warning) => (
                       <li key={warning}>{warning}</li>
                     ))}
                   </ul>
-                )}
-
-                {manualCrossModeNotice && (
-                  <p
-                    className={`status ${
-                      manualCrossModeNotice.tone === 'warning' ? 'status-warning' : 'status-tip'
-                    }`}
-                  >
-                    {manualCrossModeNotice.message}
-                  </p>
-                )}
-
-                {manualWorkspace && splitAlgorithm !== 'manual' && (
-                  <div className="manual-split-controls">
-                    <button
-                      type="button"
-                      className="primary"
-                      onClick={handleOpenManualDrawer}
-                      disabled={manualInitializing || manualLoadingDrafts}
-                    >
-                      打开手动拆分
-                    </button>
-                    <span className="split-preview-status">
-                      {manualStatusText}
-                    </span>
-                  </div>
                 )}
               </div>
             )}
