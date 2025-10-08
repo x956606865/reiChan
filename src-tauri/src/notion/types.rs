@@ -86,11 +86,54 @@ fn default_upsert_strategy() -> UpsertStrategy {
     UpsertStrategy::Skip
 }
 
+mod dedupe_key_format {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+    use serde_json::Value;
+
+    pub fn serialize<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(key) => serializer.serialize_str(key),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<Value>::deserialize(deserializer)?;
+        match value {
+            Some(Value::String(s)) => Ok(Some(s)),
+            Some(Value::Array(arr)) => {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        return Ok(Some(s.to_string()));
+                    }
+                }
+                Ok(None)
+            }
+            Some(Value::Null) | None => Ok(None),
+            Some(other) => Err(de::Error::custom(format!(
+                "dedupeKey must be string or array of strings, got {}",
+                other
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportUpsertConfig {
-    #[serde(default)]
-    pub dedupe_keys: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "dedupe_key_format::deserialize",
+        serialize_with = "dedupe_key_format::serialize"
+    )]
+    pub dedupe_key: Option<String>,
     #[serde(default = "default_upsert_strategy")]
     pub strategy: UpsertStrategy,
     #[serde(default)]

@@ -1,8 +1,13 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import { useNotionImportRunboard } from './runboardStore';
-import type { ImportJobSummary, ImportQueueSnapshot } from './types';
+import type {
+  ImportHistoryPage,
+  ImportJobSummary,
+  ImportQueueSnapshot,
+  JobState,
+} from './types';
 
 type RunboardProps = {
   onBack?: () => void;
@@ -36,6 +41,10 @@ export default function Runboard({ onBack }: RunboardProps) {
     starting,
     queue,
     focusedJobId,
+    history,
+    historyLoading,
+    historyError,
+    historyFilter,
     actions,
   } = useNotionImportRunboard((state) => ({
     job: state.job,
@@ -47,8 +56,20 @@ export default function Runboard({ onBack }: RunboardProps) {
     starting: state.starting,
     queue: state.queue,
     focusedJobId: state.focusedJobId ?? null,
+    history: state.history ?? null,
+    historyLoading: state.historyLoading,
+    historyError: state.historyError ?? null,
+    historyFilter: state.historyFilter,
     actions: state.actions,
   }));
+
+  useEffect(() => {
+    if (!history && !historyLoading) {
+      actions
+        .loadHistory()
+        .catch((err) => console.warn('[notion-import] 初次加载历史失败', err));
+    }
+  }, [history, historyLoading, actions]);
 
   const counts = useMemo(() => {
     const done = job?.progress.done ?? 0;
@@ -152,6 +173,40 @@ export default function Runboard({ onBack }: RunboardProps) {
     }
   }, [actions]);
 
+  const handleHistoryFilterChange = useCallback(
+    (states?: JobState[]) => {
+      actions
+        .loadHistory({ states })
+        .catch((err) => {
+          console.error(err);
+          alert(`刷新历史失败：${err instanceof Error ? err.message : String(err)}`);
+        });
+    },
+    [actions]
+  );
+
+  const handleHistoryPageChange = useCallback(
+    (page: number) => {
+      if (page < 0) return;
+      actions
+        .loadHistory({ page })
+        .catch((err) => {
+          console.error(err);
+          alert(`翻页失败：${err instanceof Error ? err.message : String(err)}`);
+        });
+    },
+    [actions]
+  );
+
+  const handleHistoryRefresh = useCallback(() => {
+    actions
+      .loadHistory()
+      .catch((err) => {
+        console.error(err);
+        alert(`刷新历史失败：${err instanceof Error ? err.message : String(err)}`);
+      });
+  }, [actions]);
+
   const handlePause = async () => {
     try {
       await actions.pause();
@@ -215,6 +270,18 @@ export default function Runboard({ onBack }: RunboardProps) {
         onSetPriority={handleSetPriority}
         onRequeue={handleRequeue}
         onRefresh={handleRefreshQueue}
+      />
+
+      <HistoryPanel
+        history={history ?? null}
+        loading={historyLoading}
+        error={historyError}
+        filterStates={historyFilter.states}
+        currentPage={history?.page ?? historyFilter.page}
+        pageSize={historyFilter.pageSize}
+        onFilterChange={handleHistoryFilterChange}
+        onPageChange={handleHistoryPageChange}
+        onRefresh={handleHistoryRefresh}
       />
 
       <div
@@ -580,5 +647,226 @@ function QueueSection({
         </ul>
       )}
     </div>
+  );
+}
+
+type HistoryPanelProps = {
+  history: ImportHistoryPage | null;
+  loading: boolean;
+  error: string | null;
+  filterStates?: JobState[];
+  currentPage: number;
+  pageSize: number;
+  onFilterChange: (states?: JobState[]) => void;
+  onPageChange: (page: number) => void;
+  onRefresh: () => void;
+};
+
+function HistoryPanel({
+  history,
+  loading,
+  error,
+  filterStates,
+  currentPage,
+  pageSize,
+  onFilterChange,
+  onPageChange,
+  onRefresh,
+}: HistoryPanelProps) {
+  const filterOptions: Array<{ key: string; label: string; states?: JobState[] }> = [
+    { key: 'all', label: '全部', states: undefined },
+    { key: 'failed', label: '失败', states: ['Failed'] },
+    { key: 'completed', label: '已完成', states: ['Completed'] },
+    { key: 'canceled', label: '已取消', states: ['Canceled'] },
+  ];
+
+  const activeFilterKey = (() => {
+    if (!filterStates || filterStates.length === 0) return 'all';
+    if (filterStates.length === 1) {
+      switch (filterStates[0]) {
+        case 'Failed':
+          return 'failed';
+        case 'Completed':
+          return 'completed';
+        case 'Canceled':
+          return 'canceled';
+        default:
+          return 'custom';
+      }
+    }
+    return 'custom';
+  })();
+
+  const resolvedPage = history?.page ?? currentPage;
+  const total = history?.total ?? 0;
+  const hasMore = history?.hasMore ?? false;
+  const items = history?.items ?? [];
+
+  const stateLabels: Record<JobState, string> = {
+    Pending: '待调度',
+    Queued: '排队中',
+    Running: '执行中',
+    Paused: '已暂停',
+    Completed: '已完成',
+    Failed: '失败',
+    Canceled: '已取消',
+  };
+
+  const formatTimestamp = (value?: number | null) => {
+    if (!value) return '未知时间';
+    try {
+      return new Date(value).toLocaleString();
+    } catch {
+      return String(value);
+    }
+  };
+
+  const formatCount = (value?: number | null) => {
+    if (value === undefined || value === null) return '未知';
+    return value.toLocaleString();
+  };
+
+  return (
+    <section
+      className="history-panel"
+      style={{
+        marginTop: 16,
+        padding: 12,
+        border: '1px solid var(--border-muted)',
+        borderRadius: 8,
+        background: '#fff',
+      }}
+    >
+      <header style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <strong>历史作业</strong>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {filterOptions.map((opt) => {
+            const isActive = opt.key === activeFilterKey;
+            return (
+              <button
+                key={opt.key}
+                className="ghost"
+                disabled={loading}
+                onClick={() => onFilterChange(opt.states)}
+                style={{
+                  fontWeight: isActive ? 600 : 400,
+                  background: isActive ? '#eef2ff' : undefined,
+                }}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ flex: 1 }} />
+        <button className="ghost" onClick={onRefresh} disabled={loading}>
+          {loading ? '加载中…' : '刷新'}
+        </button>
+      </header>
+
+      {error && (
+        <p style={{ color: '#b91c1c', marginTop: 8 }}>
+          历史加载失败：{error}
+        </p>
+      )}
+
+      {(!history || items.length === 0) && !loading ? (
+        <p className="muted" style={{ marginTop: 12 }}>
+          暂无历史记录。
+        </p>
+      ) : (
+        <ul
+          className="history-list"
+          style={{
+            listStyle: 'none',
+            padding: 0,
+            margin: 12,
+            marginTop: 12,
+            display: 'grid',
+            gap: 8,
+          }}
+        >
+          {items.map((item) => {
+            const finishedAt =
+              item.endedAt ?? item.startedAt ?? item.createdAt ?? Date.now();
+            return (
+              <li
+                key={item.jobId}
+                style={{
+                  border: '1px solid var(--border-muted)',
+                  borderRadius: 6,
+                  padding: 10,
+                  background: '#fafafa',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: 10,
+                    alignItems: 'center',
+                  }}
+                >
+                  <span style={{ fontWeight: 600 }}>{item.jobId}</span>
+                  <span className="muted">状态：{stateLabels[item.state] ?? item.state}</span>
+                  <span className="muted">
+                    完成：{formatCount(item.progress.done)}
+                  </span>
+                  <span className="muted">
+                    失败：{formatCount(item.progress.failed)}
+                  </span>
+                  <span className="muted">
+                    跳过：{formatCount(item.progress.skipped)}
+                  </span>
+                  <span className="muted">
+                    总数：{item.progress.total !== undefined ? formatCount(item.progress.total ?? 0) : '未知'}
+                  </span>
+                  {item.progress.conflictTotal !== undefined && (
+                    <span className="muted">
+                      冲突：{formatCount(item.progress.conflictTotal)}
+                    </span>
+                  )}
+                  <span className="muted">时间：{formatTimestamp(finishedAt)}</span>
+                  {item.lastError && (
+                    <span className="muted" style={{ color: '#b91c1c' }}>
+                      最后错误：{item.lastError}
+                    </span>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          marginTop: 8,
+          flexWrap: 'wrap',
+        }}
+      >
+        <button
+          className="ghost"
+          onClick={() => onPageChange(Math.max(resolvedPage - 1, 0))}
+          disabled={loading || resolvedPage <= 0}
+        >
+          上一页
+        </button>
+        <button
+          className="ghost"
+          onClick={() => onPageChange(resolvedPage + 1)}
+          disabled={loading || (!hasMore && (!history || history.items.length < pageSize))}
+        >
+          下一页
+        </button>
+        <span className="muted">
+          第 {resolvedPage + 1} 页 · 每页 {pageSize} 条 · 共 {total.toLocaleString()} 条
+        </span>
+        {loading && <span className="muted">加载中…</span>}
+      </div>
+    </section>
   );
 }

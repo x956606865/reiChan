@@ -11,20 +11,20 @@ use super::job_runner::{
 };
 use super::mapping::build_property_entry;
 use super::preview::{preview_file as notion_preview_file, PreviewRequest, PreviewResponse};
+use super::scheduler::{Scheduler, SchedulerConfig, SchedulerDeps};
 use super::storage::{
     ImportJobRecord, ImportJobStore, InMemoryJobStore, InMemoryTokenStore, NewImportJob,
     StateTransition, TokenStore,
 };
 #[cfg(feature = "notion-sqlite")]
 use super::storage::{SqliteJobStore, SqliteTokenStore};
-use super::scheduler::{Scheduler, SchedulerConfig, SchedulerDeps};
 use super::transform::{TransformContext, TransformExecutor};
 use super::types::{
     ConflictType, DatabaseBrief, DatabasePage, DatabaseProperty, DatabaseSchema, DryRunErrorKind,
-    DryRunInput, DryRunReport, ExportFailedResult, FieldMapping, ImportDoneEvent,
-    ImportJobHandle, ImportJobRequest, ImportJobSummary, ImportLogEvent, ImportLogLevel,
-    ImportProgressEvent, ImportQueueSnapshot, ImportTemplate, RowError, RowErrorSummary,
-    SaveTokenRequest, TokenRow, TransformEvalRequest, TransformEvalResult, WorkspaceInfo,
+    DryRunInput, DryRunReport, ExportFailedResult, FieldMapping, ImportDoneEvent, ImportJobHandle,
+    ImportJobRequest, ImportJobSummary, ImportLogEvent, ImportLogLevel, ImportProgressEvent,
+    ImportQueueSnapshot, ImportTemplate, RowError, RowErrorSummary, SaveTokenRequest, TokenRow,
+    TransformEvalRequest, TransformEvalResult, WorkspaceInfo,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -65,15 +65,12 @@ impl JobEventEmitter for TauriJobEventEmitter {
                 row_index: row.row_index,
                 error_code: row.error_code,
                 error_message: row.error_message.unwrap_or_default(),
-                conflict_type: row
-                    .conflict_type
-                    .as_deref()
-                    .and_then(|kind| match kind {
-                        "skip" => Some(ConflictType::Skip),
-                        "overwrite" => Some(ConflictType::Overwrite),
-                        "merge" => Some(ConflictType::Merge),
-                        _ => Some(ConflictType::Unknown),
-                    }),
+                conflict_type: row.conflict_type.as_deref().and_then(|kind| match kind {
+                    "skip" => Some(ConflictType::Skip),
+                    "overwrite" => Some(ConflictType::Overwrite),
+                    "merge" => Some(ConflictType::Merge),
+                    _ => Some(ConflictType::Unknown),
+                }),
             })
             .collect::<Vec<_>>();
         let event = ImportProgressEvent {
@@ -178,8 +175,7 @@ impl NotionState {
                 self.job_runner
                     .update_progress(&record.id, record.progress.clone());
             }
-            self.job_runner
-                .set_state(&record.id, record.state.clone());
+            self.job_runner.set_state(&record.id, record.state.clone());
 
             if matches!(
                 record.state,
@@ -195,7 +191,7 @@ impl NotionState {
 pub fn create_default_state() -> NotionState {
     let state = NotionState::new(
         Arc::new(InMemoryTokenStore::new()),
-        Arc::new(MockNotionAdapter),
+        Arc::new(MockNotionAdapter::new()),
         Arc::new(InMemoryJobStore::new()),
         Arc::new(JobRunner::new()),
     );
@@ -205,7 +201,7 @@ pub fn create_default_state() -> NotionState {
 
 pub fn create_default_state_with_handle(app: AppHandle) -> NotionState {
     let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::new());
-    let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter);
+    let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());
     let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
     let emitter: Arc<dyn JobEventEmitter> =
         Arc::new(TauriJobEventEmitter::new(app, job_store.clone()));
@@ -221,7 +217,7 @@ pub fn create_state_with_sqlite(app: AppHandle, db_path: PathBuf) -> NotionState
     #[cfg(feature = "notion-http")]
     let adapter: Arc<dyn NotionAdapter> = Arc::new(HttpNotionAdapter);
     #[cfg(not(feature = "notion-http"))]
-    let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter);
+    let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());
     #[cfg(feature = "notion-sqlite")]
     let job_store: Arc<dyn ImportJobStore> = Arc::new(SqliteJobStore::new(db_path.clone()));
     #[cfg(not(feature = "notion-sqlite"))]
@@ -406,6 +402,37 @@ fn record_to_summary(record: ImportJobRecord) -> ImportJobSummary {
         ended_at: record.ended_at,
         last_error: record.last_error,
         rps: record.rps,
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportHistoryRequest {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    states: Option<Vec<String>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportHistoryPage {
+    items: Vec<ImportJobSummary>,
+    total: usize,
+    page: usize,
+    page_size: usize,
+    has_more: bool,
+}
+
+fn parse_job_state_label(value: &str) -> Option<JobState> {
+    match value {
+        "Pending" => Some(JobState::Pending),
+        "Queued" => Some(JobState::Queued),
+        "Running" => Some(JobState::Running),
+        "Paused" => Some(JobState::Paused),
+        "Completed" => Some(JobState::Completed),
+        "Failed" => Some(JobState::Failed),
+        "Canceled" => Some(JobState::Canceled),
+        _ => None,
     }
 }
 
@@ -988,6 +1015,14 @@ pub fn notion_import_list_jobs(state: State<NotionState>) -> Result<Vec<ImportJo
 }
 
 #[tauri::command]
+pub fn notion_import_history(
+    state: State<NotionState>,
+    req: Option<ImportHistoryRequest>,
+) -> Result<ImportHistoryPage, String> {
+    handle_import_history(&state, req.unwrap_or_default())
+}
+
+#[tauri::command]
 pub fn notion_import_queue(state: State<NotionState>) -> Result<ImportQueueSnapshot, String> {
     handle_import_queue_snapshot(&state)
 }
@@ -1270,6 +1305,53 @@ fn handle_import_list_jobs(state: &NotionState) -> Result<Vec<ImportJobSummary>,
     } else {
         Ok(records.into_iter().map(record_to_summary).collect())
     }
+}
+
+fn handle_import_history(
+    state: &NotionState,
+    req: ImportHistoryRequest,
+) -> Result<ImportHistoryPage, String> {
+    let page_size = req.page_size.unwrap_or(20).clamp(1, 100);
+    let page = req.page.unwrap_or(0);
+    let offset = page.saturating_mul(page_size);
+    let parsed_states: Option<Vec<JobState>> = match req.states {
+        Some(values) => {
+            if values.is_empty() {
+                None
+            } else {
+                let mut parsed = Vec::with_capacity(values.len());
+                for value in values {
+                    let normalized = parse_job_state_label(&value)
+                        .ok_or_else(|| format!("unknown job state '{}'", value))?;
+                    parsed.push(normalized);
+                }
+                if parsed.is_empty() {
+                    None
+                } else {
+                    Some(parsed)
+                }
+            }
+        }
+        None => None,
+    };
+    let filter_slice = parsed_states.as_ref().map(|vec| vec.as_slice());
+    let records = state
+        .job_store
+        .list_history(offset, page_size, filter_slice)
+        .map_err(|e| e)?;
+    let total = state
+        .job_store
+        .count_history(filter_slice)
+        .map_err(|e| e)?;
+    let has_more = offset.saturating_add(records.len()) < total;
+    let summaries = records.into_iter().map(record_to_summary).collect();
+    Ok(ImportHistoryPage {
+        items: summaries,
+        total,
+        page,
+        page_size,
+        has_more,
+    })
 }
 
 fn handle_export_failed(state: &NotionState, job_id: String) -> Result<ExportFailedResult, String> {
@@ -1700,5 +1782,146 @@ mod tests {
             .expect("load job")
             .expect("job record");
         assert_eq!(canceled_record.state, JobState::Canceled);
+    }
+
+    fn insert_history_job(
+        state: &NotionState,
+        id: &str,
+        job_state: JobState,
+        created_at: i64,
+        ended_at: Option<i64>,
+    ) {
+        state
+            .job_store
+            .insert_job(NewImportJob {
+                id: id.to_string(),
+                token_id: "tok".into(),
+                database_id: "db".into(),
+                source_file_path: format!("/tmp/{id}.json"),
+                config_snapshot_json: "{}".into(),
+                total: Some(10),
+                created_at,
+                priority: 0,
+                lease_expires_at: None,
+                conflict_total: Some(0),
+            })
+            .expect("insert job");
+        state
+            .job_store
+            .mark_state(
+                id,
+                StateTransition {
+                    state: job_state,
+                    started_at: Some(created_at + 10),
+                    ended_at,
+                    last_error: None,
+                },
+            )
+            .expect("mark state");
+    }
+
+    #[test]
+    fn history_handler_returns_paginated_jobs() {
+        let state = create_default_state();
+        let base = now_ms();
+        insert_history_job(
+            &state,
+            "job-h1",
+            JobState::Completed,
+            base,
+            Some(base + 1_000),
+        );
+        insert_history_job(
+            &state,
+            "job-h2",
+            JobState::Failed,
+            base + 1_000,
+            Some(base + 2_000),
+        );
+        insert_history_job(
+            &state,
+            "job-h3",
+            JobState::Canceled,
+            base + 2_000,
+            Some(base + 3_000),
+        );
+        insert_history_job(
+            &state,
+            "job-running-ignore",
+            JobState::Running,
+            base + 3_000,
+            None,
+        );
+
+        let page = handle_import_history(&state, ImportHistoryRequest::default()).expect("history");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.items[0].job_id, "job-h3");
+        assert_eq!(page.items[1].job_id, "job-h2");
+        assert_eq!(page.items[2].job_id, "job-h1");
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn history_handler_supports_filters_and_pagination() {
+        let state = create_default_state();
+        let base = now_ms();
+        let mut offset: i64 = 0;
+        for (id, job_state) in [
+            ("hist-a", JobState::Completed),
+            ("hist-b", JobState::Failed),
+            ("hist-c", JobState::Canceled),
+            ("hist-d", JobState::Completed),
+        ] {
+            insert_history_job(
+                &state,
+                id,
+                job_state,
+                base + offset,
+                Some(base + offset + 500),
+            );
+            offset += 1_000;
+        }
+
+        let page_one = handle_import_history(
+            &state,
+            ImportHistoryRequest {
+                page: Some(0),
+                page_size: Some(2),
+                states: None,
+            },
+        )
+        .expect("page one");
+        assert_eq!(page_one.items.len(), 2);
+        assert!(page_one.has_more);
+        assert_eq!(page_one.items[0].job_id, "hist-d");
+        assert_eq!(page_one.items[1].job_id, "hist-c");
+
+        let page_two = handle_import_history(
+            &state,
+            ImportHistoryRequest {
+                page: Some(1),
+                page_size: Some(2),
+                states: None,
+            },
+        )
+        .expect("page two");
+        assert_eq!(page_two.items.len(), 2);
+        assert!(!page_two.has_more);
+        assert_eq!(page_two.items[0].job_id, "hist-b");
+        assert_eq!(page_two.items[1].job_id, "hist-a");
+
+        let failed_only = handle_import_history(
+            &state,
+            ImportHistoryRequest {
+                page: Some(0),
+                page_size: Some(5),
+                states: Some(vec!["Failed".into()]),
+            },
+        )
+        .expect("failed filter");
+        assert_eq!(failed_only.items.len(), 1);
+        assert_eq!(failed_only.total, 1);
+        assert_eq!(failed_only.items[0].job_id, "hist-b");
     }
 }

@@ -97,8 +97,131 @@ mod tests {
         assert_eq!(list[0].name, "demo");
         let token = store.get_token(&saved.id).unwrap();
         assert_eq!(token, "secret-123");
-        assert!(store.delete(&saved.id));
-        assert!(store.list().is_empty());
+       assert!(store.delete(&saved.id));
+       assert!(store.list().is_empty());
+    }
+
+    fn insert_demo_job(
+        store: &InMemoryJobStore,
+        id: &str,
+        state: JobState,
+        created_at: i64,
+        ended_at: Option<i64>,
+    ) {
+        let new_job = NewImportJob {
+            id: id.to_string(),
+            token_id: "tok-1".into(),
+            database_id: "db-1".into(),
+            source_file_path: format!("/tmp/{id}.json"),
+            config_snapshot_json: "{\"version\":1}".into(),
+            total: Some(10),
+            created_at,
+            priority: 0,
+            lease_expires_at: None,
+            conflict_total: Some(0),
+        };
+        let record = store.insert_job(new_job).expect("insert job");
+        if state != JobState::Pending {
+            store
+                .mark_state(
+                    &record.id,
+                    StateTransition {
+                        state,
+                        started_at: Some(created_at + 10),
+                        ended_at,
+                        last_error: None,
+                    },
+                )
+                .expect("mark state");
+        }
+    }
+
+    #[test]
+    fn in_memory_history_lists_terminal_states_desc() {
+        let store = InMemoryJobStore::new();
+        let base = 1_700_000_000_000i64;
+        insert_demo_job(
+            &store,
+            "job-completed",
+            JobState::Completed,
+            base,
+            Some(base + 1_000),
+        );
+        insert_demo_job(
+            &store,
+            "job-failed",
+            JobState::Failed,
+            base + 1_000,
+            Some(base + 2_000),
+        );
+        insert_demo_job(
+            &store,
+            "job-canceled",
+            JobState::Canceled,
+            base + 2_000,
+            Some(base + 3_000),
+        );
+        insert_demo_job(
+            &store,
+            "job-running",
+            JobState::Running,
+            base + 3_000,
+            None,
+        );
+
+        let items = store
+            .list_history(0, 10, None)
+            .expect("history listing should work");
+        let ids: Vec<_> = items.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(ids, ["job-canceled", "job-failed", "job-completed"]);
+
+        let total = store.count_history(None).expect("count history");
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn in_memory_history_respects_filters_and_pagination() {
+        let store = InMemoryJobStore::new();
+        let base = 1_700_100_000_000i64;
+        let mut offset_idx: i64 = 0;
+        for (id, state) in [
+            ("job-a", JobState::Completed),
+            ("job-b", JobState::Failed),
+            ("job-c", JobState::Canceled),
+            ("job-d", JobState::Completed),
+        ] {
+            insert_demo_job(
+                &store,
+                id,
+                state,
+                base + (offset_idx * 1_000),
+                Some(base + (offset_idx * 1_000) + 500),
+            );
+            offset_idx += 1;
+        }
+
+        let page_one = store
+            .list_history(0, 2, None)
+            .expect("page one should load");
+        assert_eq!(page_one.len(), 2);
+        assert_eq!(page_one[0].id, "job-d");
+        assert_eq!(page_one[1].id, "job-c");
+
+        let page_two = store
+            .list_history(2, 2, None)
+            .expect("page two should load");
+        assert_eq!(page_two.len(), 2);
+        assert_eq!(page_two[0].id, "job-b");
+        assert_eq!(page_two[1].id, "job-a");
+
+        let failed_only = store
+            .list_history(0, 10, Some(&[JobState::Failed]))
+            .expect("filter failed");
+        assert_eq!(failed_only.len(), 1);
+        assert_eq!(failed_only[0].id, "job-b");
+
+        let total = store.count_history(Some(&[JobState::Completed, JobState::Failed]));
+        assert_eq!(total.expect("count filtered"), 3);
     }
 }
 
@@ -262,6 +385,23 @@ pub struct ImportJobRowRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct ImportCheckpoint {
+    pub job_id: String,
+    pub row_index: usize,
+    pub file_offset: u64,
+    pub data_hash: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointRecord {
+    pub job_id: String,
+    pub row_index: usize,
+    pub file_offset: u64,
+    pub data_hash: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewImportJob {
     pub id: String,
     pub token_id: String,
@@ -323,6 +463,20 @@ pub trait ImportJobStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ImportJobRowRecord>, String>;
     fn list_failed_rows(&self, job_id: &str) -> Result<Vec<ImportJobRowRecord>, String>;
+    fn write_checkpoint(&self, checkpoint: CheckpointRecord) -> Result<(), String>;
+    fn recent_checkpoints(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ImportCheckpoint>, String>;
+    fn clear_checkpoints(&self, job_id: &str) -> Result<(), String>;
+    fn list_history(
+        &self,
+        offset: usize,
+        limit: usize,
+        states: Option<&[JobState]>,
+    ) -> Result<Vec<ImportJobRecord>, String>;
+    fn count_history(&self, states: Option<&[JobState]>) -> Result<usize, String>;
 }
 
 fn job_state_to_str(state: JobState) -> &'static str {
@@ -362,6 +516,26 @@ fn extract_timestamp_from_id(job_id: &str) -> i64 {
         .unwrap_or(0)
 }
 
+fn history_states_vec(states: Option<&[JobState]>) -> Vec<JobState> {
+    match states {
+        Some(list) if !list.is_empty() => list.to_vec(),
+        _ => vec![JobState::Completed, JobState::Failed, JobState::Canceled],
+    }
+}
+
+fn resolve_history_timestamp(record: &ImportJobRecord) -> i64 {
+    if let Some(ended) = record.ended_at {
+        return ended;
+    }
+    if let Some(started) = record.started_at {
+        return started;
+    }
+    if record.created_at != 0 {
+        return record.created_at;
+    }
+    extract_timestamp_from_id(&record.id)
+}
+
 #[derive(Default)]
 pub struct InMemoryJobStore {
     inner: Mutex<InMemoryJobState>,
@@ -371,11 +545,35 @@ pub struct InMemoryJobStore {
 struct InMemoryJobState {
     jobs: HashMap<String, ImportJobRecord>,
     rows: HashMap<String, Vec<ImportJobRowRecord>>,
+    checkpoints: HashMap<String, Vec<ImportCheckpoint>>,
 }
 
 impl InMemoryJobStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn collect_history_jobs(
+        &self,
+        states: Option<&[JobState]>,
+    ) -> Result<Vec<ImportJobRecord>, String> {
+        let guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        let allowed = history_states_vec(states);
+        let mut jobs: Vec<ImportJobRecord> = guard
+            .jobs
+            .values()
+            .filter(|job| allowed.iter().any(|state| state == &job.state))
+            .cloned()
+            .collect();
+        drop(guard);
+        jobs.sort_by(|a, b| {
+            let ta = resolve_history_timestamp(a);
+            let tb = resolve_history_timestamp(b);
+            tb.cmp(&ta)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(jobs)
     }
 }
 
@@ -539,6 +737,73 @@ impl ImportJobStore for InMemoryJobStore {
         rows.sort_by(|a, b| a.row_index.cmp(&b.row_index));
         Ok(rows)
     }
+
+    fn write_checkpoint(&self, checkpoint: CheckpointRecord) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        let slots = guard
+            .checkpoints
+            .entry(checkpoint.job_id.clone())
+            .or_default();
+        let entry = ImportCheckpoint {
+            job_id: checkpoint.job_id,
+            row_index: checkpoint.row_index,
+            file_offset: checkpoint.file_offset,
+            data_hash: checkpoint.data_hash,
+            updated_at: now_ms(),
+        };
+        slots.push(entry);
+        slots.sort_by(|a, b| b.row_index.cmp(&a.row_index));
+        if slots.len() > 10 {
+            slots.truncate(10);
+        }
+        Ok(())
+    }
+
+    fn recent_checkpoints(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ImportCheckpoint>, String> {
+        let guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        let entries = guard
+            .checkpoints
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default();
+        if entries.len() > limit {
+            Ok(entries.into_iter().take(limit).collect())
+        } else {
+            Ok(entries)
+        }
+    }
+
+    fn clear_checkpoints(&self, job_id: &str) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        guard.checkpoints.remove(job_id);
+        Ok(())
+    }
+
+    fn list_history(
+        &self,
+        offset: usize,
+        limit: usize,
+        states: Option<&[JobState]>,
+    ) -> Result<Vec<ImportJobRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let jobs = self.collect_history_jobs(states)?;
+        if offset >= jobs.len() {
+            return Ok(Vec::new());
+        }
+        let end = std::cmp::min(offset.saturating_add(limit), jobs.len());
+        Ok(jobs[offset..end].to_vec())
+    }
+
+    fn count_history(&self, states: Option<&[JobState]>) -> Result<usize, String> {
+        let jobs = self.collect_history_jobs(states)?;
+        Ok(jobs.len())
+    }
 }
 
 #[cfg(feature = "notion-sqlite")]
@@ -561,6 +826,7 @@ struct JobTableCapabilities {
     has_error_payload_json: bool,
     has_conflict_type: bool,
     has_previous_snapshot_json: bool,
+    has_checkpoints_table: bool,
 }
 
 #[cfg(feature = "notion-sqlite")]
@@ -605,6 +871,13 @@ fn detect_caps(path: &PathBuf) -> Result<JobTableCapabilities, String> {
     caps.has_error_payload_json = row_columns.iter().any(|c| c == "error_payload_json");
     caps.has_conflict_type = row_columns.iter().any(|c| c == "conflict_type");
     caps.has_previous_snapshot_json = row_columns.iter().any(|c| c == "previous_snapshot_json");
+
+    let mut cp_stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notion_import_checkpoints'",
+        )
+        .map_err(|e| e.to_string())?;
+    caps.has_checkpoints_table = cp_stmt.exists([]).map_err(|e| e.to_string())?;
     Ok(caps)
 }
 
@@ -816,24 +1089,36 @@ impl ImportJobStore for SqliteJobStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         for row in rows.iter() {
-            tx.execute(
-                "INSERT OR REPLACE INTO notion_import_job_rows (
-                    job_id, row_index, status, error_code, error_message, error_payload_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    row.job_id,
-                    row.row_index as i64,
-                    row.status.as_str(),
-                    row.error_code,
-                    row.error_message,
-                    if self.caps.has_error_payload_json {
-                        row.error_payload_json.clone()
-                    } else {
-                        None
-                    }
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+            if self.caps.has_error_payload_json {
+                tx.execute(
+                    "INSERT OR REPLACE INTO notion_import_job_rows (
+                        job_id, row_index, status, error_code, error_message, error_payload_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        row.job_id,
+                        row.row_index as i64,
+                        row.status.as_str(),
+                        row.error_code,
+                        row.error_message,
+                        row.error_payload_json.clone(),
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                tx.execute(
+                    "INSERT OR REPLACE INTO notion_import_job_rows (
+                        job_id, row_index, status, error_code, error_message
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        row.job_id,
+                        row.row_index as i64,
+                        row.status.as_str(),
+                        row.error_code,
+                        row.error_message,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
 
             if self.caps.has_conflict_type {
                 tx.execute(
@@ -1310,5 +1595,189 @@ impl ImportJobStore for SqliteJobStore {
             out.push(row.map_err(|e| e.to_string())?);
         }
         Ok(out)
+    }
+
+    fn write_checkpoint(&self, checkpoint: CheckpointRecord) -> Result<(), String> {
+        if !self.caps.has_checkpoints_table {
+            return Ok(());
+        }
+        use rusqlite::{params, Connection};
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO notion_import_checkpoints (job_id, row_index, file_offset, data_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(job_id, row_index)
+             DO UPDATE SET file_offset = excluded.file_offset, data_hash = excluded.data_hash, updated_at = excluded.updated_at",
+            params![
+                checkpoint.job_id,
+                checkpoint.row_index as i64,
+                checkpoint.file_offset as i64,
+                checkpoint.data_hash,
+                now_ms(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM notion_import_checkpoints
+             WHERE job_id = ?1
+               AND row_index NOT IN (
+                 SELECT row_index FROM notion_import_checkpoints
+                 WHERE job_id = ?1
+                 ORDER BY row_index DESC
+                 LIMIT 10
+               )",
+            params![checkpoint.job_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn recent_checkpoints(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ImportCheckpoint>, String> {
+        if !self.caps.has_checkpoints_table {
+            return Ok(Vec::new());
+        }
+        use rusqlite::{params, Connection};
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT job_id, row_index, file_offset, data_hash, updated_at
+                 FROM notion_import_checkpoints
+                 WHERE job_id = ?1
+                 ORDER BY row_index DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![job_id, limit as i64],
+                |row| -> rusqlite::Result<ImportCheckpoint> {
+                    Ok(ImportCheckpoint {
+                        job_id: row.get(0)?,
+                        row_index: row.get::<_, i64>(1)? as usize,
+                        file_offset: row.get::<_, i64>(2)? as u64,
+                        data_hash: row.get(3)?,
+                        updated_at: row.get::<_, i64>(4)?,
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    fn clear_checkpoints(&self, job_id: &str) -> Result<(), String> {
+        if !self.caps.has_checkpoints_table {
+            return Ok(());
+        }
+        use rusqlite::{params, Connection};
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM notion_import_checkpoints WHERE job_id = ?1",
+            params![job_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn list_history(
+        &self,
+        offset: usize,
+        limit: usize,
+        states: Option<&[JobState]>,
+    ) -> Result<Vec<ImportJobRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        use rusqlite::{params_from_iter, types::Value, Connection};
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        let states_vec = history_states_vec(states);
+        let status_values: Vec<String> = states_vec
+            .iter()
+            .map(|state| job_state_to_str(state.clone()).to_string())
+            .collect();
+        if status_values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..status_values.len())
+            .map(|idx| format!("?{}", idx + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut sql = format!(
+            "SELECT id FROM notion_import_jobs WHERE status IN ({})",
+            placeholders
+        );
+        let order_clause = if self.caps.has_created_at {
+            " ORDER BY COALESCE(ended_at, started_at, created_at, 0) DESC, id DESC"
+        } else {
+            " ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC"
+        };
+        sql.push_str(order_clause);
+        sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            status_values.len() + 1,
+            status_values.len() + 2
+        ));
+
+        let mut params: Vec<Value> = status_values
+            .into_iter()
+            .map(Value::from)
+            .collect();
+        params.push(Value::from(limit as i64));
+        params.push(Value::from(offset as i64));
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let ids: Vec<String> = stmt
+            .query_map(params_from_iter(params), |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+
+        drop(stmt);
+
+        let mut records: Vec<ImportJobRecord> = Vec::new();
+        for id in ids {
+            if let Some(record) = self.load_job(&id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    fn count_history(&self, states: Option<&[JobState]>) -> Result<usize, String> {
+        use rusqlite::{params_from_iter, types::Value, Connection};
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        let states_vec = history_states_vec(states);
+        let status_values: Vec<String> = states_vec
+            .iter()
+            .map(|state| job_state_to_str(state.clone()).to_string())
+            .collect();
+        if status_values.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = (0..status_values.len())
+            .map(|idx| format!("?{}", idx + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(1) FROM notion_import_jobs WHERE status IN ({})",
+            placeholders
+        );
+        let mut params: Vec<Value> = status_values
+            .into_iter()
+            .map(Value::from)
+            .collect();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let count: i64 = stmt
+            .query_row(params_from_iter(params), |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(count.max(0) as usize)
     }
 }

@@ -127,10 +127,7 @@ impl SchedulerCore {
 
     fn handle_set_priority(&mut self, job_id: String, priority: i32) {
         if let Err(err) = self.deps.job_store.set_priority(&job_id, priority) {
-            eprintln!(
-                "[scheduler] failed to set priority for {}: {}",
-                job_id, err
-            );
+            eprintln!("[scheduler] failed to set priority for {}: {}", job_id, err);
             return;
         }
         self.deps.job_runner.emit_log(
@@ -164,15 +161,10 @@ impl SchedulerCore {
             return;
         }
         if let Err(err) = self.deps.job_store.touch_lease(&job_id, None) {
-            eprintln!(
-                "[scheduler] failed to clear lease for {}: {}",
-                job_id, err
-            );
+            eprintln!("[scheduler] failed to clear lease for {}: {}", job_id, err);
         }
         self.active.remove(&job_id);
-        self.deps
-            .job_runner
-            .set_state(&job_id, JobState::Queued);
+        self.deps.job_runner.set_state(&job_id, JobState::Queued);
         self.pending_hint.insert(job_id);
     }
 
@@ -248,12 +240,11 @@ impl SchedulerCore {
     fn ensure_registered(&self, job: &ImportJobRecord) {
         if self.deps.job_runner.snapshot(&job.id).is_none() {
             self.deps.job_runner.register_job(job.id.clone());
-            self.deps.job_runner
+            self.deps
+                .job_runner
                 .update_progress(&job.id, job.progress.clone());
         }
-        self.deps
-            .job_runner
-            .set_state(&job.id, job.state.clone());
+        self.deps.job_runner.set_state(&job.id, job.state.clone());
     }
 
     fn observe_heartbeat(&mut self, job: &ImportJobRecord, now: i64) {
@@ -302,9 +293,7 @@ impl SchedulerCore {
             },
         );
         let _ = self.deps.job_store.touch_lease(&job.id, None);
-        self.deps
-            .job_runner
-            .set_state(&job.id, JobState::Queued);
+        self.deps.job_runner.set_state(&job.id, JobState::Queued);
         self.active.remove(&job.id);
         self.pending_hint.insert(job.id.clone());
     }
@@ -316,10 +305,7 @@ impl SchedulerCore {
             .get_token(&job.token_id)
             .ok_or_else(|| format!("token {} missing for job", job.token_id))?;
         if !Path::new(&job.source_file_path).exists() {
-            return Err(format!(
-                "source file missing: {}",
-                job.source_file_path
-            ));
+            return Err(format!("source file missing: {}", job.source_file_path));
         }
 
         self.ensure_registered(&job);
@@ -494,10 +480,7 @@ mod tests {
         .to_string()
     }
 
-    fn insert_job(
-        job_store: &Arc<dyn ImportJobStore>,
-        new_job: NewImportJob,
-    ) -> ImportJobRecord {
+    fn insert_job(job_store: &Arc<dyn ImportJobStore>, new_job: NewImportJob) -> ImportJobRecord {
         job_store.insert_job(new_job).expect("insert job")
     }
 
@@ -525,7 +508,7 @@ mod tests {
         let token = token_store.save("default", "secret", Some("Workspace".into()));
         let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
         let job_runner = Arc::new(JobRunner::new());
-        let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter);
+        let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());
 
         let records_file1 = write_sample_records();
         let records_file2 = write_sample_records();
@@ -590,21 +573,28 @@ mod tests {
         scheduler.enqueue(job2_id.into()).expect("enqueue job2");
 
         assert!(
-            wait_for_state(&job_store, job1_id, JobState::Completed, Duration::from_secs(5)),
+            wait_for_state(
+                &job_store,
+                job1_id,
+                JobState::Completed,
+                Duration::from_secs(5)
+            ),
             "job1 should complete"
         );
         assert!(
-            wait_for_state(&job_store, job2_id, JobState::Completed, Duration::from_secs(5)),
+            wait_for_state(
+                &job_store,
+                job2_id,
+                JobState::Completed,
+                Duration::from_secs(5)
+            ),
             "job2 should complete"
         );
 
         let job1 = job_store.load_job(job1_id).unwrap().unwrap();
         let job2 = job_store.load_job(job2_id).unwrap().unwrap();
         assert!(
-            job2
-                .started_at
-                .unwrap_or_default()
-                >= job1.ended_at.unwrap_or_default(),
+            job2.started_at.unwrap_or_default() >= job1.ended_at.unwrap_or_default(),
             "job2 should start after job1 finishes"
         );
 
@@ -617,7 +607,7 @@ mod tests {
         let token = token_store.save("default", "secret", Some("Workspace".into()));
         let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
         let job_runner = Arc::new(JobRunner::new());
-        let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter);
+        let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());
 
         let records_file1 = write_sample_records();
         let records_file2 = write_sample_records();
@@ -687,21 +677,28 @@ mod tests {
         scheduler.enqueue(job2_id.into()).expect("enqueue job2");
 
         assert!(
-            wait_for_state(&job_store, job2_id, JobState::Completed, Duration::from_secs(5)),
+            wait_for_state(
+                &job_store,
+                job2_id,
+                JobState::Completed,
+                Duration::from_secs(5)
+            ),
             "job2 should complete"
         );
         assert!(
-            wait_for_state(&job_store, job1_id, JobState::Completed, Duration::from_secs(5)),
+            wait_for_state(
+                &job_store,
+                job1_id,
+                JobState::Completed,
+                Duration::from_secs(5)
+            ),
             "job1 should complete"
         );
 
         let job1 = job_store.load_job(job1_id).unwrap().unwrap();
         let job2 = job_store.load_job(job2_id).unwrap().unwrap();
         assert!(
-            job1
-                .started_at
-                .unwrap_or_default()
-                >= job2.ended_at.unwrap_or_default(),
+            job1.started_at.unwrap_or_default() >= job2.ended_at.unwrap_or_default(),
             "job1 should start after promoted job2 finishes"
         );
 

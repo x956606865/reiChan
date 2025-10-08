@@ -5,12 +5,14 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   ExportFailedResult,
   ImportDoneEvent,
+  ImportHistoryPage,
   ImportJobDraft,
   ImportJobHandle,
   ImportJobSummary,
   ImportQueueSnapshot,
   ImportLogEvent,
   ImportProgressEvent,
+  JobState,
   RowErrorSummary,
 } from './types';
 
@@ -25,6 +27,14 @@ type RunboardState = {
   listeners: UnlistenFn[];
   queue?: ImportQueueSnapshot | null;
   focusedJobId?: string | null;
+  history?: ImportHistoryPage | null;
+  historyLoading: boolean;
+  historyError?: string | null;
+  historyFilter: {
+    page: number;
+    pageSize: number;
+    states?: JobState[];
+  };
   actions: {
     hydrate: (summary: ImportJobSummary | null) => Promise<void>;
     start: (draft: ImportJobDraft) => Promise<ImportJobHandle>;
@@ -36,11 +46,13 @@ type RunboardState = {
     promote: (jobId: string) => Promise<ImportJobSummary>;
     requeue: (jobId: string) => Promise<ImportJobSummary>;
     setPriority: (jobId: string, priority: number) => Promise<ImportJobSummary>;
+    loadHistory: (opts?: { page?: number; pageSize?: number; states?: JobState[] }) => Promise<ImportHistoryPage>;
     reset: () => void;
   };
 };
 
 const MAX_LOGS = 50;
+const DEFAULT_HISTORY_PAGE_SIZE = 10;
 
 export const useNotionImportRunboard = create<RunboardState>((set, get) => {
   const cleanupListeners = () => {
@@ -106,6 +118,11 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
       }));
       cleanupListeners();
       await refreshQueue();
+      try {
+        await get().actions.loadHistory();
+      } catch (err) {
+        console.warn('[notion-import] load history after done failed', err);
+      }
     });
     nextListeners.push(doneUnlisten);
 
@@ -155,6 +172,14 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
     listeners: [],
     queue: null,
     focusedJobId: null,
+    history: null,
+    historyLoading: false,
+    historyError: null,
+    historyFilter: {
+      page: 0,
+      pageSize: DEFAULT_HISTORY_PAGE_SIZE,
+      states: undefined,
+    },
     actions: {
       hydrate: async (summary) => {
         if (!summary) {
@@ -169,6 +194,11 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
             focusedJobId: null,
           });
           await refreshQueue();
+          try {
+            await get().actions.loadHistory();
+          } catch (err) {
+            console.warn('[notion-import] load history during hydrate(null) failed', err);
+          }
           return;
         }
         set({
@@ -181,6 +211,11 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
         });
         await attachListeners(summary.jobId);
         await refreshQueue();
+        try {
+          await get().actions.loadHistory();
+        } catch (err) {
+          console.warn('[notion-import] load history during hydrate failed', err);
+        }
       },
       start: async (draft) => {
         set({ starting: true, lastDone: undefined });
@@ -266,6 +301,11 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
         }));
         cleanupListeners();
         await refreshQueue();
+        try {
+          await get().actions.loadHistory();
+        } catch (err) {
+          console.warn('[notion-import] load history after cancel failed', err);
+        }
         return summary;
       },
       exportFailed: async () => {
@@ -315,6 +355,56 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
         }
         return summary;
       },
+      loadHistory: async (opts) => {
+        const { historyFilter } = get();
+        const forcedStates = opts?.states;
+        const forcedPageSize = opts?.pageSize;
+        const statesChanged = forcedStates !== undefined;
+        const nextStates = forcedStates ?? historyFilter.states;
+        const pageSize = Math.min(
+          Math.max(forcedPageSize ?? historyFilter.pageSize ?? DEFAULT_HISTORY_PAGE_SIZE, 1),
+          100
+        );
+        const basePage = statesChanged || forcedPageSize !== undefined ? 0 : historyFilter.page;
+        const nextPage = opts?.page ?? basePage;
+        const requestStates =
+          nextStates && nextStates.length > 0 ? nextStates.filter(Boolean) : undefined;
+
+        set({ historyLoading: true, historyError: null });
+        const payload: {
+          page: number;
+          pageSize: number;
+          states?: JobState[];
+        } = {
+          page: nextPage,
+          pageSize,
+        };
+        if (requestStates && requestStates.length > 0) {
+          payload.states = requestStates;
+        }
+        try {
+          const pageData = await invoke<ImportHistoryPage>('notion_import_history', {
+            req: payload,
+          });
+          set({
+            history: pageData,
+            historyLoading: false,
+            historyError: null,
+            historyFilter: {
+              page: pageData.page,
+              pageSize: pageData.pageSize ?? pageSize,
+              states: requestStates,
+            },
+          });
+          return pageData;
+        } catch (err) {
+          set({
+            historyLoading: false,
+            historyError: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      },
       reset: () => {
         cleanupListeners();
         set({
@@ -326,6 +416,14 @@ export const useNotionImportRunboard = create<RunboardState>((set, get) => {
           isStreaming: false,
           queue: null,
           focusedJobId: null,
+          history: null,
+          historyLoading: false,
+          historyError: null,
+          historyFilter: {
+            page: 0,
+            pageSize: DEFAULT_HISTORY_PAGE_SIZE,
+            states: undefined,
+          },
         });
       },
     },

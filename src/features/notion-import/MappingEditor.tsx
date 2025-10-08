@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type {
   DatabaseSchema,
@@ -9,6 +9,7 @@ import type {
   TransformEvalResult,
   ImportJobDraft,
   DryRunErrorKind,
+  UpsertStrategy,
 } from './types'
 
 import { useNotionImportRunboard } from './runboardStore'
@@ -68,7 +69,23 @@ export default function MappingEditor(props: Props) {
 
   const [transformEditor, setTransformEditor] = useState<TransformEditorState | null>(null)
 
+  const [upsertEnabled, setUpsertEnabled] = useState<boolean>(Boolean(draft?.upsert))
+  const [upsertStrategy, setUpsertStrategy] = useState<UpsertStrategy>(draft?.upsert?.strategy ?? 'skip')
+  const [upsertKey, setUpsertKey] = useState<string>(draft?.upsert?.dedupeKey ?? '')
+  const [conflictColumns, setConflictColumns] = useState<string[]>(draft?.upsert?.conflictColumns ?? [])
+  const [upsertError, setUpsertError] = useState<string | null>(null)
+  const [draftFingerprint, setDraftFingerprint] = useState<string | null>(null)
+
   const hasSamples = previewRecords.length > 0
+  const upsertInvalid = upsertEnabled && !upsertKey
+
+useEffect(() => {
+  if (upsertInvalid) {
+    setUpsertError('Upsert 已开启，请选择唯一键字段。')
+  } else {
+    setUpsertError(null)
+  }
+}, [upsertInvalid])
 
   const propertyMap = useMemo(() => {
     const map = new Map<string, DatabaseSchema['properties'][number]>()
@@ -117,6 +134,20 @@ export default function MappingEditor(props: Props) {
     }
   }, [draft, mappings.length])
 
+  useEffect(() => {
+    if (draft?.upsert) {
+      setUpsertEnabled(true)
+      setUpsertStrategy(draft.upsert.strategy)
+      setUpsertKey(draft.upsert.dedupeKey ?? '')
+      setConflictColumns(draft.upsert.conflictColumns ?? [])
+    } else {
+      setUpsertEnabled(false)
+      setUpsertStrategy('skip')
+      setUpsertKey('')
+      setConflictColumns([])
+    }
+  }, [draft])
+
   const propertyNames = useMemo(() => schema?.properties.map((p) => p.name) ?? [], [schema])
 
   const incompleteMappings = useMemo(() => {
@@ -129,6 +160,68 @@ export default function MappingEditor(props: Props) {
     const current = mappings.map((m) => m.sourceField).filter(Boolean)
     return Array.from(new Set([...fromPreview, ...fromTpl, ...current]))
   }, [previewFields, tplSourceFields, mappings])
+
+  const targetPropertyOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        mappings
+          .filter((m) => m.include && m.targetProperty.trim())
+          .map((m) => m.targetProperty.trim())
+      )
+    )
+  }, [mappings])
+
+  const normalizedDefaultsJson = useMemo(() => {
+    const trimmed = defaultsJson.trim()
+    return trimmed.length > 0 ? trimmed : ''
+  }, [defaultsJson])
+
+  const currentFingerprint = useMemo(() => {
+    const upsertPayload = upsertEnabled && upsertKey
+      ? {
+          strategy: upsertStrategy,
+          dedupeKey: upsertKey,
+          conflictColumns: [...conflictColumns].sort(),
+        }
+      : null
+    return JSON.stringify({
+      tokenId,
+      databaseId,
+      sourceFilePath,
+      fileType,
+      mappings,
+      defaults: normalizedDefaultsJson,
+      upsert: upsertPayload,
+    })
+  }, [
+    tokenId,
+    databaseId,
+    sourceFilePath,
+    fileType,
+    mappings,
+    normalizedDefaultsJson,
+    upsertEnabled,
+    upsertStrategy,
+    upsertKey,
+    conflictColumns,
+  ])
+
+  useEffect(() => {
+    if (!onDraftChange) return
+    if (!draftFingerprint) return
+    if (currentFingerprint !== draftFingerprint) {
+      onDraftChange(null)
+      setDraftFingerprint(null)
+    }
+  }, [currentFingerprint, draftFingerprint, onDraftChange])
+
+  useEffect(() => {
+    if (!upsertEnabled) return
+    if (upsertKey && !targetPropertyOptions.includes(upsertKey)) {
+      setUpsertKey('')
+    }
+    setConflictColumns((current) => current.filter((key) => targetPropertyOptions.includes(key)))
+  }, [targetPropertyOptions, upsertEnabled, upsertKey])
 
   useEffect(() => {
     if (!schema) return
@@ -243,6 +336,10 @@ export default function MappingEditor(props: Props) {
 
   const runDry = useCallback(async () => {
     if (!schema) return
+    if (upsertInvalid) {
+      setUpsertError('Upsert 已开启，请选择唯一键字段。')
+      return
+    }
     if (!hasSamples) {
       setDryRunReport({ total: 0, ok: 0, failed: 0, errors: [{ rowIndex: 0, message: '需要至少一条样本记录，请返回上一步重新选择数据源。' }] })
       return
@@ -258,6 +355,13 @@ export default function MappingEditor(props: Props) {
       setDryRunReport(report)
       if (onDraftChange) {
         if (report.failed === 0 && sourceFilePath) {
+          const upsert = upsertEnabled && upsertKey
+            ? {
+                dedupeKey: upsertKey,
+                strategy: upsertStrategy,
+                conflictColumns,
+              }
+            : undefined
           onDraftChange({
             tokenId,
             databaseId,
@@ -267,15 +371,35 @@ export default function MappingEditor(props: Props) {
             previewRecords: records,
             mappings,
             defaults: defaults && Object.keys(defaults).length > 0 ? defaults : undefined,
+            upsert,
           })
+          setDraftFingerprint(currentFingerprint)
         } else {
           onDraftChange(null)
+          setDraftFingerprint(null)
         }
       }
     } finally {
       setDryRunLoading(false)
     }
-  }, [schema, hasSamples, parseDefaults, previewRecords, mappings, sourceFilePath, onDraftChange, tokenId, databaseId, fileType, previewFields])
+  }, [
+    schema,
+    hasSamples,
+    parseDefaults,
+    previewRecords,
+    mappings,
+    sourceFilePath,
+    onDraftChange,
+    tokenId,
+    databaseId,
+    fileType,
+    previewFields,
+    upsertEnabled,
+    upsertKey,
+    upsertStrategy,
+    conflictColumns,
+    currentFingerprint,
+  ])
 
   const openTransformEditor = useCallback((index: number) => {
     const current = mappings[index]
@@ -417,17 +541,18 @@ export default function MappingEditor(props: Props) {
         <button className="primary" disabled={savingTemplate} onClick={saveTemplate}>{savingTemplate ? '保存中…' : '保存模板'}</button>
         <button
           className="ghost"
-          disabled={dryRunLoading || !schema || !hasSamples || defaultsError !== null || incompleteMappings > 0}
+          disabled={dryRunLoading || !schema || !hasSamples || defaultsError !== null || incompleteMappings > 0 || upsertInvalid}
           onClick={runDry}
         >
           {dryRunLoading ? '校验中…' : 'Dry-run 校验'}
         </button>
       </div>
 
-      {(defaultsError || incompleteMappings > 0) && (
+      {(defaultsError || incompleteMappings > 0 || upsertError) && (
         <div className="error" style={{ marginBottom: 8 }}>
           {defaultsError && <div>默认值错误：{defaultsError}</div>}
           {incompleteMappings > 0 && <div>仍有 {incompleteMappings} 条映射缺少源字段或目标属性。</div>}
+          {upsertError && <div>{upsertError}</div>}
         </div>
       )}
 
@@ -440,6 +565,67 @@ export default function MappingEditor(props: Props) {
           style={{ width: '100%', fontFamily: 'monospace' }}
         />
         {defaultsError && <p className="error">{defaultsError}</p>}
+      </section>
+
+      <section style={{ marginBottom: 12 }}>
+        <h4>Upsert 配置</h4>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <input
+            type="checkbox"
+            checked={upsertEnabled}
+            onChange={(e) => {
+              const next = e.target.checked
+              setUpsertEnabled(next)
+              if (!next) {
+                setUpsertKey('')
+                setConflictColumns([])
+                setUpsertStrategy('skip')
+              }
+            }}
+          />
+          <span>启用 Upsert / 增量导入</span>
+        </label>
+        {upsertEnabled && (
+          <div style={{ display: 'grid', gap: 12 }}>
+            <div>
+              <label style={{ display: 'block', fontWeight: 600, marginBottom: 4 }}>唯一键字段</label>
+              <select
+                value={upsertKey}
+                onChange={(e) => setUpsertKey(e.target.value)}
+                disabled={targetPropertyOptions.length === 0}
+              >
+                <option value="">选择唯一键字段</option>
+                {targetPropertyOptions.map((opt) => (
+                  <option key={opt} value={opt}>{opt}</option>
+                ))}
+              </select>
+              {targetPropertyOptions.length === 0 && (
+                <p className="muted" style={{ marginTop: 4 }}>暂无可用的目标属性，请先完成映射。</p>
+              )}
+              <p className="muted" style={{ marginTop: 4 }}>选择用来匹配现有页面的 Notion 属性，仅支持单项。</p>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontWeight: 600, marginBottom: 4 }}>冲突策略</label>
+              <select value={upsertStrategy} onChange={(e) => setUpsertStrategy(e.target.value as UpsertStrategy)}>
+                <option value="skip">Skip（跳过已有记录）</option>
+                <option value="overwrite">Overwrite（覆盖现有记录）</option>
+                <option value="merge">Merge（仅更新映射字段）</option>
+              </select>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontWeight: 600, marginBottom: 4 }}>冲突报告字段（可选）</label>
+              <MultiSelectField
+                options={targetPropertyOptions}
+                selected={conflictColumns}
+                onChange={setConflictColumns}
+                placeholder="选择需要在报告中展示的字段"
+                disabled={targetPropertyOptions.length === 0}
+                emptyHint="暂无可用字段，请先映射目标属性。"
+              />
+              <p className="muted" style={{ marginTop: 4 }}>在冲突行导出中额外展示这些字段，便于核对。</p>
+            </div>
+          </div>
+        )}
       </section>
 
       <section style={{ marginBottom: 12 }}>
@@ -534,6 +720,142 @@ export default function MappingEditor(props: Props) {
               <p className="muted">输出：<code>{transformEditor.result}</code></p>
             )}
           </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+type MultiSelectFieldProps = {
+  options: string[]
+  selected: string[]
+  onChange: (next: string[]) => void
+  placeholder?: string
+  disabled?: boolean
+  emptyHint?: string
+}
+
+function MultiSelectField({ options, selected, onChange, placeholder = '请选择', disabled = false, emptyHint }: MultiSelectFieldProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const [open, setOpen] = useState(false)
+
+  const orderedSelected = useMemo(() => {
+    const inOptions = options.filter((opt) => selected.includes(opt))
+    const extra = selected.filter((value) => !options.includes(value))
+    return [...inOptions, ...extra]
+  }, [options, selected])
+
+  const noOptionAvailable = options.length === 0
+  const isDisabled = disabled || noOptionAvailable
+
+  useEffect(() => {
+    if (!open) return
+    const handleClickOutside = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    document.addEventListener('keydown', handleEscape)
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (isDisabled) {
+      setOpen(false)
+    }
+  }, [isDisabled])
+
+  const toggleOption = useCallback((value: string) => {
+    if (isDisabled) return
+    const next = new Set(selected)
+    if (next.has(value)) {
+      next.delete(value)
+    } else {
+      next.add(value)
+    }
+    const ordered = options.filter((opt) => next.has(opt))
+    const leftovers = Array.from(next).filter((opt) => !options.includes(opt))
+    onChange([...ordered, ...leftovers])
+  }, [isDisabled, onChange, options, selected])
+
+  const clearSelection = useCallback(() => {
+    if (isDisabled) return
+    onChange([])
+  }, [isDisabled, onChange])
+
+  const hasSelection = orderedSelected.length > 0
+  const placeholderText = noOptionAvailable ? (emptyHint ?? placeholder) : placeholder
+
+  return (
+    <div
+      className={`multi-select-field${open ? ' open' : ''}${isDisabled ? ' disabled' : ''}`}
+      ref={containerRef}
+    >
+      <button
+        type="button"
+        className={`multi-select-trigger${!hasSelection ? ' placeholder' : ''}`}
+        onClick={() => {
+          if (isDisabled) return
+          setOpen((prev) => !prev)
+        }}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-disabled={isDisabled}
+        disabled={isDisabled}
+      >
+        {hasSelection ? (
+          <span className="multi-select-badges">
+            {orderedSelected.map((value) => (
+              <span key={value} className="multi-select-badge">{value}</span>
+            ))}
+          </span>
+        ) : (
+          <span className="multi-select-placeholder">{placeholderText}</span>
+        )}
+        <span className="multi-select-caret" aria-hidden="true">▾</span>
+      </button>
+      {hasSelection && !isDisabled && (
+        <button
+          type="button"
+          className="multi-select-clear"
+          onClick={(event) => {
+            event.stopPropagation()
+            clearSelection()
+          }}
+          aria-label="清除已选择的字段"
+        >
+          ×
+        </button>
+      )}
+      {open && (
+        <div className="multi-select-dropdown" role="listbox" aria-multiselectable="true">
+          {options.map((opt) => {
+            const checked = selected.includes(opt)
+            return (
+              <label key={opt} className={`multi-select-option${checked ? ' checked' : ''}`}>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggleOption(opt)}
+                />
+                <span>{opt}</span>
+              </label>
+            )
+          })}
+          {noOptionAvailable && (
+            <div className="multi-select-empty">
+              {emptyHint ?? '暂无可选项'}
+            </div>
+          )}
         </div>
       )}
     </div>

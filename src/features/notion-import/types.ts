@@ -28,7 +28,7 @@ export type FieldMapping = {
 export type UpsertStrategy = 'skip' | 'overwrite' | 'merge'
 
 export type ImportUpsertConfig = {
-  dedupeKeys: string[]
+  dedupeKey: string
   strategy: UpsertStrategy
   conflictColumns?: string[]
 }
@@ -175,6 +175,14 @@ export type ExportFailedResult = {
   jobId: string
   path: string
   total: number
+}
+
+export type ImportHistoryPage = {
+  items: ImportJobSummary[]
+  total: number
+  page: number
+  pageSize: number
+  hasMore: boolean
 }
 
 export type ImportQueueSnapshot = {

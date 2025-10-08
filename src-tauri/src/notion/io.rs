@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 use thiserror::Error;
 
@@ -65,9 +65,20 @@ impl RecordStream {
                     .map(|h| h.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
 
                 if target_index > 0 {
-                    for _ in 0..target_index {
-                        if reader.records().next().is_none() {
-                            break;
+                    let mut seek_applied = false;
+                    if position.byte_offset > 0 {
+                        let mut csv_pos = csv::Position::new();
+                        csv_pos.set_byte(position.byte_offset);
+                        csv_pos.set_record(target_index as u64);
+                        if reader.seek(csv_pos.clone()).is_ok() {
+                            seek_applied = true;
+                        }
+                    }
+                    if !seek_applied {
+                        for _ in 0..target_index {
+                            if reader.records().next().is_none() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -87,16 +98,21 @@ impl RecordStream {
                 let mut reader = BufReader::new(file);
                 let mut skipped = 0usize;
                 let mut buf = String::new();
-                while skipped < position.record_index {
-                    buf.clear();
-                    let bytes = reader.read_line(&mut buf)?;
-                    if bytes == 0 {
-                        break;
+                if position.byte_offset > 0 {
+                    reader.seek(SeekFrom::Start(position.byte_offset))?;
+                    skipped = position.record_index;
+                } else {
+                    while skipped < position.record_index {
+                        buf.clear();
+                        let bytes = reader.read_line(&mut buf)?;
+                        if bytes == 0 {
+                            break;
+                        }
+                        if buf.trim().is_empty() {
+                            continue;
+                        }
+                        skipped += 1;
                     }
-                    if buf.trim().is_empty() {
-                        continue;
-                    }
-                    skipped += 1;
                 }
 
                 let byte_offset = reader.stream_position()?;
