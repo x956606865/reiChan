@@ -686,7 +686,6 @@ const MangaUpscaleAgent = () => {
   );
   const [jobParams, setJobParams] =
     useState<JobParamsConfig>(DEFAULT_JOB_PARAMS);
-  const [contentSplitEnabled, setContentSplitEnabled] = useState(false);
   const [splitAlgorithm, setSplitAlgorithm] =
     useState<SplitAlgorithmOption>('edgeTexture');
   const [edgeBrightnessThresholds, setEdgeBrightnessThresholds] =
@@ -1984,13 +1983,6 @@ const MangaUpscaleAgent = () => {
   }, [isMultiVolumeSource, selectedVolumeKey, volumeMappings]);
 
   useEffect(() => {
-    if (isMultiVolumeSource && contentSplitEnabled) {
-      setContentSplitEnabled(false);
-      resetSplitState();
-    }
-  }, [contentSplitEnabled, isMultiVolumeSource, resetSplitState]);
-
-  useEffect(() => {
     if (splitPreparing) {
       return;
     }
@@ -2306,8 +2298,8 @@ const MangaUpscaleAgent = () => {
   );
 
   const handlePrepareSplit = useCallback(async () => {
-    if (!contentSplitEnabled) {
-      setSplitError('请先启用内容感知拆分开关。');
+    if (isMultiVolumeSource) {
+      setSplitError('多卷目录暂不支持内容感知拆分。');
       return;
     }
     const [bright, dark] = edgeBrightnessThresholds;
@@ -2327,29 +2319,16 @@ const MangaUpscaleAgent = () => {
     await ensureSplitWorkspace(true);
   }, [
     computeEdgeThresholdErrors,
-    contentSplitEnabled,
     edgeBrightnessThresholds,
     edgeSearchRatios,
     computeEdgeSearchRatioErrors,
     ensureSplitWorkspace,
+    isMultiVolumeSource,
   ]);
 
   const handleCloseManualDrawer = useCallback(() => {
     setManualDrawerOpen(false);
   }, []);
-
-  const handleToggleSplit = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const enabled = event.currentTarget.checked;
-      setContentSplitEnabled(enabled);
-      if (!enabled) {
-        resetSplitState();
-      } else {
-        setSplitError(null);
-      }
-    },
-    [resetSplitState]
-  );
 
   const runRename = useCallback(
     async (dryRun: boolean) => {
@@ -2418,7 +2397,7 @@ const MangaUpscaleAgent = () => {
               reportPath: null,
               summary: null,
             };
-          } else if (contentSplitEnabled) {
+          } else if (!isMultiVolumeSource) {
             const ensured = await ensureSplitWorkspace(false);
             if (!ensured) {
               return;
@@ -2470,7 +2449,6 @@ const MangaUpscaleAgent = () => {
       }
     },
     [
-      contentSplitEnabled,
       ensureSplitWorkspace,
       isMultiVolumeSource,
       mappingConfirmed,
@@ -2489,7 +2467,6 @@ const MangaUpscaleAgent = () => {
 
         if (field === 'directory') {
           resetSplitState();
-          setContentSplitEnabled(false);
           setSplitEstimate(null);
           setSourceAnalysis(null);
           setVolumeMappings([]);
@@ -4653,26 +4630,9 @@ const MangaUpscaleAgent = () => {
             <p>生成拆分工作区并按需调整手动裁剪，未使用时可直接跳过。</p>
           </header>
 
-        <div className="split-controls">
-          <div className="split-toggle-row">
-            <label className="form-field checkbox">
-              <input
-                type="checkbox"
-                checked={contentSplitEnabled}
-                onChange={handleToggleSplit}
-                disabled={isMultiVolumeSource}
-              />
-              <span>内容感知双页拆分（实验性）</span>
-            </label>
-          </div>
+          <div className="split-controls">
 
-          {isMultiVolumeSource && (
-            <p className="status status-tip">
-              多卷来源暂不支持内容感知拆分。
-            </p>
-          )}
-
-          {contentSplitEnabled && !isMultiVolumeSource && (
+          {!isMultiVolumeSource && (
             <div className="split-settings-row manual-split-row">
               <label className="form-field compact split-settings-field">
                 <span className="field-label">拆分算法</span>
@@ -4823,7 +4783,7 @@ const MangaUpscaleAgent = () => {
             </div>
           )}
 
-            {splitAlgorithm !== 'manual' && splitEstimate && (
+            {!isMultiVolumeSource && splitAlgorithm !== 'manual' && splitEstimate && (
               <p className="status status-tip">
                 预估拆分候选：{splitEstimate.candidates} / {splitEstimate.total}
               </p>
@@ -4835,7 +4795,7 @@ const MangaUpscaleAgent = () => {
               </p>
             )}
 
-            {contentSplitEnabled && !isMultiVolumeSource && (
+            {!isMultiVolumeSource && (
               <div className="split-summary">
                 {(splitPreparing || splitProgress) && (
                   <div
