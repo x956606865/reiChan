@@ -625,11 +625,7 @@ fn apply_defaults(
             continue;
         }
 
-        let target_type = mappings
-            .iter()
-            .find(|m| m.target_property == *prop_name)
-            .map(|m| m.target_type.clone())
-            .ok_or_else(|| format!("defaults references unknown property '{}'", prop_name))?;
+        let (target_type, payload) = extract_default_payload(prop_name, default_value, mappings)?;
 
         let stub = FieldMapping {
             include: true,
@@ -638,11 +634,43 @@ fn apply_defaults(
             target_type,
             transform_code: None,
         };
-        let entry = build_property_entry(&stub, default_value)
+        let entry = build_property_entry(&stub, &payload)
             .map_err(|err| format!("defaults for '{}' mapping error: {}", prop_name, err))?;
         props.insert(prop_name.clone(), entry);
     }
     Ok(())
+}
+
+fn extract_default_payload(
+    prop_name: &str,
+    raw: &Value,
+    mappings: &[FieldMapping],
+) -> Result<(String, Value), String> {
+    if let Some(obj) = raw.as_object() {
+        let is_flagged = obj
+            .get("__reiDefault")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
+        if is_flagged {
+            let target_type = obj
+                .get("targetType")
+                .and_then(|val| val.as_str())
+                .ok_or_else(|| format!("defaults for '{}' missing targetType", prop_name))?;
+            let payload = obj
+                .get("value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            return Ok((target_type.to_string(), payload));
+        }
+    }
+
+    let target_type = mappings
+        .iter()
+        .find(|m| m.target_property == prop_name)
+        .map(|m| m.target_type.clone())
+        .ok_or_else(|| format!("defaults references unknown property '{}'", prop_name))?;
+
+    Ok((target_type, raw.clone()))
 }
 
 fn build_lookup_properties(

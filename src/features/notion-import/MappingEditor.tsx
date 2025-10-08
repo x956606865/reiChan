@@ -29,6 +29,14 @@ type TransformEditorState = {
   error?: string
 }
 
+type DefaultRow = {
+  id: string
+  include: boolean
+  targetProperty: string
+  targetType: string
+  value: string
+}
+
 type Props = {
   tokenId: string
   databaseId: string
@@ -60,9 +68,8 @@ export default function MappingEditor(props: Props) {
   const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null)
 
   const [tplSourceFields, setTplSourceFields] = useState<string[]>([])
-
-  const [defaultsJson, setDefaultsJson] = useState(() => JSON.stringify(draft?.defaults ?? {}, null, 2))
-  const [defaultsError, setDefaultsError] = useState<string | null>(null)
+  const defaultRowSeq = useRef(0)
+  const [defaultRows, setDefaultRows] = useState<DefaultRow[]>([])
 
   const [dryRunLoading, setDryRunLoading] = useState(false)
   const [dryRunReport, setDryRunReport] = useState<DryRunReport | null>(null)
@@ -128,11 +135,21 @@ useEffect(() => {
   useEffect(() => {
     if (draft && draft.mappings.length > 0 && mappings.length === 0) {
       setMappings(draft.mappings)
-      if (draft.defaults) {
-        setDefaultsJson(JSON.stringify(draft.defaults, null, 2))
-      }
     }
   }, [draft, mappings.length])
+
+  useEffect(() => {
+    if (draft?.defaults) {
+      setDefaultRows(() => {
+        const rows = convertDefaultsToRows(draft.defaults, schema)
+        defaultRowSeq.current = rows.length
+        return rows
+      })
+    } else if (draft) {
+      setDefaultRows([])
+      defaultRowSeq.current = 0
+    }
+  }, [draft, schema])
 
   useEffect(() => {
     if (draft?.upsert) {
@@ -171,10 +188,9 @@ useEffect(() => {
     )
   }, [mappings])
 
-  const normalizedDefaultsJson = useMemo(() => {
-    const trimmed = defaultsJson.trim()
-    return trimmed.length > 0 ? trimmed : ''
-  }, [defaultsJson])
+  const defaultInfo = useMemo(() => buildDefaultsFromRows(defaultRows, schema), [defaultRows, schema])
+  const defaultsError = defaultInfo.error ? defaultInfo.error : null
+  const defaultsObject = defaultInfo.defaults
 
   const currentFingerprint = useMemo(() => {
     const upsertPayload = upsertEnabled && upsertKey
@@ -184,13 +200,20 @@ useEffect(() => {
           conflictColumns: [...conflictColumns].sort(),
         }
       : null
+    const defaultFingerprint = defaultRows.map((row) => ({
+      include: row.include,
+      targetProperty: row.targetProperty,
+      targetType: row.targetType,
+      value: row.value,
+    }))
     return JSON.stringify({
       tokenId,
       databaseId,
       sourceFilePath,
       fileType,
       mappings,
-      defaults: normalizedDefaultsJson,
+      defaults: defaultsObject,
+      defaultRows: defaultFingerprint,
       upsert: upsertPayload,
     })
   }, [
@@ -199,7 +222,8 @@ useEffect(() => {
     sourceFilePath,
     fileType,
     mappings,
-    normalizedDefaultsJson,
+    defaultsObject,
+    defaultRows,
     upsertEnabled,
     upsertStrategy,
     upsertKey,
@@ -266,6 +290,21 @@ useEffect(() => {
     })
   }, [schema])
 
+  const addDefaultRow = useCallback(() => {
+    setDefaultRows((current) => {
+      const nextId = defaultRowSeq.current + 1
+      defaultRowSeq.current = nextId
+      const defaultType = schema?.properties[0]?.type ?? 'rich_text'
+      return [...current, {
+        id: `default-${nextId}`,
+        include: true,
+        targetProperty: '',
+        targetType: defaultType,
+        value: '',
+      }]
+    })
+  }, [schema])
+
   const updateRow = useCallback((index: number, patch: Partial<FieldMapping>) => {
     setMappings((current) => current.map((row, idx) => (idx === index ? { ...row, ...patch } : row)))
   }, [])
@@ -274,39 +313,28 @@ useEffect(() => {
     setMappings((current) => current.filter((_, idx) => idx !== index))
   }, [])
 
-  const applyTemplate = useCallback((tpl: ImportTemplate) => {
-    setMappings(tpl.mappings ?? [])
-    if (tpl.defaults) {
-      setDefaultsJson(JSON.stringify(tpl.defaults, null, 2))
-    }
-    const fields = (tpl.mappings ?? []).map((m) => m.sourceField).filter(Boolean)
-    setTplSourceFields(Array.from(new Set(fields)))
+  const updateDefaultRow = useCallback((id: string, patch: Partial<DefaultRow>) => {
+    setDefaultRows((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)))
   }, [])
 
-  const parseDefaults = useCallback((): Record<string, unknown> | undefined => {
-    try {
-      const trimmed = defaultsJson.trim()
-      if (trimmed.length === 0) {
-        setDefaultsError(null)
-        return {}
-      }
-      const parsed = JSON.parse(trimmed)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        setDefaultsError(null)
-        return parsed as Record<string, unknown>
-      }
-      setDefaultsError('defaults 需为对象，例如 {"status": "已导入"}')
-      return undefined
-    } catch (err) {
-      setDefaultsError(err instanceof Error ? err.message : String(err))
-      return undefined
-    }
-  }, [defaultsJson])
+  const removeDefaultRow = useCallback((id: string) => {
+    setDefaultRows((current) => current.filter((row) => row.id !== id))
+  }, [])
+
+  const applyTemplate = useCallback((tpl: ImportTemplate) => {
+    setMappings(tpl.mappings ?? [])
+    setDefaultRows(() => {
+      const rows = convertDefaultsToRows(tpl.defaults ?? {}, schema)
+      defaultRowSeq.current = rows.length
+      return rows
+    })
+    const fields = (tpl.mappings ?? []).map((m) => m.sourceField).filter(Boolean)
+    setTplSourceFields(Array.from(new Set(fields)))
+  }, [schema])
 
   const saveTemplate = useCallback(async () => {
     if (!schema) return
-    const defaults = parseDefaults()
-    if (defaults === undefined) return
+    if (defaultsError) return
     try {
       setSavingTemplate(true)
       const payload: ImportTemplate = {
@@ -314,7 +342,7 @@ useEffect(() => {
         tokenId,
         databaseId,
         mappings,
-        defaults,
+        defaults: defaultsObject,
       }
       await invoke<ImportTemplate>('notion_template_save', { tpl: payload })
       setTplName(DEFAULT_TEMPLATE_NAME)
@@ -322,7 +350,7 @@ useEffect(() => {
     } finally {
       setSavingTemplate(false)
     }
-  }, [schema, tplName, tokenId, databaseId, mappings, parseDefaults, loadTemplates])
+  }, [schema, tplName, tokenId, databaseId, mappings, defaultsError, defaultsObject, loadTemplates])
 
   const deleteTemplate = useCallback(async (id: string) => {
     try {
@@ -344,13 +372,13 @@ useEffect(() => {
       setDryRunReport({ total: 0, ok: 0, failed: 0, errors: [{ rowIndex: 0, message: '需要至少一条样本记录，请返回上一步重新选择数据源。' }] })
       return
     }
-    const defaults = parseDefaults()
-    if (defaults === undefined) return
+    if (defaultsError) return
+    const defaultsPayload = defaultsObject && Object.keys(defaultsObject).length > 0 ? defaultsObject : undefined
     setDryRunLoading(true)
     setDryRunReport(null)
     try {
       const records = previewRecords.slice(0, 20)
-      const input: DryRunInput = defaults && Object.keys(defaults).length > 0 ? { schema, mappings, records, defaults } : { schema, mappings, records }
+      const input: DryRunInput = defaultsPayload ? { schema, mappings, records, defaults: defaultsPayload } : { schema, mappings, records }
       const report = await invoke<DryRunReport>('notion_import_dry_run', { input })
       setDryRunReport(report)
       if (onDraftChange) {
@@ -370,7 +398,7 @@ useEffect(() => {
             fields: previewFields,
             previewRecords: records,
             mappings,
-            defaults: defaults && Object.keys(defaults).length > 0 ? defaults : undefined,
+            defaults: defaultsPayload,
             upsert,
           })
           setDraftFingerprint(currentFingerprint)
@@ -385,7 +413,6 @@ useEffect(() => {
   }, [
     schema,
     hasSamples,
-    parseDefaults,
     previewRecords,
     mappings,
     sourceFilePath,
@@ -398,6 +425,8 @@ useEffect(() => {
     upsertKey,
     upsertStrategy,
     conflictColumns,
+    defaultsError,
+    defaultsObject,
     currentFingerprint,
   ])
 
@@ -470,7 +499,7 @@ useEffect(() => {
           <thead>
             <tr>
               <th style={{ width: 70 }}>包含</th>
-              <th>源字段</th>
+          <th>源字段 / 默认值</th>
               <th>目标属性</th>
               <th style={{ width: 100 }}>类型</th>
               <th style={{ width: 120 }}>Transform</th>
@@ -479,7 +508,7 @@ useEffect(() => {
           </thead>
           <tbody>
             {mappings.map((mapping, index) => (
-              <tr key={index}>
+              <tr key={`mapping-${index}`}>
                 <td>
                   <input type="checkbox" checked={mapping.include} onChange={(e) => updateRow(index, { include: e.target.checked })} />
                 </td>
@@ -521,8 +550,47 @@ useEffect(() => {
                 </td>
               </tr>
             ))}
-            {mappings.length === 0 && (
-              <tr><td colSpan={6} className="muted">暂无映射，请添加。</td></tr>
+            {defaultRows.map((row) => (
+              <tr key={row.id} className="default-row">
+                <td>
+                  <input type="checkbox" checked={row.include} onChange={(e) => updateDefaultRow(row.id, { include: e.target.checked })} />
+                </td>
+                <td>
+                  <input
+                    type="text"
+                    value={row.value}
+                    onChange={(e) => updateDefaultRow(row.id, { value: e.target.value })}
+                    placeholder="默认值（可写 JSON）"
+                  />
+                  <div className="muted" style={{ fontSize: 12 }}>默认值</div>
+                </td>
+                <td>
+                  <select
+                    value={row.targetProperty}
+                    onChange={(e) => {
+                      const name = e.target.value
+                      const t = schema?.properties.find((p) => p.name === name)?.type || row.targetType
+                      updateDefaultRow(row.id, { targetProperty: name, targetType: t })
+                    }}
+                  >
+                    <option value="">选择属性</option>
+                    {schema?.properties.map((prop) => (
+                      <option key={prop.name} value={prop.name}>
+                        {prop.name}
+                        {prop.required ? ' *' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td><code>{row.targetType}</code></td>
+                <td><span className="muted">—</span></td>
+                <td>
+                  <button className="ghost" onClick={() => removeDefaultRow(row.id)}>删除</button>
+                </td>
+              </tr>
+            ))}
+            {mappings.length === 0 && defaultRows.length === 0 && (
+              <tr><td colSpan={6} className="muted">暂无映射，请添加或设置默认值。</td></tr>
             )}
           </tbody>
         </table>
@@ -536,6 +604,7 @@ useEffect(() => {
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
         <button className="ghost" onClick={addRow}>添加映射</button>
+        <button className="ghost" onClick={addDefaultRow}>添加默认值</button>
         <div style={{ flex: 1 }} />
         <input type="text" value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder="模板名称" />
         <button className="primary" disabled={savingTemplate} onClick={saveTemplate}>{savingTemplate ? '保存中…' : '保存模板'}</button>
@@ -555,17 +624,6 @@ useEffect(() => {
           {upsertError && <div>{upsertError}</div>}
         </div>
       )}
-
-      <section style={{ marginBottom: 12 }}>
-        <h4>默认值（JSON）</h4>
-        <textarea
-          value={defaultsJson}
-          onChange={(e) => setDefaultsJson(e.target.value)}
-          rows={6}
-          style={{ width: '100%', fontFamily: 'monospace' }}
-        />
-        {defaultsError && <p className="error">{defaultsError}</p>}
-      </section>
 
       <section style={{ marginBottom: 12 }}>
         <h4>Upsert 配置</h4>
@@ -868,6 +926,150 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+const DEFAULT_META_FLAG = '__reiDefault'
+
+type SerializedDefaultValue = {
+  [DEFAULT_META_FLAG]: true
+  targetType: string
+  value: unknown
+}
+
+function buildDefaultsFromRows(rows: DefaultRow[], schema: DatabaseSchema | null): {
+  defaults?: Record<string, unknown>
+  error?: string
+} {
+  if (!rows || rows.length === 0) {
+    return { defaults: undefined }
+  }
+  const errors: string[] = []
+  const defaults: Record<string, unknown> = {}
+  const seen = new Set<string>()
+  rows.forEach((row, idx) => {
+    if (!row.include) {
+      return
+    }
+    const property = row.targetProperty.trim()
+    if (!property) {
+      errors.push(`第 ${idx + 1} 条默认值缺少目标属性`)
+      return
+    }
+    if (schema && !schema.properties.some((prop) => prop.name === property)) {
+      errors.push(`默认值属性 ${property} 不在当前数据库 schema 中`)
+      return
+    }
+    if (seen.has(property)) {
+      errors.push(`默认值属性 ${property} 重复设置`)
+      return
+    }
+    const raw = row.value.trim()
+    if (raw.length === 0) {
+      errors.push(`属性 ${property} 缺少默认值内容`)
+      return
+    }
+    seen.add(property)
+    const payload = {
+      [DEFAULT_META_FLAG]: true,
+      targetType: row.targetType,
+      value: interpretDefaultValue(raw),
+    } as SerializedDefaultValue
+    defaults[property] = payload
+  })
+  if (errors.length > 0) {
+    return { error: errors.join('；') }
+  }
+  return { defaults: Object.keys(defaults).length > 0 ? defaults : undefined }
+}
+
+function convertDefaultsToRows(defaults: Record<string, unknown>, schema: DatabaseSchema | null): DefaultRow[] {
+  const entries = Object.entries(defaults ?? {})
+  if (entries.length === 0) {
+    return []
+  }
+  return entries.map(([name, raw], index) => {
+    const property = schema?.properties.find((prop) => prop.name === name)
+    const parsed = parseSerializedDefault(raw)
+    const targetType = parsed?.targetType ?? property?.type ?? inferTargetTypeFromValue(parsed?.value ?? raw)
+    const rawValue = parsed?.value ?? raw
+    return {
+      id: `default-${index + 1}`,
+      include: true,
+      targetProperty: name,
+      targetType,
+      value: formatDefaultValueForInput(rawValue),
+    }
+  })
+}
+
+function interpretDefaultValue(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (trimmed === '') {
+    return ''
+  }
+  if (trimmed === 'true' || trimmed === 'false') {
+    return trimmed === 'true'
+  }
+  if (trimmed === 'null') {
+    return null
+  }
+  if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+    const num = Number(trimmed)
+    if (!Number.isNaN(num)) {
+      return num
+    }
+  }
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      // ignore fallthrough
+    }
+  }
+  return raw
+}
+
+function parseSerializedDefault(raw: unknown): SerializedDefaultValue | undefined {
+  if (raw && typeof raw === 'object' && DEFAULT_META_FLAG in raw) {
+    const obj = raw as Record<string, unknown>
+    if (obj[DEFAULT_META_FLAG] === true && typeof obj.targetType === 'string') {
+      return {
+        __reiDefault: true,
+        targetType: obj.targetType,
+        value: 'value' in obj ? (obj.value as unknown) : undefined,
+      }
+    }
+  }
+  return undefined
+}
+
+function formatDefaultValueForInput(value: unknown): string {
+  if (typeof value === 'undefined') {
+    return ''
+  }
+  if (typeof value === 'string') {
+    return value
+  }
+  if (value === null) {
+    return 'null'
+  }
+  return safeStringify(value)
+}
+
+function inferTargetTypeFromValue(value: unknown): string {
+  if (typeof value === 'number') {
+    return 'number'
+  }
+  if (typeof value === 'boolean') {
+    return 'checkbox'
+  }
+  if (Array.isArray(value)) {
+    return 'multi_select'
+  }
+  if (value && typeof value === 'object') {
+    return 'rich_text'
+  }
+  return 'rich_text'
 }
 
 function mapErrorKind(kind: DryRunErrorKind): string {

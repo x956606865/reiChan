@@ -805,6 +805,8 @@ pub fn notion_import_dry_run(input: DryRunInput) -> Result<DryRunReport, String>
 
         if !defaults_obj.is_empty() {
             for (prop_name, default_value) in defaults_obj.iter() {
+                let (target_override, payload) =
+                    extract_default_payload_for_validation(prop_name, default_value)?;
                 let property = match property_map.get(prop_name) {
                     Some(prop) => prop,
                     None => {
@@ -831,7 +833,7 @@ pub fn notion_import_dry_run(input: DryRunInput) -> Result<DryRunReport, String>
                     continue;
                 }
 
-                if let Err(msg) = validate_schema_constraints(property, default_value) {
+                if let Err(msg) = validate_schema_constraints(property, &payload) {
                     failed += 1;
                     errors.push(RowError {
                         row_index: idx,
@@ -846,11 +848,11 @@ pub fn notion_import_dry_run(input: DryRunInput) -> Result<DryRunReport, String>
                     include: true,
                     source_field: prop_name.clone(),
                     target_property: prop_name.clone(),
-                    target_type: property.type_.clone(),
+                    target_type: target_override.unwrap_or_else(|| property.type_.clone()),
                     transform_code: None,
                 };
 
-                match build_property_entry(&stub, default_value) {
+                match build_property_entry(&stub, &payload) {
                     Ok(entry) => {
                         if let Err(msg) = validate_option_values(property, &entry) {
                             failed += 1;
@@ -1469,6 +1471,28 @@ fn validate_option_values(property: &DatabaseProperty, entry: &Value) -> Result<
         }
         _ => Ok(()),
     }
+}
+
+fn extract_default_payload_for_validation(
+    prop_name: &str,
+    raw: &Value,
+) -> Result<(Option<String>, Value), String> {
+    if let Some(obj) = raw.as_object() {
+        if obj
+            .get("__reiDefault")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let target_type = obj
+                .get("targetType")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("defaults for '{}' missing targetType", prop_name))?;
+            let payload = obj.get("value").cloned().unwrap_or(Value::Null);
+            return Ok((Some(target_type.to_string()), payload));
+        }
+    }
+
+    Ok((None, raw.clone()))
 }
 
 fn property_value_has_content(property: &DatabaseProperty, value: &Value) -> bool {
