@@ -74,6 +74,29 @@ pub struct FieldMapping {
     pub transform_code: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpsertStrategy {
+    Skip,
+    Overwrite,
+    Merge,
+}
+
+fn default_upsert_strategy() -> UpsertStrategy {
+    UpsertStrategy::Skip
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportUpsertConfig {
+    #[serde(default)]
+    pub dedupe_keys: Vec<String>,
+    #[serde(default = "default_upsert_strategy")]
+    pub strategy: UpsertStrategy,
+    #[serde(default)]
+    pub conflict_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportTemplate {
@@ -155,6 +178,10 @@ pub struct ImportJobRequest {
     pub rate_limit: Option<u32>,
     #[serde(default)]
     pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub upsert: Option<ImportUpsertConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,4 +197,105 @@ pub struct ImportJobSummary {
     pub job_id: String,
     pub state: JobState,
     pub progress: JobProgress,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub lease_expires_at: Option<i64>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    pub database_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub ended_at: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub rps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictType {
+    Skip,
+    Overwrite,
+    Merge,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowErrorSummary {
+    pub row_index: usize,
+    pub error_code: Option<String>,
+    pub error_message: String,
+    #[serde(default)]
+    pub conflict_type: Option<ConflictType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgressEvent {
+    pub job_id: String,
+    pub state: JobState,
+    pub progress: JobProgress,
+    pub rps: Option<f64>,
+    pub recent_errors: Vec<RowErrorSummary>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub lease_expires_at: Option<i64>,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportLogEvent {
+    pub job_id: String,
+    pub level: ImportLogLevel,
+    pub message: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDoneEvent {
+    pub job_id: String,
+    pub state: JobState,
+    pub progress: JobProgress,
+    pub rps: Option<f64>,
+    pub finished_at: i64,
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub conflict_total: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFailedResult {
+    pub job_id: String,
+    pub path: String,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportQueueSnapshot {
+    pub running: Vec<ImportJobSummary>,
+    pub waiting: Vec<ImportJobSummary>,
+    pub paused: Vec<ImportJobSummary>,
+    pub timestamp: i64,
 }

@@ -1,5 +1,6 @@
 use serde_json::{Map, Value};
 use std::fs::File;
+use std::io::{BufRead, BufReader, Seek};
 use std::path::Path;
 use thiserror::Error;
 
@@ -24,6 +25,10 @@ enum RecordStreamInner {
         reader: csv::Reader<File>,
         headers: Vec<String>,
     },
+    JsonLines {
+        reader: BufReader<File>,
+        line_buf: String,
+    },
     JsonArray {
         data: Vec<Value>,
         index: usize,
@@ -42,12 +47,13 @@ impl RecordStream {
         position: StreamPosition,
     ) -> Result<(Self, StreamPosition), RecordStreamError> {
         let path = path.as_ref();
-        match path
+        let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase())
-        {
-            Some(ext) if ext == "csv" => {
+            .map(|ext| ext.to_ascii_lowercase());
+
+        match extension.as_deref() {
+            Some("csv") => {
                 let file = File::open(path)?;
                 let target_index = position.record_index;
                 let mut reader = csv::ReaderBuilder::new()
@@ -76,7 +82,38 @@ impl RecordStream {
                     },
                 ))
             }
-            Some(ext) if ext == "json" || ext == "jsonl" || ext == "jsonlines" => {
+            Some("jsonl") | Some("jsonlines") => {
+                let file = File::open(path)?;
+                let mut reader = BufReader::new(file);
+                let mut skipped = 0usize;
+                let mut buf = String::new();
+                while skipped < position.record_index {
+                    buf.clear();
+                    let bytes = reader.read_line(&mut buf)?;
+                    if bytes == 0 {
+                        break;
+                    }
+                    if buf.trim().is_empty() {
+                        continue;
+                    }
+                    skipped += 1;
+                }
+
+                let byte_offset = reader.stream_position()?;
+                Ok((
+                    Self {
+                        inner: RecordStreamInner::JsonLines {
+                            reader,
+                            line_buf: String::new(),
+                        },
+                    },
+                    StreamPosition {
+                        byte_offset,
+                        record_index: skipped,
+                    },
+                ))
+            }
+            Some("json") => {
                 let file = File::open(path)?;
                 let data: Value = serde_json::from_reader(file)?;
                 let values = match data {
@@ -133,6 +170,29 @@ impl RecordStream {
                 position.byte_offset = reader.position().byte();
                 Ok(Some(collected))
             }
+            RecordStreamInner::JsonLines { reader, line_buf } => {
+                let mut collected = Vec::new();
+                while collected.len() < batch_size {
+                    line_buf.clear();
+                    let bytes = reader.read_line(line_buf)?;
+                    if bytes == 0 {
+                        break;
+                    }
+                    let trimmed = line_buf.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(trimmed)?;
+                    collected.push(value);
+                }
+
+                if collected.is_empty() {
+                    return Ok(None);
+                }
+                position.record_index += collected.len();
+                position.byte_offset = reader.stream_position()?;
+                Ok(Some(collected))
+            }
             RecordStreamInner::JsonArray { data, index } => {
                 if *index >= data.len() {
                     return Ok(None);
@@ -181,5 +241,40 @@ mod tests {
         assert_eq!(obj.get("name").unwrap(), "Bob");
         assert_eq!(obj.get("age").unwrap(), "25");
         assert_eq!(resumed_pos.record_index, 2);
+    }
+
+    #[test]
+    fn jsonl_stream_supports_resume() {
+        let mut file = tempfile::Builder::new()
+            .prefix("record-stream")
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        writeln!(file, "{{\"name\":\"Alice\"}}").unwrap();
+        writeln!(file, "{{\"name\":\"Bob\"}}").unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, "{{\"name\":\"Charlie\"}}").unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_path_buf();
+
+        let (mut stream, mut pos) =
+            RecordStream::open(&path, StreamPosition::default()).expect("open jsonl");
+        let first_batch = stream
+            .next_batch(2, &mut pos)
+            .expect("batch")
+            .expect("rows present");
+        assert_eq!(first_batch.len(), 2);
+        assert_eq!(first_batch[0]["name"], "Alice");
+        assert_eq!(first_batch[1]["name"], "Bob");
+
+        let (mut resumed, mut resume_pos) =
+            RecordStream::open(&path, pos.clone()).expect("reopen jsonl");
+        let remaining = resumed
+            .next_batch(10, &mut resume_pos)
+            .expect("batch")
+            .expect("remaining rows");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["name"], "Charlie");
+        assert_eq!(resume_pos.record_index, 3);
     }
 }

@@ -27,9 +27,9 @@ pub struct ManualSplitContextRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ManualSplitContextEntry {
     pub source_path: PathBuf,
-   pub display_name: String,
-   pub width: u32,
-   pub height: u32,
+    pub display_name: String,
+    pub width: u32,
+    pub height: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_lines: Option<[f32; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1123,9 +1123,8 @@ pub fn apply_manual_splits(
             let mut created_this_round: Vec<PathBuf> = Vec::new();
             let outputs_for_entry: Vec<PathBuf> = match item.image_kind {
                 ManualImageKind::Content => {
-                    let outputs =
-                        derive_manual_output_paths(&workspace, &manual_dir, &item.source)
-                            .map_err(ManualSplitError::InvalidOverrides)?;
+                    let outputs = derive_manual_output_paths(&workspace, &manual_dir, &item.source)
+                        .map_err(ManualSplitError::InvalidOverrides)?;
 
                     for path in [
                         &outputs.left_root,
@@ -1217,12 +1216,9 @@ pub fn apply_manual_splits(
             let width_f = width as f32;
             let pixel_values = match item.image_kind {
                 ManualImageKind::Content => [left_trim, left_end, right_start, right_trim],
-                ManualImageKind::Cover | ManualImageKind::Spread => [
-                    left_trim,
-                    left_trim,
-                    right_trim,
-                    right_trim,
-                ],
+                ManualImageKind::Cover | ManualImageKind::Spread => {
+                    [left_trim, left_trim, right_trim, right_trim]
+                }
             };
             let sanitized = [
                 (pixel_values[0] as f32 / width_f).clamp(0.0, 1.0),
@@ -2556,7 +2552,10 @@ mod tests {
         let (rotated_width, rotated_height) = spread_image.dimensions();
         assert_eq!(rotated_width, 900, "width should match original height");
         let expected_width = override_pixels[3].saturating_sub(override_pixels[0]);
-        assert_eq!(rotated_height, expected_width, "height should match cropped width");
+        assert_eq!(
+            rotated_height, expected_width,
+            "height should match cropped width"
+        );
 
         let split_report_path = response.split_report_path.expect("split report path");
         let split_report_data = fs::read_to_string(&split_report_path).unwrap();
@@ -2705,13 +2704,12 @@ mod tests {
     }
 
     fn write_mock_image(path: &Path, width: u32, height: u32) {
-        let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(width, height, |x, y| {
-                let r = (x % 256) as u8;
-                let g = (y % 256) as u8;
-                let b = ((x + y) % 256) as u8;
-                Rgba([r, g, b, 255])
-            });
+        let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
+            let r = (x % 256) as u8;
+            let g = (y % 256) as u8;
+            let b = ((x + y) % 256) as u8;
+            Rgba([r, g, b, 255])
+        });
         DynamicImage::ImageRgba8(buffer)
             .save_with_format(path, ImageFormat::Png)
             .unwrap();

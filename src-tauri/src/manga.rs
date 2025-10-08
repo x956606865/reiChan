@@ -495,12 +495,14 @@ fn build_manifest_manual_entry(entry: &ManualOverrideEntry) -> ManifestManualEnt
         EdgeTextureAcceleratorPreference::Gpu => "gpu".to_string(),
     });
 
-    let image_kind = Some(match entry.image_kind {
-        ManualImageKind::Content => "content",
-        ManualImageKind::Cover => "cover",
-        ManualImageKind::Spread => "spread",
-    }
-    .to_string());
+    let image_kind = Some(
+        match entry.image_kind {
+            ManualImageKind::Content => "content",
+            ManualImageKind::Cover => "cover",
+            ManualImageKind::Spread => "spread",
+        }
+        .to_string(),
+    );
 
     ManifestManualEntry {
         source: source_name,

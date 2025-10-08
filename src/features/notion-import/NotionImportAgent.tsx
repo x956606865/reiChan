@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import MappingEditor from "./MappingEditor";
-import type { DatabaseBrief as DbBrief, PreviewResponse, ImportJobDraft } from "./types";
+import Runboard from "./Runboard";
+import { useNotionImportRunboard } from "./runboardStore";
+import type { DatabaseBrief as DbBrief, PreviewResponse, ImportJobDraft, ImportJobSummary } from "./types";
 
 type TokenRow = {
   id: string;
@@ -75,9 +77,55 @@ export default function NotionImportAgent() {
   const [selectedDb, setSelectedDb] = useState<DbBrief | null>(null);
   const [previewInfo, setPreviewInfo] = useState<{ path: string; fileType: string; data: PreviewResponse } | null>(null);
   const [jobDraft, setJobDraft] = useState<ImportJobDraft | null>(null);
+  const [showRunboard, setShowRunboard] = useState(false);
+
+  const startImport = useNotionImportRunboard((state) => state.actions.start);
+  const hydrateRunboard = useNotionImportRunboard((state) => state.actions.hydrate);
+  const jobState = useNotionImportRunboard((state) => state.job?.state ?? null);
 
   const stepOrder = [1, 2, 3, 4] as const;
   const stepIndexMap = useMemo(() => new Map([[1, 1], [2, 2], [3, 3], [4, 4]]), []);
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const jobs = await invoke<ImportJobSummary[]>("notion_import_list_jobs");
+        if (!mounted) return;
+        if (jobs.length > 0) {
+          await hydrateRunboard(jobs[0]);
+          if (mounted) setShowRunboard(true);
+        } else {
+          await hydrateRunboard(null);
+        }
+      } catch (err) {
+        console.warn("failed to hydrate import jobs", err);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [hydrateRunboard]);
+
+  useEffect(() => {
+    if (!jobState) return;
+    if (jobState !== "Completed" && jobState !== "Failed" && jobState !== "Canceled") {
+      setShowRunboard(true);
+    }
+  }, [jobState]);
+
+  const handleStartImport = useCallback(async (draft: ImportJobDraft) => {
+    try {
+      await startImport(draft);
+      setShowRunboard(true);
+    } catch (err) {
+      console.error(err);
+      alert(`启动导入失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [startImport]);
+
+  const handleRunboardBack = useCallback(() => {
+    setShowRunboard(false);
+  }, []);
   const backToTokenStep = useCallback(() => setStep(1), []);
 
   return (
@@ -172,8 +220,12 @@ export default function NotionImportAgent() {
             previewRecords={previewInfo.data.records}
             draft={jobDraft}
             onDraftChange={setJobDraft}
+            onStartImport={handleStartImport}
             onPrev={() => setStep(3)}
           />
+          {showRunboard && (
+            <Runboard onBack={handleRunboardBack} />
+          )}
         </section>
       )}
     </div>

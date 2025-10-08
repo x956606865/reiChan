@@ -1,4 +1,42 @@
 use super::types::{DatabaseBrief, DatabasePage, DatabaseProperty, DatabaseSchema, WorkspaceInfo};
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone)]
+pub struct CreatePageRequest {
+    pub database_id: String,
+    pub properties: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CreatePageResponse {
+    pub page_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotionApiErrorKind {
+    RateLimited,
+    Temporary,
+    Validation,
+    Unauthorized,
+    NotFound,
+    Conflict,
+    Other,
+}
+
+impl NotionApiErrorKind {
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Temporary)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NotionApiError {
+    pub kind: NotionApiErrorKind,
+    pub message: String,
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub retry_after_ms: Option<u64>,
+}
 
 pub trait NotionAdapter: Send + Sync {
     fn test_connection(&self, token: &str) -> Result<WorkspaceInfo, String>;
@@ -16,6 +54,11 @@ pub trait NotionAdapter: Send + Sync {
     ) -> Result<DatabasePage, String>;
     fn get_database_schema(&self, token: &str, database_id: &str)
         -> Result<DatabaseSchema, String>;
+    fn create_page(
+        &self,
+        token: &str,
+        request: CreatePageRequest,
+    ) -> Result<CreatePageResponse, NotionApiError>;
 }
 
 /// A placeholder adapter that does not perform network calls.
@@ -148,6 +191,14 @@ impl NotionAdapter for MockNotionAdapter {
             title: format!("{} (Mock)", database_id),
             properties: props,
         })
+    }
+
+    fn create_page(
+        &self,
+        _token: &str,
+        _request: CreatePageRequest,
+    ) -> Result<CreatePageResponse, NotionApiError> {
+        Ok(CreatePageResponse::default())
     }
 }
 
@@ -389,5 +440,68 @@ impl NotionAdapter for HttpNotionAdapter {
             title,
             properties,
         })
+    }
+
+    fn create_page(
+        &self,
+        token: &str,
+        request: CreatePageRequest,
+    ) -> Result<CreatePageResponse, NotionApiError> {
+        use serde_json::json;
+        let client = Self::client_with_token(token);
+        let url = "https://api.notion.com/v1/pages";
+        let payload = json!({
+            "parent": { "database_id": request.database_id },
+            "properties": request.properties,
+        });
+        let response = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Notion-Version", "2022-06-28")
+            .json(&payload)
+            .send()
+            .map_err(|err| NotionApiError {
+                kind: NotionApiErrorKind::Temporary,
+                message: err.to_string(),
+                status: None,
+                code: None,
+                retry_after_ms: None,
+            })?;
+
+        if response.status().is_success() {
+            let json: serde_json::Value = response
+                .json()
+                .unwrap_or_else(|_| serde_json::json!({}));
+            println!("[notion] create_page success: {}", json);
+            let page_id = json
+                .get("id")
+                .and_then(|val| val.as_str())
+                .map(|s| s.to_string());
+            Ok(CreatePageResponse { page_id })
+        } else {
+            let status = response.status();
+            let retry_after_ms = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|header| header.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| seconds.saturating_mul(1000));
+            let body = response.text().unwrap_or_default();
+            let kind = match status.as_u16() {
+                401 | 403 => NotionApiErrorKind::Unauthorized,
+                404 => NotionApiErrorKind::NotFound,
+                409 => NotionApiErrorKind::Conflict,
+                429 => NotionApiErrorKind::RateLimited,
+                code if code >= 500 => NotionApiErrorKind::Temporary,
+                _ => NotionApiErrorKind::Validation,
+            };
+            Err(NotionApiError {
+                kind,
+                message: body,
+                status: Some(status.as_u16()),
+                code: None,
+                retry_after_ms,
+            })
+        }
     }
 }

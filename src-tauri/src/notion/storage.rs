@@ -202,7 +202,7 @@ impl TokenStore for SqliteTokenStore {
 // Import job storage (M3)
 // -----------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImportJobRowStatus {
     Ok,
@@ -235,6 +235,7 @@ pub struct ImportJobRecord {
     pub token_id: String,
     pub database_id: String,
     pub source_file_path: String,
+    pub created_at: i64,
     pub state: JobState,
     pub progress: JobProgress,
     pub config_snapshot_json: String,
@@ -244,6 +245,8 @@ pub struct ImportJobRecord {
     pub rps: Option<f64>,
     pub last_error: Option<String>,
     pub last_heartbeat: Option<i64>,
+    pub priority: i32,
+    pub lease_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +257,8 @@ pub struct ImportJobRowRecord {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub error_payload_json: Option<String>,
+    pub conflict_type: Option<String>,
+    pub previous_snapshot_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +270,9 @@ pub struct NewImportJob {
     pub config_snapshot_json: String,
     pub total: Option<usize>,
     pub created_at: i64,
+    pub priority: i32,
+    pub lease_expires_at: Option<i64>,
+    pub conflict_total: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -273,6 +281,8 @@ pub struct ProgressUpdate {
     pub done: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub conflicts: usize,
+    pub conflict_total: Option<usize>,
     pub next_offset: Option<usize>,
     pub rps: Option<f64>,
     pub last_error: Option<String>,
@@ -302,6 +312,8 @@ pub trait ImportJobStore: Send + Sync {
     fn insert_job(&self, job: NewImportJob) -> Result<ImportJobRecord, String>;
     fn update_progress(&self, job_id: &str, update: ProgressUpdate) -> Result<(), String>;
     fn mark_state(&self, job_id: &str, transition: StateTransition) -> Result<(), String>;
+    fn touch_lease(&self, job_id: &str, lease_expires_at: Option<i64>) -> Result<(), String>;
+    fn set_priority(&self, job_id: &str, priority: i32) -> Result<(), String>;
     fn append_row_results(&self, rows: Vec<ImportJobRowRecord>) -> Result<(), String>;
     fn load_job(&self, job_id: &str) -> Result<Option<ImportJobRecord>, String>;
     fn list_pending_jobs(&self) -> Result<Vec<ImportJobRecord>, String>;
@@ -310,11 +322,13 @@ pub trait ImportJobStore: Send + Sync {
         job_id: &str,
         limit: usize,
     ) -> Result<Vec<ImportJobRowRecord>, String>;
+    fn list_failed_rows(&self, job_id: &str) -> Result<Vec<ImportJobRowRecord>, String>;
 }
 
 fn job_state_to_str(state: JobState) -> &'static str {
     match state {
         JobState::Pending => "pending",
+        JobState::Queued => "queued",
         JobState::Running => "running",
         JobState::Paused => "paused",
         JobState::Completed => "succeeded",
@@ -326,6 +340,7 @@ fn job_state_to_str(state: JobState) -> &'static str {
 fn job_state_from_str(state: &str) -> JobState {
     match state {
         "pending" => JobState::Pending,
+        "queued" => JobState::Queued,
         "running" => JobState::Running,
         "paused" => JobState::Paused,
         "succeeded" | "completed" => JobState::Completed,
@@ -337,6 +352,14 @@ fn job_state_from_str(state: &str) -> JobState {
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+fn extract_timestamp_from_id(job_id: &str) -> i64 {
+    job_id
+        .rsplit('-')
+        .next()
+        .and_then(|fragment| fragment.parse::<i64>().ok())
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -367,12 +390,14 @@ impl ImportJobStore for InMemoryJobStore {
             token_id: job.token_id.clone(),
             database_id: job.database_id.clone(),
             source_file_path: job.source_file_path.clone(),
+            created_at: job.created_at,
             state: JobState::Pending,
             progress: JobProgress {
                 total: job.total,
                 done: 0,
                 failed: 0,
                 skipped: 0,
+                conflict_total: job.conflict_total,
             },
             config_snapshot_json: job.config_snapshot_json.clone(),
             started_at: None,
@@ -381,6 +406,8 @@ impl ImportJobStore for InMemoryJobStore {
             rps: None,
             last_error: None,
             last_heartbeat: Some(job.created_at),
+            priority: job.priority,
+            lease_expires_at: job.lease_expires_at,
         };
         guard.jobs.insert(job.id.clone(), record.clone());
         Ok(record)
@@ -398,6 +425,13 @@ impl ImportJobStore for InMemoryJobStore {
         job.progress.done += update.done;
         job.progress.failed += update.failed;
         job.progress.skipped += update.skipped;
+        if update.conflicts > 0 {
+            let entry = job.progress.conflict_total.get_or_insert(0);
+            *entry += update.conflicts;
+        }
+        if let Some(conflict_total) = update.conflict_total {
+            job.progress.conflict_total = Some(conflict_total);
+        }
         if let Some(offset) = update.next_offset {
             job.next_offset = offset;
         }
@@ -431,6 +465,26 @@ impl ImportJobStore for InMemoryJobStore {
         Ok(())
     }
 
+    fn touch_lease(&self, job_id: &str, lease_expires_at: Option<i64>) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        let job = guard
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| "job not found".to_string())?;
+        job.lease_expires_at = lease_expires_at;
+        Ok(())
+    }
+
+    fn set_priority(&self, job_id: &str, priority: i32) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        let job = guard
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| "job not found".to_string())?;
+        job.priority = priority;
+        Ok(())
+    }
+
     fn append_row_results(&self, rows: Vec<ImportJobRowRecord>) -> Result<(), String> {
         if rows.is_empty() {
             return Ok(());
@@ -452,7 +506,12 @@ impl ImportJobStore for InMemoryJobStore {
         Ok(guard
             .jobs
             .values()
-            .filter(|job| matches!(job.state, JobState::Pending | JobState::Running))
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    JobState::Pending | JobState::Queued | JobState::Running
+                )
+            })
             .cloned()
             .collect())
     }
@@ -472,6 +531,14 @@ impl ImportJobStore for InMemoryJobStore {
         }
         Ok(rows)
     }
+
+    fn list_failed_rows(&self, job_id: &str) -> Result<Vec<ImportJobRowRecord>, String> {
+        let guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
+        let mut rows = guard.rows.get(job_id).cloned().unwrap_or_default();
+        rows.retain(|row| matches!(row.status, ImportJobRowStatus::Failed));
+        rows.sort_by(|a, b| a.row_index.cmp(&b.row_index));
+        Ok(rows)
+    }
 }
 
 #[cfg(feature = "notion-sqlite")]
@@ -487,7 +554,13 @@ struct JobTableCapabilities {
     has_rps: bool,
     has_last_error: bool,
     has_last_heartbeat: bool,
+    has_priority: bool,
+    has_lease_expires_at: bool,
+    has_conflict_total: bool,
+    has_created_at: bool,
     has_error_payload_json: bool,
+    has_conflict_type: bool,
+    has_previous_snapshot_json: bool,
 }
 
 #[cfg(feature = "notion-sqlite")]
@@ -516,6 +589,10 @@ fn detect_caps(path: &PathBuf) -> Result<JobTableCapabilities, String> {
     caps.has_rps = column_names.iter().any(|c| c == "rps");
     caps.has_last_error = column_names.iter().any(|c| c == "last_error");
     caps.has_last_heartbeat = column_names.iter().any(|c| c == "last_heartbeat");
+    caps.has_priority = column_names.iter().any(|c| c == "priority");
+    caps.has_lease_expires_at = column_names.iter().any(|c| c == "lease_expires_at");
+    caps.has_conflict_total = column_names.iter().any(|c| c == "conflict_total");
+    caps.has_created_at = column_names.iter().any(|c| c == "created_at");
 
     let mut row_stmt = conn
         .prepare("PRAGMA table_info(notion_import_job_rows)")
@@ -526,6 +603,8 @@ fn detect_caps(path: &PathBuf) -> Result<JobTableCapabilities, String> {
         .filter_map(Result::ok)
         .collect();
     caps.has_error_payload_json = row_columns.iter().any(|c| c == "error_payload_json");
+    caps.has_conflict_type = row_columns.iter().any(|c| c == "conflict_type");
+    caps.has_previous_snapshot_json = row_columns.iter().any(|c| c == "previous_snapshot_json");
     Ok(caps)
 }
 
@@ -557,10 +636,38 @@ impl ImportJobStore for SqliteJobStore {
             )
             .map_err(|e| e.to_string())?;
         }
+        if self.caps.has_created_at {
+            conn.execute(
+                "UPDATE notion_import_jobs SET created_at = ?2 WHERE id = ?1",
+                params![job.id.as_str(), job.created_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         if self.caps.has_last_heartbeat {
             conn.execute(
                 "UPDATE notion_import_jobs SET last_heartbeat = ?2 WHERE id = ?1",
                 params![job.id.as_str(), job.created_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if self.caps.has_priority {
+            conn.execute(
+                "UPDATE notion_import_jobs SET priority = ?2 WHERE id = ?1",
+                params![job.id.as_str(), job.priority],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if self.caps.has_lease_expires_at {
+            conn.execute(
+                "UPDATE notion_import_jobs SET lease_expires_at = ?2 WHERE id = ?1",
+                params![job.id.as_str(), job.lease_expires_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if self.caps.has_conflict_total {
+            conn.execute(
+                "UPDATE notion_import_jobs SET conflict_total = ?2 WHERE id = ?1",
+                params![job.id.as_str(), job.conflict_total.unwrap_or(0) as i64],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -570,51 +677,66 @@ impl ImportJobStore for SqliteJobStore {
     }
 
     fn update_progress(&self, job_id: &str, update: ProgressUpdate) -> Result<(), String> {
-        use rusqlite::Connection;
+        use rusqlite::{params_from_iter, types::Value, Connection};
         let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
         let mut sql = String::from(
             "UPDATE notion_import_jobs SET done = done + ?2, failed = failed + ?3, skipped = skipped + ?4",
         );
-        let mut params: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::from(job_id.to_string()),
-            rusqlite::types::Value::from(update.done as i64),
-            rusqlite::types::Value::from(update.failed as i64),
-            rusqlite::types::Value::from(update.skipped as i64),
+        let mut params: Vec<Value> = vec![
+            Value::from(job_id.to_string()),
+            Value::from(update.done as i64),
+            Value::from(update.failed as i64),
+            Value::from(update.skipped as i64),
         ];
+
+        let mut append_value = |fragment: &str, value: Value| {
+            let index = params.len() + 1;
+            let clause = fragment.replace("{}", &index.to_string());
+            sql.push_str(&clause);
+            params.push(value);
+        };
+
         if let Some(total) = update.total {
-            sql.push_str(", total = ?5");
-            params.push(rusqlite::types::Value::from(total as i64));
+            append_value(", total = ?{}", Value::from(total as i64));
         }
-        let mut index = 5 + if update.total.is_some() { 1 } else { 0 };
+
+        if self.caps.has_conflict_total {
+            if let Some(total) = update.conflict_total {
+                append_value(", conflict_total = ?{}", Value::from(total as i64));
+            } else if update.conflicts > 0 {
+                append_value(
+                    ", conflict_total = COALESCE(conflict_total, 0) + ?{}",
+                    Value::from(update.conflicts as i64),
+                );
+            }
+        }
+
         if self.caps.has_next_offset {
             if let Some(offset) = update.next_offset {
-                sql.push_str(&format!(", next_offset = ?{}", index));
-                params.push(rusqlite::types::Value::from(offset as i64));
-                index += 1;
+                append_value(", next_offset = ?{}", Value::from(offset as i64));
             }
         }
+
         if self.caps.has_rps {
             if let Some(rps) = update.rps {
-                sql.push_str(&format!(", rps = ?{}", index));
-                params.push(rusqlite::types::Value::from(rps));
-                index += 1;
+                append_value(", rps = ?{}", Value::from(rps));
             }
         }
+
         if self.caps.has_last_error {
             if let Some(err) = update.last_error {
-                sql.push_str(&format!(", last_error = ?{}", index));
-                params.push(rusqlite::types::Value::from(err));
-                index += 1;
+                append_value(", last_error = ?{}", Value::from(err));
             }
         }
+
         if self.caps.has_last_heartbeat {
             let hb = update.heartbeat_at.unwrap_or_else(now_ms);
-            sql.push_str(&format!(", last_heartbeat = ?{}", index));
-            params.push(rusqlite::types::Value::from(hb));
+            append_value(", last_heartbeat = ?{}", Value::from(hb));
         }
+
         sql.push_str(" WHERE id = ?1");
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        stmt.execute(rusqlite::params_from_iter(params.into_iter()))
+        stmt.execute(params_from_iter(params.into_iter()))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -656,6 +778,34 @@ impl ImportJobStore for SqliteJobStore {
         Ok(())
     }
 
+    fn touch_lease(&self, job_id: &str, lease_expires_at: Option<i64>) -> Result<(), String> {
+        use rusqlite::Connection;
+        if !self.caps.has_lease_expires_at {
+            return Ok(());
+        }
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE notion_import_jobs SET lease_expires_at = ?2 WHERE id = ?1",
+            params![job_id, lease_expires_at],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn set_priority(&self, job_id: &str, priority: i32) -> Result<(), String> {
+        use rusqlite::Connection;
+        if !self.caps.has_priority {
+            return Ok(());
+        }
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE notion_import_jobs SET priority = ?2 WHERE id = ?1",
+            (job_id, priority),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn append_row_results(&self, rows: Vec<ImportJobRowRecord>) -> Result<(), String> {
         use rusqlite::{params, Connection, TransactionBehavior};
         if rows.is_empty() {
@@ -684,6 +834,25 @@ impl ImportJobStore for SqliteJobStore {
                 ],
             )
             .map_err(|e| e.to_string())?;
+
+            if self.caps.has_conflict_type {
+                tx.execute(
+                    "UPDATE notion_import_job_rows SET conflict_type = ?3 WHERE job_id = ?1 AND row_index = ?2",
+                    params![row.job_id, row.row_index as i64, row.conflict_type.clone()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            if self.caps.has_previous_snapshot_json {
+                tx.execute(
+                    "UPDATE notion_import_job_rows SET previous_snapshot_json = ?3 WHERE job_id = ?1 AND row_index = ?2",
+                    params![
+                        row.job_id,
+                        row.row_index as i64,
+                        row.previous_snapshot_json.clone()
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
@@ -695,6 +864,12 @@ impl ImportJobStore for SqliteJobStore {
         let mut columns = String::from(
             "id, token_id, database_id, source_file_path, status, total, done, failed, skipped, started_at, ended_at, config_snapshot_json",
         );
+        if self.caps.has_created_at {
+            columns.push_str(", created_at");
+        }
+        if self.caps.has_created_at {
+            columns.push_str(", created_at");
+        }
         if self.caps.has_next_offset {
             columns.push_str(", next_offset");
         }
@@ -706,6 +881,24 @@ impl ImportJobStore for SqliteJobStore {
         }
         if self.caps.has_last_heartbeat {
             columns.push_str(", last_heartbeat");
+        }
+        if self.caps.has_priority {
+            columns.push_str(", priority");
+        }
+        if self.caps.has_lease_expires_at {
+            columns.push_str(", lease_expires_at");
+        }
+        if self.caps.has_conflict_total {
+            columns.push_str(", conflict_total");
+        }
+        if self.caps.has_priority {
+            columns.push_str(", priority");
+        }
+        if self.caps.has_lease_expires_at {
+            columns.push_str(", lease_expires_at");
+        }
+        if self.caps.has_conflict_total {
+            columns.push_str(", conflict_total");
         }
         let sql = format!("SELECT {} FROM notion_import_jobs WHERE id = ?1", columns);
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -738,6 +931,13 @@ impl ImportJobStore for SqliteJobStore {
                     col_index += 1;
                     let config_snapshot_json: String = row.get(col_index)?;
                     col_index += 1;
+                    let created_at = if self.caps.has_created_at {
+                        let val: i64 = row.get(col_index)?;
+                        col_index += 1;
+                        val
+                    } else {
+                        extract_timestamp_from_id(&id)
+                    };
                     let next_offset = if self.caps.has_next_offset {
                         let offset: i64 = row.get(col_index)?;
                         col_index += 1;
@@ -761,7 +961,29 @@ impl ImportJobStore for SqliteJobStore {
                     };
                     let last_heartbeat = if self.caps.has_last_heartbeat {
                         let val: Option<i64> = row.get(col_index)?;
+                        col_index += 1;
                         val
+                    } else {
+                        None
+                    };
+                    let priority = if self.caps.has_priority {
+                        let val: i64 = row.get(col_index)?;
+                        col_index += 1;
+                        val as i32
+                    } else {
+                        0
+                    };
+                    let lease_expires_at = if self.caps.has_lease_expires_at {
+                        let val: Option<i64> = row.get(col_index)?;
+                        col_index += 1;
+                        val
+                    } else {
+                        None
+                    };
+                    let conflict_total = if self.caps.has_conflict_total {
+                        let val: Option<i64> = row.get(col_index)?;
+                        col_index += 1;
+                        val.map(|v| v.max(0) as usize)
                     } else {
                         None
                     };
@@ -771,12 +993,14 @@ impl ImportJobStore for SqliteJobStore {
                         token_id,
                         database_id,
                         source_file_path,
+                        created_at,
                         state: job_state_from_str(&status),
                         progress: JobProgress {
                             total: total.map(|v| v as usize),
                             done: done.max(0) as usize,
                             failed: failed.max(0) as usize,
                             skipped: skipped.max(0) as usize,
+                            conflict_total,
                         },
                         config_snapshot_json,
                         started_at,
@@ -785,6 +1009,8 @@ impl ImportJobStore for SqliteJobStore {
                         rps,
                         last_error,
                         last_heartbeat,
+                        priority,
+                        lease_expires_at,
                     })
                 },
             )
@@ -812,7 +1038,7 @@ impl ImportJobStore for SqliteJobStore {
             columns.push_str(", last_heartbeat");
         }
         let sql = format!(
-            "SELECT {} FROM notion_import_jobs WHERE status IN ('pending','running','paused')",
+            "SELECT {} FROM notion_import_jobs WHERE status IN ('pending','queued','running','paused')",
             columns
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -843,6 +1069,13 @@ impl ImportJobStore for SqliteJobStore {
                 col_index += 1;
                 let config_snapshot_json: String = row.get(col_index)?;
                 col_index += 1;
+                let created_at = if self.caps.has_created_at {
+                    let val: i64 = row.get(col_index)?;
+                    col_index += 1;
+                    val
+                } else {
+                    extract_timestamp_from_id(&id)
+                };
                 let next_offset = if self.caps.has_next_offset {
                     let offset: i64 = row.get(col_index)?;
                     col_index += 1;
@@ -866,7 +1099,29 @@ impl ImportJobStore for SqliteJobStore {
                 };
                 let last_heartbeat = if self.caps.has_last_heartbeat {
                     let val: Option<i64> = row.get(col_index)?;
+                    col_index += 1;
                     val
+                } else {
+                    None
+                };
+                let priority = if self.caps.has_priority {
+                    let val: i64 = row.get(col_index)?;
+                    col_index += 1;
+                    val as i32
+                } else {
+                    0
+                };
+                let lease_expires_at = if self.caps.has_lease_expires_at {
+                    let val: Option<i64> = row.get(col_index)?;
+                    col_index += 1;
+                    val
+                } else {
+                    None
+                };
+                let conflict_total = if self.caps.has_conflict_total {
+                    let val: Option<i64> = row.get(col_index)?;
+                    col_index += 1;
+                    val.map(|v| v.max(0) as usize)
                 } else {
                     None
                 };
@@ -875,12 +1130,14 @@ impl ImportJobStore for SqliteJobStore {
                     token_id,
                     database_id,
                     source_file_path,
+                    created_at,
                     state: job_state_from_str(&status),
                     progress: JobProgress {
                         total: total.map(|v| v as usize),
                         done: done.max(0) as usize,
                         failed: failed.max(0) as usize,
                         skipped: skipped.max(0) as usize,
+                        conflict_total,
                     },
                     config_snapshot_json,
                     started_at,
@@ -889,6 +1146,8 @@ impl ImportJobStore for SqliteJobStore {
                     rps,
                     last_error,
                     last_heartbeat,
+                    priority,
+                    lease_expires_at,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -909,6 +1168,18 @@ impl ImportJobStore for SqliteJobStore {
         let mut columns = String::from("job_id, row_index, status, error_code, error_message");
         if self.caps.has_error_payload_json {
             columns.push_str(", error_payload_json");
+        }
+        if self.caps.has_conflict_type {
+            columns.push_str(", conflict_type");
+        }
+        if self.caps.has_previous_snapshot_json {
+            columns.push_str(", previous_snapshot_json");
+        }
+        if self.caps.has_conflict_type {
+            columns.push_str(", conflict_type");
+        }
+        if self.caps.has_previous_snapshot_json {
+            columns.push_str(", previous_snapshot_json");
         }
         let sql = format!(
             "SELECT {} FROM notion_import_job_rows WHERE job_id = ?1 AND status = 'failed' ORDER BY row_index DESC LIMIT ?2",
@@ -932,7 +1203,22 @@ impl ImportJobStore for SqliteJobStore {
                     col_index += 1;
                     let error_payload_json = if self.caps.has_error_payload_json {
                         let payload: Option<String> = row.get(col_index)?;
+                        col_index += 1;
                         payload
+                    } else {
+                        None
+                    };
+                    let conflict_type = if self.caps.has_conflict_type {
+                        let value: Option<String> = row.get(col_index)?;
+                        col_index += 1;
+                        value
+                    } else {
+                        None
+                    };
+                    let previous_snapshot_json = if self.caps.has_previous_snapshot_json {
+                        let value: Option<String> = row.get(col_index)?;
+                        col_index += 1;
+                        value
                     } else {
                         None
                     };
@@ -944,6 +1230,8 @@ impl ImportJobStore for SqliteJobStore {
                         error_code,
                         error_message,
                         error_payload_json,
+                        conflict_type,
+                        previous_snapshot_json,
                     })
                 },
             )
@@ -952,6 +1240,75 @@ impl ImportJobStore for SqliteJobStore {
             .map(|row| row.map_err(|e| e.to_string()))
             .collect::<Result<_, _>>()?;
         out.reverse();
+        Ok(out)
+    }
+
+    fn list_failed_rows(&self, job_id: &str) -> Result<Vec<ImportJobRowRecord>, String> {
+        use rusqlite::{params, Connection};
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        let mut columns = String::from("job_id, row_index, status, error_code, error_message");
+        if self.caps.has_error_payload_json {
+            columns.push_str(", error_payload_json");
+        }
+        let sql = format!(
+            "SELECT {} FROM notion_import_job_rows WHERE job_id = ?1 AND status = 'failed' ORDER BY row_index",
+            columns
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![job_id],
+                |row| -> rusqlite::Result<ImportJobRowRecord> {
+                    let mut col_index = 0;
+                    let job_id: String = row.get(col_index)?;
+                    col_index += 1;
+                    let row_index: i64 = row.get(col_index)?;
+                    col_index += 1;
+                    let status: String = row.get(col_index)?;
+                    col_index += 1;
+                    let error_code: Option<String> = row.get(col_index)?;
+                    col_index += 1;
+                    let error_message: Option<String> = row.get(col_index)?;
+                    col_index += 1;
+                    let error_payload_json = if self.caps.has_error_payload_json {
+                        let payload: Option<String> = row.get(col_index)?;
+                        col_index += 1;
+                        payload
+                    } else {
+                        None
+                    };
+                    let conflict_type = if self.caps.has_conflict_type {
+                        let value: Option<String> = row.get(col_index)?;
+                        col_index += 1;
+                        value
+                    } else {
+                        None
+                    };
+                    let previous_snapshot_json = if self.caps.has_previous_snapshot_json {
+                        let value: Option<String> = row.get(col_index)?;
+                        col_index += 1;
+                        value
+                    } else {
+                        None
+                    };
+                    Ok(ImportJobRowRecord {
+                        job_id,
+                        row_index: row_index.max(0) as usize,
+                        status: ImportJobRowStatus::from_str(&status)
+                            .unwrap_or(ImportJobRowStatus::Failed),
+                        error_code,
+                        error_message,
+                        error_payload_json,
+                        conflict_type,
+                        previous_snapshot_json,
+                    })
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
         Ok(out)
     }
 }

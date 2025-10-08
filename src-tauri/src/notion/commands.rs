@@ -1,31 +1,131 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 #[cfg(feature = "notion-http")]
 use super::adapter::HttpNotionAdapter;
 use super::adapter::{MockNotionAdapter, NotionAdapter};
-use super::job_runner::{JobRunner, JobSnapshot, JobState};
+use super::job_runner::{
+    JobEventEmitter, JobLogEvent, JobLogLevel, JobRunner, JobSnapshot, JobState,
+};
 use super::mapping::build_property_entry;
 use super::preview::{preview_file as notion_preview_file, PreviewRequest, PreviewResponse};
-use super::storage::{ImportJobStore, InMemoryJobStore, InMemoryTokenStore, TokenStore};
+use super::storage::{
+    ImportJobRecord, ImportJobStore, InMemoryJobStore, InMemoryTokenStore, NewImportJob,
+    StateTransition, TokenStore,
+};
 #[cfg(feature = "notion-sqlite")]
 use super::storage::{SqliteJobStore, SqliteTokenStore};
+use super::scheduler::{Scheduler, SchedulerConfig, SchedulerDeps};
 use super::transform::{TransformContext, TransformExecutor};
 use super::types::{
-    DatabaseBrief, DatabasePage, DatabaseProperty, DatabaseSchema, DryRunErrorKind, DryRunInput,
-    DryRunReport, FieldMapping, ImportJobHandle, ImportJobRequest, ImportJobSummary,
-    ImportTemplate, RowError, SaveTokenRequest, TokenRow, TransformEvalRequest,
-    TransformEvalResult, WorkspaceInfo,
+    ConflictType, DatabaseBrief, DatabasePage, DatabaseProperty, DatabaseSchema, DryRunErrorKind,
+    DryRunInput, DryRunReport, ExportFailedResult, FieldMapping, ImportDoneEvent,
+    ImportJobHandle, ImportJobRequest, ImportJobSummary, ImportLogEvent, ImportLogLevel,
+    ImportProgressEvent, ImportQueueSnapshot, ImportTemplate, RowError, RowErrorSummary,
+    SaveTokenRequest, TokenRow, TransformEvalRequest, TransformEvalResult, WorkspaceInfo,
 };
+use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn apply_filter_empty_title(list: &mut Vec<DatabaseBrief>, include_empty_title: bool) {
     if !include_empty_title {
         list.retain(|d| !d.title.trim().is_empty());
+    }
+}
+
+struct TauriJobEventEmitter {
+    app: AppHandle,
+    job_store: Arc<dyn ImportJobStore>,
+}
+
+impl TauriJobEventEmitter {
+    fn new(app: AppHandle, job_store: Arc<dyn ImportJobStore>) -> Self {
+        Self { app, job_store }
+    }
+}
+
+impl JobEventEmitter for TauriJobEventEmitter {
+    fn on_snapshot(&self, job_id: &str, snapshot: &JobSnapshot) {
+        let record = self.job_store.load_job(job_id).ok().flatten();
+        let rps = record.as_ref().and_then(|rec| rec.rps);
+        let priority = record.as_ref().map(|rec| rec.priority);
+        let lease_expires_at = record.as_ref().and_then(|rec| rec.lease_expires_at);
+        let errors = self
+            .job_store
+            .list_recent_failures(job_id, 5)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| RowErrorSummary {
+                row_index: row.row_index,
+                error_code: row.error_code,
+                error_message: row.error_message.unwrap_or_default(),
+                conflict_type: row
+                    .conflict_type
+                    .as_deref()
+                    .and_then(|kind| match kind {
+                        "skip" => Some(ConflictType::Skip),
+                        "overwrite" => Some(ConflictType::Overwrite),
+                        "merge" => Some(ConflictType::Merge),
+                        _ => Some(ConflictType::Unknown),
+                    }),
+            })
+            .collect::<Vec<_>>();
+        let event = ImportProgressEvent {
+            job_id: job_id.to_string(),
+            state: snapshot.state.clone(),
+            progress: snapshot.progress.clone(),
+            rps,
+            recent_errors: errors,
+            priority,
+            lease_expires_at,
+            timestamp: Utc::now().timestamp_millis(),
+        };
+        let _ = self.app.emit("notion-import/progress", event);
+    }
+
+    fn on_log(&self, job_id: &str, event: &JobLogEvent) {
+        let mapped = ImportLogEvent {
+            job_id: job_id.to_string(),
+            level: match event.level {
+                JobLogLevel::Info => ImportLogLevel::Info,
+                JobLogLevel::Warn => ImportLogLevel::Warn,
+                JobLogLevel::Error => ImportLogLevel::Error,
+            },
+            message: event.message.clone(),
+            timestamp: event.timestamp,
+        };
+        let _ = self.app.emit("notion-import/log", mapped);
+    }
+
+    fn on_done(&self, job_id: &str, snapshot: &JobSnapshot) {
+        let record = self.job_store.load_job(job_id).ok().flatten();
+        let (rps, last_error, finished_at) = if let Some(ref rec) = record {
+            (
+                rec.rps,
+                rec.last_error.clone(),
+                rec.ended_at
+                    .unwrap_or_else(|| Utc::now().timestamp_millis()),
+            )
+        } else {
+            (None, None, Utc::now().timestamp_millis())
+        };
+        let event = ImportDoneEvent {
+            job_id: job_id.to_string(),
+            state: snapshot.state.clone(),
+            progress: snapshot.progress.clone(),
+            rps,
+            finished_at,
+            last_error,
+            priority: record.as_ref().map(|rec| rec.priority),
+            conflict_total: snapshot.progress.conflict_total,
+        };
+        let _ = self.app.emit("notion-import/done", event);
     }
 }
 
@@ -37,6 +137,7 @@ pub struct NotionState {
     pub templates_mem: Arc<Mutex<Vec<ImportTemplate>>>,
     pub job_runner: Arc<JobRunner>,
     pub job_store: Arc<dyn ImportJobStore>,
+    pub scheduler: Arc<Scheduler>,
 }
 
 impl NotionState {
@@ -44,28 +145,78 @@ impl NotionState {
         store: Arc<dyn TokenStore>,
         adapter: Arc<dyn NotionAdapter>,
         job_store: Arc<dyn ImportJobStore>,
+        job_runner: Arc<JobRunner>,
     ) -> Self {
+        let scheduler = Arc::new(Scheduler::spawn(
+            SchedulerConfig::default(),
+            SchedulerDeps {
+                token_store: Arc::clone(&store),
+                job_store: Arc::clone(&job_store),
+                job_runner: Arc::clone(&job_runner),
+                adapter: Arc::clone(&adapter),
+            },
+        ));
         Self {
             store,
             adapter,
             db_path: None,
             templates_mem: Arc::new(Mutex::new(Vec::new())),
-            job_runner: Arc::new(JobRunner::new()),
+            job_runner,
             job_store,
+            scheduler,
+        }
+    }
+
+    pub fn resume_pending_jobs(&self) {
+        let records = match self.job_store.list_pending_jobs() {
+            Ok(list) => list,
+            Err(_) => return,
+        };
+        for record in records {
+            if self.job_runner.snapshot(&record.id).is_none() {
+                self.job_runner.register_job(record.id.clone());
+                self.job_runner
+                    .update_progress(&record.id, record.progress.clone());
+            }
+            self.job_runner
+                .set_state(&record.id, record.state.clone());
+
+            if matches!(
+                record.state,
+                JobState::Pending | JobState::Queued | JobState::Running
+            ) {
+                let _ = self.job_store.touch_lease(&record.id, None);
+                let _ = self.scheduler.enqueue(record.id.clone());
+            }
         }
     }
 }
 
 pub fn create_default_state() -> NotionState {
-    NotionState::new(
+    let state = NotionState::new(
         Arc::new(InMemoryTokenStore::new()),
         Arc::new(MockNotionAdapter),
         Arc::new(InMemoryJobStore::new()),
-    )
+        Arc::new(JobRunner::new()),
+    );
+    state.resume_pending_jobs();
+    state
+}
+
+pub fn create_default_state_with_handle(app: AppHandle) -> NotionState {
+    let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::new());
+    let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter);
+    let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
+    let emitter: Arc<dyn JobEventEmitter> =
+        Arc::new(TauriJobEventEmitter::new(app, job_store.clone()));
+    let job_runner = Arc::new(JobRunner::with_emitter(emitter));
+    let state = NotionState::new(store, adapter, job_store, job_runner);
+    state.resume_pending_jobs();
+    state
 }
 
 #[cfg(feature = "notion-sqlite")]
-pub fn create_state_with_sqlite(db_path: PathBuf) -> NotionState {
+pub fn create_state_with_sqlite(app: AppHandle, db_path: PathBuf) -> NotionState {
     let store: Arc<dyn TokenStore> = Arc::new(SqliteTokenStore::new(db_path.clone()));
     #[cfg(feature = "notion-http")]
     let adapter: Arc<dyn NotionAdapter> = Arc::new(HttpNotionAdapter);
@@ -75,8 +226,12 @@ pub fn create_state_with_sqlite(db_path: PathBuf) -> NotionState {
     let job_store: Arc<dyn ImportJobStore> = Arc::new(SqliteJobStore::new(db_path.clone()));
     #[cfg(not(feature = "notion-sqlite"))]
     let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
-    let mut state = NotionState::new(store, adapter, job_store);
+    let emitter: Arc<dyn JobEventEmitter> =
+        Arc::new(TauriJobEventEmitter::new(app, job_store.clone()));
+    let job_runner = Arc::new(JobRunner::with_emitter(emitter));
+    let mut state = NotionState::new(store, adapter, job_store, job_runner);
     state.db_path = Some(db_path);
+    state.resume_pending_jobs();
     state
 }
 
@@ -225,7 +380,61 @@ fn snapshot_to_summary(job_id: String, snapshot: JobSnapshot) -> ImportJobSummar
         job_id,
         state: snapshot.state,
         progress: snapshot.progress,
+        priority: None,
+        lease_expires_at: None,
+        token_id: None,
+        database_id: None,
+        created_at: None,
+        started_at: None,
+        ended_at: None,
+        last_error: None,
+        rps: None,
     }
+}
+
+fn record_to_summary(record: ImportJobRecord) -> ImportJobSummary {
+    ImportJobSummary {
+        job_id: record.id,
+        state: record.state,
+        progress: record.progress,
+        priority: Some(record.priority),
+        lease_expires_at: record.lease_expires_at,
+        token_id: Some(record.token_id),
+        database_id: Some(record.database_id),
+        created_at: Some(record.created_at),
+        started_at: record.started_at,
+        ended_at: record.ended_at,
+        last_error: record.last_error,
+        rps: record.rps,
+    }
+}
+
+fn sort_by_priority(entries: &mut Vec<ImportJobSummary>) {
+    entries.sort_by(|a, b| {
+        let pa = a.priority.unwrap_or(0);
+        let pb = b.priority.unwrap_or(0);
+        pb.cmp(&pa)
+            .then_with(|| {
+                let ca = a.created_at.unwrap_or(i64::MAX);
+                let cb = b.created_at.unwrap_or(i64::MAX);
+                ca.cmp(&cb)
+            })
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
+}
+
+fn sort_running(entries: &mut Vec<ImportJobSummary>) {
+    entries.sort_by(|a, b| {
+        let pa = a.priority.unwrap_or(0);
+        let pb = b.priority.unwrap_or(0);
+        pb.cmp(&pa)
+            .then_with(|| {
+                let sa = a.started_at.unwrap_or(i64::MAX);
+                let sb = b.started_at.unwrap_or(i64::MAX);
+                sa.cmp(&sb)
+            })
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
 }
 
 #[tauri::command]
@@ -738,6 +947,88 @@ pub fn notion_import_start(
     state: State<NotionState>,
     req: ImportJobRequest,
 ) -> Result<ImportJobHandle, String> {
+    handle_import_start(&state, req)
+}
+
+#[tauri::command]
+pub fn notion_import_pause(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ImportJobSummary, String> {
+    handle_import_pause(&state, job_id)
+}
+
+#[tauri::command]
+pub fn notion_import_resume(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ImportJobSummary, String> {
+    handle_import_resume(&state, job_id)
+}
+
+#[tauri::command]
+pub fn notion_import_cancel(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ImportJobSummary, String> {
+    handle_import_cancel(&state, job_id)
+}
+
+#[tauri::command]
+pub fn notion_import_get_job(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ImportJobSummary, String> {
+    handle_import_get_job(&state, job_id)
+}
+
+#[tauri::command]
+pub fn notion_import_list_jobs(state: State<NotionState>) -> Result<Vec<ImportJobSummary>, String> {
+    handle_import_list_jobs(&state)
+}
+
+#[tauri::command]
+pub fn notion_import_queue(state: State<NotionState>) -> Result<ImportQueueSnapshot, String> {
+    handle_import_queue_snapshot(&state)
+}
+
+#[tauri::command]
+pub fn notion_import_promote(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ImportJobSummary, String> {
+    handle_import_promote(&state, job_id)
+}
+
+#[tauri::command]
+pub fn notion_import_requeue(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ImportJobSummary, String> {
+    handle_import_requeue(&state, job_id)
+}
+
+#[tauri::command]
+pub fn notion_import_set_priority(
+    state: State<NotionState>,
+    job_id: String,
+    priority: i32,
+) -> Result<ImportJobSummary, String> {
+    handle_import_set_priority(&state, job_id, priority)
+}
+
+#[tauri::command]
+pub fn notion_import_export_failed(
+    state: State<NotionState>,
+    job_id: String,
+) -> Result<ExportFailedResult, String> {
+    handle_export_failed(&state, job_id)
+}
+
+fn handle_import_start(
+    state: &NotionState,
+    req: ImportJobRequest,
+) -> Result<ImportJobHandle, String> {
     let ImportJobRequest {
         job_id,
         token_id,
@@ -748,16 +1039,13 @@ pub fn notion_import_start(
         defaults,
         rate_limit,
         batch_size,
+        priority,
+        upsert,
     } = req;
 
-    let _ = (
-        token_id,
-        database_id,
-        source_file_path,
-        file_type,
-        mappings,
-        defaults,
-    );
+    if state.store.get_token(&token_id).is_none() {
+        return Err("Token not found".to_string());
+    }
 
     let job_id = job_id
         .as_ref()
@@ -765,78 +1053,277 @@ pub fn notion_import_start(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(next_job_id);
 
-    state.job_runner.register_job(job_id.clone());
-    state.job_runner.mark_running(&job_id);
+    let created_at = now_ms();
+    let priority_value = priority.unwrap_or(0);
+    let snapshot_value = serde_json::json!({
+        "version": 1,
+        "tokenId": token_id.clone(),
+        "databaseId": database_id.clone(),
+        "sourceFilePath": source_file_path.clone(),
+        "fileType": file_type,
+        "mappings": mappings,
+        "defaults": defaults,
+        "rateLimit": rate_limit,
+        "batchSize": batch_size,
+        "priority": priority_value,
+        "upsert": upsert,
+    });
+    let config_snapshot_json = serde_json::to_string(&snapshot_value).map_err(|e| e.to_string())?;
 
-    if let (Some(_rate), Some(_batch)) = (rate_limit, batch_size) {
-        // Placeholder for future rate limiting integration
+    let new_job = NewImportJob {
+        id: job_id.clone(),
+        token_id: token_id,
+        database_id: database_id,
+        source_file_path: source_file_path,
+        config_snapshot_json,
+        total: None,
+        created_at,
+        priority: priority_value,
+        lease_expires_at: None,
+        conflict_total: Some(0),
+    };
+
+    let record = state.job_store.insert_job(new_job)?;
+
+    if state.job_runner.snapshot(&job_id).is_none() {
+        state.job_runner.register_job(job_id.clone());
+        state
+            .job_runner
+            .update_progress(&job_id, record.progress.clone());
     }
+    state.job_runner.set_state(&job_id, JobState::Queued);
+
+    state.job_store.mark_state(
+        &job_id,
+        StateTransition {
+            state: JobState::Queued,
+            ..StateTransition::default()
+        },
+    )?;
+    state.job_store.touch_lease(&job_id, None)?;
+
+    state.scheduler.enqueue(job_id.clone())?;
 
     Ok(ImportJobHandle {
         job_id: job_id.clone(),
-        state: JobState::Running,
+        state: JobState::Queued,
     })
 }
 
-#[tauri::command]
-pub fn notion_import_pause(
-    state: State<NotionState>,
-    job_id: String,
-) -> Result<ImportJobSummary, String> {
+fn handle_import_pause(state: &NotionState, job_id: String) -> Result<ImportJobSummary, String> {
+    state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
     state.job_runner.pause(&job_id);
-    let snapshot = state
-        .job_runner
-        .snapshot(&job_id)
+    state.job_store.mark_state(
+        &job_id,
+        StateTransition {
+            state: JobState::Paused,
+            ..StateTransition::default()
+        },
+    )?;
+    let record = state
+        .job_store
+        .load_job(&job_id)?
         .ok_or_else(|| "Job not found".to_string())?;
-    Ok(snapshot_to_summary(job_id, snapshot))
+    Ok(record_to_summary(record))
 }
 
-#[tauri::command]
-pub fn notion_import_resume(
-    state: State<NotionState>,
-    job_id: String,
-) -> Result<ImportJobSummary, String> {
+fn handle_import_resume(state: &NotionState, job_id: String) -> Result<ImportJobSummary, String> {
+    state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
     state.job_runner.resume(&job_id);
-    let snapshot = state
-        .job_runner
-        .snapshot(&job_id)
+    state.job_store.mark_state(
+        &job_id,
+        StateTransition {
+            state: JobState::Running,
+            ..StateTransition::default()
+        },
+    )?;
+    let record = state
+        .job_store
+        .load_job(&job_id)?
         .ok_or_else(|| "Job not found".to_string())?;
-    Ok(snapshot_to_summary(job_id, snapshot))
+    Ok(record_to_summary(record))
 }
 
-#[tauri::command]
-pub fn notion_import_cancel(
-    state: State<NotionState>,
-    job_id: String,
-) -> Result<ImportJobSummary, String> {
+fn handle_import_cancel(state: &NotionState, job_id: String) -> Result<ImportJobSummary, String> {
+    state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
     state.job_runner.cancel(&job_id);
-    let snapshot = state
-        .job_runner
-        .snapshot(&job_id)
+    state.job_store.mark_state(
+        &job_id,
+        StateTransition {
+            state: JobState::Canceled,
+            ended_at: Some(now_ms()),
+            ..StateTransition::default()
+        },
+    )?;
+    let record = state
+        .job_store
+        .load_job(&job_id)?
         .ok_or_else(|| "Job not found".to_string())?;
-    Ok(snapshot_to_summary(job_id, snapshot))
+    Ok(record_to_summary(record))
 }
 
-#[tauri::command]
-pub fn notion_import_get_job(
-    state: State<NotionState>,
+fn handle_import_queue_snapshot(state: &NotionState) -> Result<ImportQueueSnapshot, String> {
+    let mut running = Vec::new();
+    let mut waiting = Vec::new();
+    let mut paused = Vec::new();
+    let records = state.job_store.list_pending_jobs()?;
+    for record in records {
+        let job_state = record.state.clone();
+        let summary = record_to_summary(record);
+        match job_state {
+            JobState::Running => running.push(summary),
+            JobState::Paused => paused.push(summary),
+            JobState::Pending | JobState::Queued => waiting.push(summary),
+            _ => {}
+        }
+    }
+    sort_running(&mut running);
+    sort_by_priority(&mut waiting);
+    sort_by_priority(&mut paused);
+    Ok(ImportQueueSnapshot {
+        running,
+        waiting,
+        paused,
+        timestamp: now_ms(),
+    })
+}
+
+fn handle_import_promote(state: &NotionState, job_id: String) -> Result<ImportJobSummary, String> {
+    let record = state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
+    let previous_priority = record.priority;
+    state.scheduler.promote(job_id.clone())?;
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        if let Some(updated) = state.job_store.load_job(&job_id)? {
+            if updated.priority > previous_priority {
+                return Ok(record_to_summary(updated));
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    handle_import_get_job(state, job_id)
+}
+
+fn handle_import_requeue(state: &NotionState, job_id: String) -> Result<ImportJobSummary, String> {
+    state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
+    state.scheduler.requeue(job_id.clone())?;
+    handle_import_get_job(state, job_id)
+}
+
+fn handle_import_set_priority(
+    state: &NotionState,
     job_id: String,
+    priority: i32,
 ) -> Result<ImportJobSummary, String> {
     state
-        .job_runner
-        .snapshot(&job_id)
-        .map(|snapshot| snapshot_to_summary(job_id, snapshot))
-        .ok_or_else(|| "Job not found".to_string())
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
+    state.job_store.set_priority(&job_id, priority)?;
+    state.scheduler.set_priority(job_id.clone(), priority)?;
+    let record = state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
+    Ok(record_to_summary(record))
 }
 
-#[tauri::command]
-pub fn notion_import_list_jobs(state: State<NotionState>) -> Result<Vec<ImportJobSummary>, String> {
-    Ok(state
-        .job_runner
-        .list()
-        .into_iter()
-        .map(|(job_id, snapshot)| snapshot_to_summary(job_id, snapshot))
-        .collect())
+fn handle_import_get_job(state: &NotionState, job_id: String) -> Result<ImportJobSummary, String> {
+    if let Some(record) = state.job_store.load_job(&job_id)? {
+        Ok(record_to_summary(record))
+    } else {
+        state
+            .job_runner
+            .snapshot(&job_id)
+            .map(|snapshot| snapshot_to_summary(job_id, snapshot))
+            .ok_or_else(|| "Job not found".to_string())
+    }
+}
+
+fn handle_import_list_jobs(state: &NotionState) -> Result<Vec<ImportJobSummary>, String> {
+    let records = state.job_store.list_pending_jobs()?;
+    if records.is_empty() {
+        Ok(state
+            .job_runner
+            .list()
+            .into_iter()
+            .map(|(job_id, snapshot)| snapshot_to_summary(job_id, snapshot))
+            .collect())
+    } else {
+        Ok(records.into_iter().map(record_to_summary).collect())
+    }
+}
+
+fn handle_export_failed(state: &NotionState, job_id: String) -> Result<ExportFailedResult, String> {
+    let job = state
+        .job_store
+        .load_job(&job_id)?
+        .ok_or_else(|| "Job not found".to_string())?;
+    let rows = state.job_store.list_failed_rows(&job_id)?;
+    let mut sanitized = job_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        sanitized = "notion-import-job".into();
+    }
+    let file_name = format!("{}-failed-rows.csv", sanitized);
+    let export_path = std::env::temp_dir().join(file_name);
+    let mut writer = csv::Writer::from_path(&export_path).map_err(|e| e.to_string())?;
+    writer
+        .write_record([
+            "row_index",
+            "error_code",
+            "error_message",
+            "error_payload_json",
+        ])
+        .map_err(|e| e.to_string())?;
+    for row in rows.iter() {
+        writer
+            .write_record([
+                row.row_index.to_string(),
+                row.error_code.clone().unwrap_or_default(),
+                row.error_message.clone().unwrap_or_default(),
+                row.error_payload_json.clone().unwrap_or_default(),
+            ])
+            .map_err(|e| e.to_string())?;
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    let path_str = export_path.to_string_lossy().to_string();
+    state.job_runner.emit_log(
+        &job.id,
+        JobLogLevel::Info,
+        format!("exported {} failed rows to {}", rows.len(), path_str),
+    );
+    Ok(ExportFailedResult {
+        job_id: job.id,
+        path: path_str,
+        total: rows.len(),
+    })
 }
 
 fn validate_schema_constraints(property: &DatabaseProperty, value: &Value) -> Result<(), String> {
@@ -976,6 +1463,9 @@ mod tests {
     use super::*;
     use crate::notion::types::{DatabaseProperty, FieldMapping};
     use serde_json::json;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::Builder;
 
     #[test]
     fn filter_removes_empty_titles_by_default() {
@@ -1084,5 +1574,131 @@ mod tests {
         };
         let res = notion_transform_eval_sample(req).expect("eval");
         assert_eq!(res.result, json!("hi!"));
+    }
+
+    #[test]
+    fn import_start_persists_job_in_store_and_runner() {
+        let state = create_default_state();
+        let token = state
+            .store
+            .save("demo", "secret-token", Some("Workspace".into()));
+
+        let file = Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("create temp file");
+        let path = file.path().to_path_buf();
+        let records = vec![json!({"title": "hello"}), json!({"title": "world"})];
+        serde_json::to_writer(std::fs::File::create(&path).unwrap(), &records).expect("write json");
+
+        let req = ImportJobRequest {
+            job_id: None,
+            token_id: token.id.clone(),
+            database_id: "db-1".into(),
+            source_file_path: path.to_string_lossy().to_string(),
+            file_type: "json".into(),
+            mappings: vec![FieldMapping {
+                include: true,
+                source_field: "title".into(),
+                target_property: "Name".into(),
+                target_type: "title".into(),
+                transform_code: None,
+            }],
+            defaults: None,
+            rate_limit: None,
+            batch_size: None,
+            priority: None,
+            upsert: None,
+        };
+
+        let handle = handle_import_start(&state, req).expect("start job");
+
+        for _ in 0..20 {
+            let record = state
+                .job_store
+                .load_job(&handle.job_id)
+                .expect("load job")
+                .expect("job record");
+            if record.state == JobState::Completed {
+                assert_eq!(record.progress.done, records.len());
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let record = state
+            .job_store
+            .load_job(&handle.job_id)
+            .expect("load job")
+            .expect("job record");
+        assert_eq!(record.id, handle.job_id);
+        assert_eq!(record.state, JobState::Completed);
+
+        let snapshot = state
+            .job_runner
+            .snapshot(&handle.job_id)
+            .expect("job snapshot");
+        assert_eq!(snapshot.state, JobState::Completed);
+    }
+
+    #[test]
+    fn import_pause_resume_cancel_update_store_state() {
+        let state = create_default_state();
+        let job_id = "job-flow".to_string();
+        state
+            .job_store
+            .insert_job(NewImportJob {
+                id: job_id.clone(),
+                token_id: "tok".into(),
+                database_id: "db".into(),
+                source_file_path: "/tmp/data.csv".into(),
+                config_snapshot_json: "{}".into(),
+                total: None,
+                created_at: now_ms(),
+                priority: 0,
+                lease_expires_at: None,
+                conflict_total: Some(0),
+            })
+            .expect("insert job");
+        state
+            .job_store
+            .mark_state(
+                &job_id,
+                StateTransition {
+                    state: JobState::Running,
+                    started_at: Some(now_ms()),
+                    ..StateTransition::default()
+                },
+            )
+            .expect("mark running");
+        state.job_runner.register_job(job_id.clone());
+        state.job_runner.mark_running(&job_id);
+
+        let paused = handle_import_pause(&state, job_id.clone()).expect("pause");
+        assert_eq!(paused.state, JobState::Paused);
+        let paused_record = state
+            .job_store
+            .load_job(&job_id)
+            .expect("load job")
+            .expect("job record");
+        assert_eq!(paused_record.state, JobState::Paused);
+
+        let resumed = handle_import_resume(&state, job_id.clone()).expect("resume");
+        assert_eq!(resumed.state, JobState::Running);
+        let resumed_record = state
+            .job_store
+            .load_job(&job_id)
+            .expect("load job")
+            .expect("job record");
+        assert_eq!(resumed_record.state, JobState::Running);
+
+        let canceled = handle_import_cancel(&state, job_id.clone()).expect("cancel");
+        assert_eq!(canceled.state, JobState::Canceled);
+        let canceled_record = state
+            .job_store
+            .load_job(&job_id)
+            .expect("load job")
+            .expect("job record");
+        assert_eq!(canceled_record.state, JobState::Canceled);
     }
 }

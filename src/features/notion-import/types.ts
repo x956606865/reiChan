@@ -25,6 +25,16 @@ export type FieldMapping = {
   transformCode?: string
 }
 
+export type UpsertStrategy = 'skip' | 'overwrite' | 'merge'
+
+export type ImportUpsertConfig = {
+  dedupeKeys: string[]
+  strategy: UpsertStrategy
+  conflictColumns?: string[]
+}
+
+export type ConflictType = 'skip' | 'overwrite' | 'merge' | 'unknown'
+
 export type ImportTemplate = {
   id?: string | null
   name: string
@@ -82,4 +92,94 @@ export type ImportJobDraft = {
   previewRecords: unknown[]
   mappings: FieldMapping[]
   defaults?: Record<string, unknown>
+  priority?: number
+  upsert?: ImportUpsertConfig
+}
+
+export type JobState =
+  | 'Pending'
+  | 'Queued'
+  | 'Running'
+  | 'Paused'
+  | 'Completed'
+  | 'Failed'
+  | 'Canceled'
+
+export type JobProgress = {
+  total?: number | null
+  done: number
+  failed: number
+  skipped: number
+  conflictTotal?: number
+}
+
+export type RowErrorSummary = {
+  rowIndex: number
+  errorCode?: string | null
+  errorMessage: string
+  conflictType?: ConflictType | null
+}
+
+export type ImportProgressEvent = {
+  jobId: string
+  state: JobState
+  progress: JobProgress
+  rps?: number | null
+  recentErrors: RowErrorSummary[]
+  priority?: number
+  leaseExpiresAt?: number | null
+  timestamp: number
+}
+
+export type ImportLogLevel = 'info' | 'warn' | 'error'
+
+export type ImportLogEvent = {
+  jobId: string
+  level: ImportLogLevel
+  message: string
+  timestamp: number
+}
+
+export type ImportDoneEvent = {
+  jobId: string
+  state: JobState
+  progress: JobProgress
+  rps?: number | null
+  finishedAt: number
+  lastError?: string | null
+  priority?: number
+  conflictTotal?: number
+}
+
+export type ImportJobSummary = {
+  jobId: string
+  state: JobState
+  progress: JobProgress
+  priority?: number
+  leaseExpiresAt?: number | null
+  tokenId?: string | null
+  databaseId?: string | null
+  createdAt?: number | null
+  startedAt?: number | null
+  endedAt?: number | null
+  lastError?: string | null
+  rps?: number | null
+}
+
+export type ImportJobHandle = {
+  jobId: string
+  state: JobState
+}
+
+export type ExportFailedResult = {
+  jobId: string
+  path: string
+  total: number
+}
+
+export type ImportQueueSnapshot = {
+  running: ImportJobSummary[]
+  waiting: ImportJobSummary[]
+  paused: ImportJobSummary[]
+  timestamp: number
 }

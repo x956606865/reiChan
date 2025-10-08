@@ -11,6 +11,8 @@ import type {
   DryRunErrorKind,
 } from './types'
 
+import { useNotionImportRunboard } from './runboardStore'
+
 const DEFAULT_TRANSFORM = `function transform(value, ctx) {
   return value
 }`
@@ -35,11 +37,16 @@ type Props = {
   previewRecords: unknown[]
   draft: ImportJobDraft | null
   onDraftChange?: (draft: ImportJobDraft | null) => void
+  onStartImport?: (draft: ImportJobDraft) => void
   onPrev: () => void
 }
 
 export default function MappingEditor(props: Props) {
-  const { tokenId, databaseId, previewFields, previewRecords, sourceFilePath, fileType, draft, onDraftChange, onPrev } = props
+  const { tokenId, databaseId, previewFields, previewRecords, sourceFilePath, fileType, draft, onDraftChange, onStartImport, onPrev } = props
+
+  const { starting } = useNotionImportRunboard((state) => ({ starting: state.starting }))
+  const activeJobState = useNotionImportRunboard((state) => state.job?.state)
+  const hasRunningJob = activeJobState !== undefined && !['Completed', 'Failed', 'Canceled'].includes(activeJobState)
 
   const [schema, setSchema] = useState<DatabaseSchema | null>(null)
   const [loadingSchema, setLoadingSchema] = useState(false)
@@ -471,6 +478,22 @@ export default function MappingEditor(props: Props) {
           )}
           {dryRunReport.failed === 0 && onDraftChange && (
             <div className="success" style={{ marginTop: 8 }}>✅ Dry-run 通过，已生成导入草稿。</div>
+          )}
+          {dryRunReport.failed === 0 && draft && onStartImport && !hasRunningJob && (
+            <div style={{ marginTop: 12 }}>
+              <button
+                className="primary"
+                disabled={starting}
+                onClick={() => onStartImport(draft)}
+              >
+                {starting ? '启动中…' : '开始导入'}
+              </button>
+            </div>
+          )}
+          {hasRunningJob && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              当前已有导入作业在执行，请先完成或取消后再启动新的导入。
+            </p>
           )}
         </section>
       )}

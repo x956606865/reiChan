@@ -352,13 +352,8 @@ fn validate_manga_artifact(
 #[tauri::command]
 fn read_template_file(path: String) -> Result<String, String> {
     let resolved = PathBuf::from(&path);
-    fs::read_to_string(&resolved).map_err(|err| {
-        format!(
-            "无法读取模板文件 {}: {}",
-            resolved.display(),
-            err
-        )
-    })
+    fs::read_to_string(&resolved)
+        .map_err(|err| format!("无法读取模板文件 {}: {}", resolved.display(), err))
 }
 
 fn collect_ports() -> Result<Vec<PortUsage>, Box<dyn std::error::Error>> {
@@ -904,9 +899,18 @@ pub fn run() {
             });
             // Notion: use SQLite-backed store and HTTP adapter when enabled.
             #[cfg(feature = "notion-sqlite")]
-            app.manage(notion::commands::create_state_with_sqlite(db_path.clone()));
+            {
+                let handle = app.handle().clone();
+                app.manage(notion::commands::create_state_with_sqlite(
+                    handle,
+                    db_path.clone(),
+                ));
+            }
             #[cfg(not(feature = "notion-sqlite"))]
-            app.manage(notion::commands::create_default_state());
+            {
+                let handle = app.handle().clone();
+                app.manage(notion::commands::create_default_state_with_handle(handle));
+            }
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -958,7 +962,8 @@ pub fn run() {
             notion::commands::notion_import_resume,
             notion::commands::notion_import_cancel,
             notion::commands::notion_import_get_job,
-            notion::commands::notion_import_list_jobs
+            notion::commands::notion_import_list_jobs,
+            notion::commands::notion_import_export_failed
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
