@@ -1,22 +1,63 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::job_runner::{JobProgress, JobState};
-use super::types::TokenRow;
+use super::types::{TokenKind, TokenRow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "notion-sqlite")]
 use rusqlite::params;
 #[cfg(feature = "notion-sqlite")]
+use rusqlite::Connection;
+#[cfg(feature = "notion-sqlite")]
 use rusqlite::OptionalExtension;
 
 pub trait TokenStore: Send + Sync {
-    fn save(&self, name: &str, token: &str, workspace_name: Option<String>) -> TokenRow;
+    fn save_manual(&self, params: ManualTokenParams) -> TokenRow;
+    fn save_oauth(&self, params: OAuthTokenParams) -> TokenRow;
     fn list(&self) -> Vec<TokenRow>;
     fn delete(&self, id: &str) -> bool;
-    fn get_token(&self, id: &str) -> Option<String>;
+    fn load(&self, id: &str) -> Option<TokenSecret>;
+    fn update_oauth_after_refresh(&self, id: &str, update: OAuthRefreshSuccess)
+        -> Option<TokenRow>;
+    fn record_oauth_refresh_error(&self, id: &str, message: String) -> Option<TokenRow>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ManualTokenParams {
+    pub name: String,
+    pub token: String,
+    pub workspace_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OAuthTokenParams {
+    pub name: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<i64>,
+    pub workspace_name: Option<String>,
+    pub workspace_icon: Option<String>,
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OAuthRefreshSuccess {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<i64>,
+    pub workspace_name: Option<String>,
+    pub workspace_icon: Option<String>,
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenSecret {
+    pub row: TokenRow,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -27,7 +68,7 @@ pub struct InMemoryTokenStore {
 #[derive(Default)]
 struct StoreInner {
     seq: u64,
-    rows: HashMap<String, (TokenRow, String)>, // id -> (row, token_plain)
+    rows: HashMap<String, TokenSecret>, // id -> secret with metadata
 }
 
 impl InMemoryTokenStore {
@@ -43,26 +84,40 @@ impl InMemoryTokenStore {
 }
 
 impl TokenStore for InMemoryTokenStore {
-    fn save(&self, name: &str, token: &str, workspace_name: Option<String>) -> TokenRow {
+    fn save_manual(&self, params: ManualTokenParams) -> TokenRow {
         let mut guard = self.inner.lock().expect("poisoned");
         let id = Self::next_id(&mut guard.seq);
         let now = chrono::Utc::now().timestamp_millis();
         let row = TokenRow {
             id: id.clone(),
-            name: name.to_string(),
-            workspace_name,
+            name: params.name.clone(),
+            kind: TokenKind::Manual,
+            workspace_name: params.workspace_name.clone(),
+            workspace_icon: None,
+            workspace_id: None,
             created_at: now,
             last_used_at: Some(now),
+            expires_at: None,
+            last_refresh_error: None,
         };
-        guard
-            .rows
-            .insert(id.clone(), (row.clone(), token.to_string()));
+        guard.rows.insert(
+            id.clone(),
+            TokenSecret {
+                row: row.clone(),
+                access_token: params.token.clone(),
+                refresh_token: None,
+            },
+        );
         row
     }
 
     fn list(&self) -> Vec<TokenRow> {
         let guard = self.inner.lock().expect("poisoned");
-        let mut rows: Vec<_> = guard.rows.values().map(|(r, _)| r.clone()).collect();
+        let mut rows: Vec<_> = guard
+            .rows
+            .values()
+            .map(|secret| secret.row.clone())
+            .collect();
         rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         rows
     }
@@ -72,14 +127,70 @@ impl TokenStore for InMemoryTokenStore {
         guard.rows.remove(id).is_some()
     }
 
-    fn get_token(&self, id: &str) -> Option<String> {
+    fn load(&self, id: &str) -> Option<TokenSecret> {
         let mut guard = self.inner.lock().expect("poisoned");
-        if let Some((row, token)) = guard.rows.get_mut(id) {
-            row.last_used_at = Some(chrono::Utc::now().timestamp_millis());
-            Some(token.clone())
-        } else {
-            None
+        let secret = guard.rows.get_mut(id)?;
+        secret.row.last_used_at = Some(chrono::Utc::now().timestamp_millis());
+        Some(secret.clone())
+    }
+
+    fn save_oauth(&self, params: OAuthTokenParams) -> TokenRow {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let id = Self::next_id(&mut guard.seq);
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = TokenRow {
+            id: id.clone(),
+            name: params.name.clone(),
+            kind: TokenKind::Oauth,
+            workspace_name: params.workspace_name.clone(),
+            workspace_icon: params.workspace_icon.clone(),
+            workspace_id: params.workspace_id.clone(),
+            created_at: now,
+            last_used_at: Some(now),
+            expires_at: params.expires_at,
+            last_refresh_error: None,
+        };
+        guard.rows.insert(
+            id.clone(),
+            TokenSecret {
+                row: row.clone(),
+                access_token: params.access_token.clone(),
+                refresh_token: params.refresh_token.clone(),
+            },
+        );
+        row
+    }
+
+    fn update_oauth_after_refresh(
+        &self,
+        id: &str,
+        update: OAuthRefreshSuccess,
+    ) -> Option<TokenRow> {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let secret = guard.rows.get_mut(id)?;
+        if secret.row.kind != TokenKind::Oauth {
+            return None;
         }
+        secret.access_token = update.access_token;
+        secret.refresh_token = update.refresh_token;
+        secret.row.expires_at = update.expires_at;
+        secret.row.workspace_name = update.workspace_name;
+        secret.row.workspace_icon = update.workspace_icon;
+        secret.row.workspace_id = update.workspace_id;
+        secret.row.last_refresh_error = None;
+        secret.row.last_used_at = Some(chrono::Utc::now().timestamp_millis());
+        Some(secret.row.clone())
+    }
+
+    fn record_oauth_refresh_error(&self, id: &str, message: String) -> Option<TokenRow> {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let secret = guard.rows.get_mut(id)?;
+        if secret.row.kind != TokenKind::Oauth {
+            return None;
+        }
+        secret.row.last_refresh_error = Some(message);
+        secret.row.last_used_at = Some(chrono::Utc::now().timestamp_millis());
+        Some(secret.row.clone())
     }
 }
 
@@ -90,15 +201,137 @@ mod tests {
     #[test]
     fn store_roundtrip() {
         let store = InMemoryTokenStore::new();
-        let saved = store.save("demo", "secret-123", Some("Workspace".into()));
+        let saved = store.save_manual(ManualTokenParams {
+            name: "demo".into(),
+            token: "secret-123".into(),
+            workspace_name: Some("Workspace".into()),
+        });
         assert!(saved.id.starts_with("tok-"));
         let list = store.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "demo");
-        let token = store.get_token(&saved.id).unwrap();
-        assert_eq!(token, "secret-123");
-       assert!(store.delete(&saved.id));
-       assert!(store.list().is_empty());
+        let token = store.load(&saved.id).unwrap();
+        assert_eq!(token.access_token, "secret-123");
+        assert!(store.delete(&saved.id));
+        assert!(store.list().is_empty());
+    }
+
+    #[cfg(feature = "notion-sqlite")]
+    mod sqlite {
+        use super::*;
+        use rusqlite::Connection;
+        use tempfile::TempDir;
+
+        fn setup_db() -> (TempDir, SqliteTokenStore) {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("tokens.db");
+            let conn = Connection::open(&path).expect("open sqlite db");
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS notion_tokens (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    token_cipher BLOB NOT NULL,
+                    workspace_name TEXT NULL,
+                    workspace_icon TEXT NULL,
+                    workspace_id TEXT NULL,
+                    created_at INTEGER NOT NULL,
+                    last_used_at INTEGER NULL,
+                    expires_at INTEGER NULL,
+                    refresh_token TEXT NULL,
+                    last_refresh_error TEXT NULL,
+                    encryption_salt BLOB NULL
+                )",
+                [],
+            )
+            .expect("create notion_tokens");
+            drop(conn);
+            (dir, SqliteTokenStore::new(path))
+        }
+
+        #[test]
+        fn sqlite_save_and_load_oauth_token() {
+            let (_dir, store) = setup_db();
+            let row = store.save_oauth(OAuthTokenParams {
+                name: "workspace oauth".into(),
+                access_token: "secret_token".into(),
+                refresh_token: Some("refresh_value".into()),
+                expires_at: Some(1_700_000_000_000),
+                workspace_name: Some("Workspace".into()),
+                workspace_icon: Some("https://icon.example/icon.png".into()),
+                workspace_id: Some("ws_123".into()),
+            });
+
+            let secret = store.load(&row.id).expect("load secret");
+            assert_eq!(secret.access_token, "secret_token");
+            assert_eq!(secret.refresh_token.as_deref(), Some("refresh_value"));
+            assert_eq!(secret.row.workspace_name.as_deref(), Some("Workspace"));
+            assert_eq!(secret.row.workspace_id.as_deref(), Some("ws_123"));
+            assert_eq!(secret.row.expires_at, Some(1_700_000_000_000));
+            assert_eq!(secret.row.kind, TokenKind::Oauth);
+        }
+
+        #[test]
+        fn sqlite_update_oauth_after_refresh() {
+            let (_dir, store) = setup_db();
+            let row = store.save_oauth(OAuthTokenParams {
+                name: "workspace oauth".into(),
+                access_token: "old_secret".into(),
+                refresh_token: Some("old_refresh".into()),
+                expires_at: Some(1_700_000_000_000),
+                workspace_name: Some("Workspace".into()),
+                workspace_icon: None,
+                workspace_id: Some("ws_123".into()),
+            });
+
+            let updated = store
+                .update_oauth_after_refresh(
+                    &row.id,
+                    OAuthRefreshSuccess {
+                        access_token: "new_secret".into(),
+                        refresh_token: Some("new_refresh".into()),
+                        expires_at: Some(1_700_000_500_000),
+                        workspace_name: Some("Workspace Updated".into()),
+                        workspace_icon: Some("emoji".into()),
+                        workspace_id: Some("ws_999".into()),
+                    },
+                )
+                .expect("update token");
+
+            assert_eq!(updated.expires_at, Some(1_700_000_500_000));
+            assert_eq!(updated.workspace_name.as_deref(), Some("Workspace Updated"));
+            assert_eq!(updated.workspace_icon.as_deref(), Some("emoji"));
+            assert_eq!(updated.workspace_id.as_deref(), Some("ws_999"));
+
+            let secret = store.load(&row.id).expect("load secret");
+            assert_eq!(secret.access_token, "new_secret");
+            assert_eq!(secret.refresh_token.as_deref(), Some("new_refresh"));
+        }
+
+        #[test]
+        fn sqlite_record_oauth_refresh_error() {
+            let (_dir, store) = setup_db();
+            let row = store.save_oauth(OAuthTokenParams {
+                name: "workspace oauth".into(),
+                access_token: "secret".into(),
+                refresh_token: Some("refresh".into()),
+                expires_at: None,
+                workspace_name: None,
+                workspace_icon: None,
+                workspace_id: None,
+            });
+
+            let updated = store
+                .record_oauth_refresh_error(&row.id, "error message".into())
+                .expect("record error");
+            assert_eq!(updated.last_refresh_error.as_deref(), Some("error message"));
+
+            let secret = store.load(&row.id).expect("load secret");
+            assert_eq!(
+                secret.row.last_refresh_error.as_deref(),
+                Some("error message")
+            );
+        }
     }
 
     fn insert_demo_job(
@@ -161,13 +394,7 @@ mod tests {
             base + 2_000,
             Some(base + 3_000),
         );
-        insert_demo_job(
-            &store,
-            "job-running",
-            JobState::Running,
-            base + 3_000,
-            None,
-        );
+        insert_demo_job(&store, "job-running", JobState::Running, base + 3_000, None);
 
         let items = store
             .list_history(0, 10, None)
@@ -239,57 +466,383 @@ impl SqliteTokenStore {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
     }
+
+    pub fn ensure_schema(path: &Path) -> Result<(), String> {
+        let conn = Connection::open(path).map_err(|err| err.to_string())?;
+        let schema = Self::detect_token_columns(&conn);
+        let mut migrations: Vec<&str> = Vec::new();
+        if !schema.has_kind {
+            migrations
+                .push("ALTER TABLE notion_tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'manual'");
+        }
+        if !schema.has_workspace_name {
+            migrations.push("ALTER TABLE notion_tokens ADD COLUMN workspace_name TEXT");
+        }
+        if !schema.has_workspace_icon {
+            migrations.push("ALTER TABLE notion_tokens ADD COLUMN workspace_icon TEXT");
+        }
+        if !schema.has_workspace_id {
+            migrations.push("ALTER TABLE notion_tokens ADD COLUMN workspace_id TEXT");
+        }
+        if !schema.has_expires_at {
+            migrations.push("ALTER TABLE notion_tokens ADD COLUMN expires_at INTEGER");
+        }
+        if !schema.has_refresh_token {
+            migrations.push("ALTER TABLE notion_tokens ADD COLUMN refresh_token TEXT");
+        }
+        if !schema.has_last_refresh_error {
+            migrations.push("ALTER TABLE notion_tokens ADD COLUMN last_refresh_error TEXT");
+        }
+        for sql in migrations {
+            conn.execute(sql, [])
+                .map_err(|err| format!("{} => {}", sql, err))?;
+        }
+        Ok(())
+    }
+
+    fn is_missing_column(err: &rusqlite::Error) -> bool {
+        use rusqlite::Error::{SqlInputError, SqliteFailure};
+        match err {
+            SqlInputError { msg, .. } => msg.to_lowercase().contains("no such column"),
+            SqliteFailure(_, Some(message)) => message.to_lowercase().contains("no such column"),
+            _ => false,
+        }
+    }
+
+    fn list_current(conn: &Connection) -> Result<Vec<TokenRow>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, workspace_name, workspace_icon, workspace_id,
+                        created_at, last_used_at, expires_at, last_refresh_error
+                 FROM notion_tokens ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: String = row.get(2)?;
+            let kind = match kind_str.as_str() {
+                "oauth" => TokenKind::Oauth,
+                _ => TokenKind::Manual,
+            };
+            Ok(TokenRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind,
+                workspace_name: row.get(3)?,
+                workspace_icon: row.get(4)?,
+                workspace_id: row.get(5)?,
+                created_at: row.get(6)?,
+                last_used_at: row.get(7)?,
+                expires_at: row.get(8)?,
+                last_refresh_error: row.get(9)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    fn list_legacy(conn: &Connection) -> Vec<TokenRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, created_at, last_used_at
+                 FROM notion_tokens ORDER BY created_at",
+            )
+            .expect("prepare legacy list tokens");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TokenRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: TokenKind::Manual,
+                    workspace_name: None,
+                    workspace_icon: None,
+                    workspace_id: None,
+                    created_at: row.get(2)?,
+                    last_used_at: row.get(3)?,
+                    expires_at: None,
+                    last_refresh_error: None,
+                })
+            })
+            .expect("map legacy list tokens");
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    fn load_current(conn: &Connection, id: &str) -> Result<Option<TokenSecret>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, workspace_name, workspace_icon, workspace_id,
+                    created_at, last_used_at, expires_at, last_refresh_error,
+                    token_cipher, refresh_token
+             FROM notion_tokens WHERE id = ?1",
+        )?;
+        let secret = stmt
+            .query_row([id], |row| {
+                let kind_str: String = row.get(2)?;
+                let kind = match kind_str.as_str() {
+                    "oauth" => TokenKind::Oauth,
+                    _ => TokenKind::Manual,
+                };
+                Ok(TokenSecret {
+                    access_token: row.get(10)?,
+                    refresh_token: row.get(11)?,
+                    row: TokenRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        kind,
+                        workspace_name: row.get(3)?,
+                        workspace_icon: row.get(4)?,
+                        workspace_id: row.get(5)?,
+                        created_at: row.get(6)?,
+                        last_used_at: row.get(7)?,
+                        expires_at: row.get(8)?,
+                        last_refresh_error: row.get(9)?,
+                    },
+                })
+            })
+            .optional()?;
+        Ok(secret)
+    }
+
+    fn load_legacy(conn: &Connection, id: &str) -> Option<TokenSecret> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, token_cipher, created_at, last_used_at
+                 FROM notion_tokens WHERE id = ?1",
+            )
+            .expect("prepare legacy load token");
+        let secret = stmt
+            .query_row([id], |row| {
+                Ok(TokenSecret {
+                    access_token: row.get(2)?,
+                    refresh_token: None,
+                    row: TokenRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        kind: TokenKind::Manual,
+                        workspace_name: None,
+                        workspace_icon: None,
+                        workspace_id: None,
+                        created_at: row.get(3)?,
+                        last_used_at: row.get(4)?,
+                        expires_at: None,
+                        last_refresh_error: None,
+                    },
+                })
+            })
+            .optional()
+            .expect("query legacy token by id");
+        secret
+    }
+
+    fn save_manual_current(
+        conn: &Connection,
+        params: &ManualTokenParams,
+        now: i64,
+    ) -> Result<TokenRow, rusqlite::Error> {
+        let workspace_name_ref = params.workspace_name.as_deref();
+        let workspace_icon_ref: Option<&str> = None;
+        let workspace_id_ref: Option<&str> = None;
+        let expires_at: Option<i64> = None;
+        let refresh_token_ref: Option<&str> = None;
+        let last_refresh_error_ref: Option<&str> = None;
+        let mut stmt = conn.prepare(
+            "INSERT INTO notion_tokens (
+                id, name, kind, token_cipher, workspace_name, workspace_icon, workspace_id,
+                created_at, last_used_at, expires_at, refresh_token, last_refresh_error
+            )
+            VALUES (
+                lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11
+            )
+            RETURNING id",
+        )?;
+        let id: String = stmt.query_row(
+            params![
+                &params.name,
+                "manual",
+                &params.token,
+                workspace_name_ref,
+                workspace_icon_ref,
+                workspace_id_ref,
+                now,
+                now,
+                expires_at,
+                refresh_token_ref,
+                last_refresh_error_ref
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(TokenRow {
+            id,
+            name: params.name.clone(),
+            kind: TokenKind::Manual,
+            workspace_name: params.workspace_name.clone(),
+            workspace_icon: None,
+            workspace_id: None,
+            created_at: now,
+            last_used_at: Some(now),
+            expires_at: None,
+            last_refresh_error: None,
+        })
+    }
+
+    fn save_manual_legacy(conn: &Connection, params: &ManualTokenParams, now: i64) -> TokenRow {
+        use rusqlite::params;
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO notion_tokens (
+                    id, name, token_cipher, created_at, last_used_at
+                )
+                VALUES (
+                    lower(hex(randomblob(16))), ?, ?, ?, ?
+                )
+                RETURNING id",
+            )
+            .expect("prepare legacy insert manual token");
+        let id: String = stmt
+            .query_row(params![&params.name, &params.token, now, now], |row| {
+                row.get(0)
+            })
+            .expect("insert legacy manual token");
+        let schema = Self::detect_token_columns(conn);
+        if schema.has_workspace_name {
+            let _ = conn.execute(
+                "UPDATE notion_tokens SET workspace_name = ?2 WHERE id = ?1",
+                params![&id, params.workspace_name.as_deref()],
+            );
+        }
+        TokenRow {
+            id,
+            name: params.name.clone(),
+            kind: TokenKind::Manual,
+            workspace_name: params.workspace_name.clone(),
+            workspace_icon: None,
+            workspace_id: None,
+            created_at: now,
+            last_used_at: Some(now),
+            expires_at: None,
+            last_refresh_error: None,
+        }
+    }
+
+    pub(crate) fn detect_token_columns(conn: &Connection) -> TokenTableSchema {
+        let mut schema = TokenTableSchema::default();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info('notion_tokens')")
+            .expect("describe notion_tokens table");
+        let rows = stmt
+            .query_map([], |row| -> Result<String, rusqlite::Error> { row.get(1) })
+            .expect("query notion_tokens table info");
+        for column in rows.filter_map(|r| r.ok()) {
+            match column.as_str() {
+                "kind" => schema.has_kind = true,
+                "workspace_name" => schema.has_workspace_name = true,
+                "workspace_icon" => schema.has_workspace_icon = true,
+                "workspace_id" => schema.has_workspace_id = true,
+                "expires_at" => schema.has_expires_at = true,
+                "refresh_token" => schema.has_refresh_token = true,
+                "last_refresh_error" => schema.has_last_refresh_error = true,
+                _ => {}
+            }
+        }
+        schema
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub(crate) struct TokenTableSchema {
+    has_kind: bool,
+    has_workspace_name: bool,
+    has_workspace_icon: bool,
+    has_workspace_id: bool,
+    has_expires_at: bool,
+    has_refresh_token: bool,
+    has_last_refresh_error: bool,
 }
 
 #[cfg(feature = "notion-sqlite")]
 impl TokenStore for SqliteTokenStore {
-    fn save(&self, name: &str, token: &str, workspace_name: Option<String>) -> TokenRow {
+    fn save_manual(&self, params: ManualTokenParams) -> TokenRow {
         use rusqlite::Connection;
         let conn = Connection::open(&self.db_path).expect("open db");
         let now = chrono::Utc::now().timestamp_millis();
-        // Use SQLite to generate a random 128-bit id.
+        match Self::save_manual_current(&conn, &params, now) {
+            Ok(row) => row,
+            Err(err) if Self::is_missing_column(&err) => {
+                Self::save_manual_legacy(&conn, &params, now)
+            }
+            Err(err) => panic!("insert manual token failed: {}", err),
+        }
+    }
+
+    fn save_oauth(&self, params: OAuthTokenParams) -> TokenRow {
+        use rusqlite::Connection;
+        let OAuthTokenParams {
+            name,
+            access_token,
+            refresh_token,
+            expires_at,
+            workspace_name,
+            workspace_icon,
+            workspace_id,
+        } = params;
+        let conn = Connection::open(&self.db_path).expect("open db");
+        let now = chrono::Utc::now().timestamp_millis();
         let mut stmt = conn
             .prepare(
-                "INSERT INTO notion_tokens (id, name, token_cipher, workspace_name, created_at, last_used_at, encryption_salt)
-                 VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, NULL)
-                 RETURNING id",
+                "INSERT INTO notion_tokens (
+                    id, name, kind, token_cipher, workspace_name, workspace_icon, workspace_id,
+                    created_at, last_used_at, expires_at, refresh_token, last_refresh_error
+                )
+                VALUES (
+                    lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6,
+                    ?7, ?8, ?9, ?10, NULL
+                )
+                RETURNING id",
             )
-            .expect("prepare insert");
+            .unwrap_or_else(|err| {
+                if Self::is_missing_column(&err) {
+                    panic!(
+                        "notion_tokens 表缺少 OAuth 所需列，请按照 docs/notion-import-oauth-token-plan.md 中的 ALTER TABLE 指引升级数据库后再试。原始错误: {}",
+                        err
+                    );
+                }
+                panic!("prepare insert oauth token failed: {}", err)
+            });
         let id: String = stmt
-            .query_row((name, token, workspace_name.clone(), now, now), |row| {
-                row.get(0)
-            })
-            .expect("insert row");
+            .query_row(
+                params![
+                    &name,
+                    "oauth",
+                    &access_token,
+                    workspace_name.as_deref(),
+                    workspace_icon.as_deref(),
+                    workspace_id.as_deref(),
+                    now,
+                    now,
+                    expires_at,
+                    refresh_token.as_deref()
+                ],
+                |row| row.get(0),
+            )
+            .expect("insert oauth token");
         TokenRow {
             id,
-            name: name.to_string(),
+            name,
+            kind: TokenKind::Oauth,
             workspace_name,
+            workspace_icon,
+            workspace_id,
             created_at: now,
             last_used_at: Some(now),
+            expires_at,
+            last_refresh_error: None,
         }
     }
 
     fn list(&self) -> Vec<TokenRow> {
         use rusqlite::Connection;
         let conn = Connection::open(&self.db_path).expect("open db");
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, workspace_name, created_at, last_used_at
-                 FROM notion_tokens ORDER BY created_at",
-            )
-            .expect("prepare list");
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(TokenRow {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    workspace_name: row.get(2)?,
-                    created_at: row.get(3)?,
-                    last_used_at: row.get(4)?,
-                })
-            })
-            .expect("query map");
-        rows.filter_map(|r| r.ok()).collect()
+        match Self::list_current(&conn) {
+            Ok(rows) => rows,
+            Err(err) if Self::is_missing_column(&err) => Self::list_legacy(&conn),
+            Err(err) => panic!("prepare list tokens failed: {}", err),
+        }
     }
 
     fn delete(&self, id: &str) -> bool {
@@ -301,23 +854,84 @@ impl TokenStore for SqliteTokenStore {
         affected > 0
     }
 
-    fn get_token(&self, id: &str) -> Option<String> {
+    fn load(&self, id: &str) -> Option<TokenSecret> {
         use rusqlite::Connection;
         let conn = Connection::open(&self.db_path).expect("open db");
         let now = chrono::Utc::now().timestamp_millis();
-        let _ = conn
+        let secret = match Self::load_current(&conn, id) {
+            Ok(secret) => secret,
+            Err(err) if Self::is_missing_column(&err) => Self::load_legacy(&conn, id),
+            Err(err) => panic!("load token failed: {}", err),
+        };
+        if let Some(mut secret) = secret {
+            let _ = conn
+                .execute(
+                    "UPDATE notion_tokens SET last_used_at = ?2 WHERE id = ?1",
+                    (id, now),
+                )
+                .ok();
+            secret.row.last_used_at = Some(now);
+            Some(secret)
+        } else {
+            None
+        }
+    }
+
+    fn update_oauth_after_refresh(
+        &self,
+        id: &str,
+        update: OAuthRefreshSuccess,
+    ) -> Option<TokenRow> {
+        use rusqlite::Connection;
+        let conn = Connection::open(&self.db_path).expect("open db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let affected = conn
             .execute(
-                "UPDATE notion_tokens SET last_used_at = ?2 WHERE id = ?1",
-                (id, now),
+                "UPDATE notion_tokens
+                 SET token_cipher = ?2,
+                     refresh_token = ?3,
+                     expires_at = ?4,
+                     workspace_name = ?5,
+                     workspace_icon = ?6,
+                     workspace_id = ?7,
+                     last_refresh_error = NULL,
+                     last_used_at = ?8
+                 WHERE id = ?1 AND kind = 'oauth'",
+                params![
+                    id,
+                    &update.access_token,
+                    update.refresh_token.as_deref(),
+                    update.expires_at,
+                    update.workspace_name.as_deref(),
+                    update.workspace_icon.as_deref(),
+                    update.workspace_id.as_deref(),
+                    now
+                ],
             )
-            .ok();
-        // token_cipher is declared as BLOB but stores UTF-8 text in M1.
-        // Read as String for maximum compatibility; future encryption can switch representation safely.
-        let mut stmt = conn
-            .prepare("SELECT token_cipher FROM notion_tokens WHERE id = ?1")
-            .expect("prepare select token");
-        let token: Option<String> = stmt.query_row([id], |row| row.get::<_, String>(0)).ok();
-        token
+            .expect("update oauth token");
+        if affected == 0 {
+            return None;
+        }
+        self.load(id).map(|secret| secret.row)
+    }
+
+    fn record_oauth_refresh_error(&self, id: &str, message: String) -> Option<TokenRow> {
+        use rusqlite::Connection;
+        let conn = Connection::open(&self.db_path).expect("open db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let affected = conn
+            .execute(
+                "UPDATE notion_tokens
+                 SET last_refresh_error = ?2,
+                     last_used_at = ?3
+                 WHERE id = ?1 AND kind = 'oauth'",
+                params![id, message, now],
+            )
+            .expect("record refresh error");
+        if affected == 0 {
+            return None;
+        }
+        self.load(id).map(|secret| secret.row)
     }
 }
 
@@ -765,11 +1379,7 @@ impl ImportJobStore for InMemoryJobStore {
         limit: usize,
     ) -> Result<Vec<ImportCheckpoint>, String> {
         let guard = self.inner.lock().map_err(|_| "poisoned".to_string())?;
-        let entries = guard
-            .checkpoints
-            .get(job_id)
-            .cloned()
-            .unwrap_or_default();
+        let entries = guard.checkpoints.get(job_id).cloned().unwrap_or_default();
         if entries.len() > limit {
             Ok(entries.into_iter().take(limit).collect())
         } else {
@@ -1726,10 +2336,7 @@ impl ImportJobStore for SqliteJobStore {
             status_values.len() + 2
         ));
 
-        let mut params: Vec<Value> = status_values
-            .into_iter()
-            .map(Value::from)
-            .collect();
+        let mut params: Vec<Value> = status_values.into_iter().map(Value::from).collect();
         params.push(Value::from(limit as i64));
         params.push(Value::from(offset as i64));
 
@@ -1770,10 +2377,7 @@ impl ImportJobStore for SqliteJobStore {
             "SELECT COUNT(1) FROM notion_import_jobs WHERE status IN ({})",
             placeholders
         );
-        let mut params: Vec<Value> = status_values
-            .into_iter()
-            .map(Value::from)
-            .collect();
+        let mut params: Vec<Value> = status_values.into_iter().map(Value::from).collect();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let count: i64 = stmt
             .query_row(params_from_iter(params), |row| row.get(0))

@@ -8,6 +8,8 @@ use std::time::Duration;
 use crate::notion::adapter::NotionAdapter;
 use crate::notion::import::{ImportEngine, StartContext};
 use crate::notion::job_runner::{JobLogLevel, JobRunner, JobState};
+#[cfg(test)]
+use crate::notion::storage::ManualTokenParams;
 use crate::notion::storage::{ImportJobRecord, ImportJobStore, StateTransition, TokenStore};
 
 const DEFAULT_MAX_PARALLEL: usize = 2;
@@ -299,11 +301,12 @@ impl SchedulerCore {
     }
 
     fn start_job(&mut self, job: ImportJobRecord) -> Result<(), String> {
-        let token = self
+        let secret = self
             .deps
             .token_store
-            .get_token(&job.token_id)
+            .load(&job.token_id)
             .ok_or_else(|| format!("token {} missing for job", job.token_id))?;
+        let token = secret.access_token;
         if !Path::new(&job.source_file_path).exists() {
             return Err(format!("source file missing: {}", job.source_file_path));
         }
@@ -505,7 +508,11 @@ mod tests {
     #[test]
     fn dispatches_jobs_with_parallel_limit() {
         let token_store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::new());
-        let token = token_store.save("default", "secret", Some("Workspace".into()));
+        let token = token_store.save_manual(ManualTokenParams {
+            name: "default".into(),
+            token: "secret".into(),
+            workspace_name: Some("Workspace".into()),
+        });
         let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
         let job_runner = Arc::new(JobRunner::new());
         let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());
@@ -604,7 +611,11 @@ mod tests {
     #[test]
     fn promote_moves_job_to_front() {
         let token_store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::new());
-        let token = token_store.save("default", "secret", Some("Workspace".into()));
+        let token = token_store.save_manual(ManualTokenParams {
+            name: "default".into(),
+            token: "secret".into(),
+            workspace_name: Some("Workspace".into()),
+        });
         let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
         let job_runner = Arc::new(JobRunner::new());
         let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());

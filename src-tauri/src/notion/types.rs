@@ -2,14 +2,26 @@ use super::job_runner::{JobProgress, JobState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenKind {
+    Manual,
+    Oauth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenRow {
     pub id: String,
     pub name: String,
+    pub kind: TokenKind,
     pub workspace_name: Option<String>,
+    pub workspace_icon: Option<String>,
+    pub workspace_id: Option<String>,
     pub created_at: i64, // unix ms
     pub last_used_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub last_refresh_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

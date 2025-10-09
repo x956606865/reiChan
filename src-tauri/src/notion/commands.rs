@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(feature = "notion-http")]
 use super::adapter::HttpNotionAdapter;
@@ -10,11 +10,15 @@ use super::job_runner::{
     JobEventEmitter, JobLogEvent, JobLogLevel, JobRunner, JobSnapshot, JobState,
 };
 use super::mapping::build_property_entry;
+use super::oauth::{OAuthSessionConfig, OAuthSessionManager, StartOAuthSession};
 use super::preview::{preview_file as notion_preview_file, PreviewRequest, PreviewResponse};
 use super::scheduler::{Scheduler, SchedulerConfig, SchedulerDeps};
+use super::settings::{
+    default_settings_path, load_oauth_settings, save_oauth_settings, OAuthSettings,
+};
 use super::storage::{
-    ImportJobRecord, ImportJobStore, InMemoryJobStore, InMemoryTokenStore, NewImportJob,
-    StateTransition, TokenStore,
+    ImportJobRecord, ImportJobStore, InMemoryJobStore, InMemoryTokenStore, ManualTokenParams,
+    NewImportJob, StateTransition, TokenStore,
 };
 #[cfg(feature = "notion-sqlite")]
 use super::storage::{SqliteJobStore, SqliteTokenStore};
@@ -23,11 +27,12 @@ use super::types::{
     ConflictType, DatabaseBrief, DatabasePage, DatabaseProperty, DatabaseSchema, DryRunErrorKind,
     DryRunInput, DryRunReport, ExportFailedResult, FieldMapping, ImportDoneEvent, ImportJobHandle,
     ImportJobRequest, ImportJobSummary, ImportLogEvent, ImportLogLevel, ImportProgressEvent,
-    ImportQueueSnapshot, ImportTemplate, RowError, RowErrorSummary, SaveTokenRequest, TokenRow,
-    TransformEvalRequest, TransformEvalResult, WorkspaceInfo,
+    ImportQueueSnapshot, ImportTemplate, RowError, RowErrorSummary, SaveTokenRequest, TokenKind,
+    TokenRow, TransformEvalRequest, TransformEvalResult, WorkspaceInfo,
 };
 use chrono::Utc;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::thread;
@@ -135,6 +140,9 @@ pub struct NotionState {
     pub job_runner: Arc<JobRunner>,
     pub job_store: Arc<dyn ImportJobStore>,
     pub scheduler: Arc<Scheduler>,
+    pub oauth: Arc<OAuthSessionManager>,
+    pub oauth_settings: Arc<Mutex<OAuthSettings>>,
+    pub oauth_settings_path: Option<std::path::PathBuf>,
 }
 
 impl NotionState {
@@ -143,6 +151,8 @@ impl NotionState {
         adapter: Arc<dyn NotionAdapter>,
         job_store: Arc<dyn ImportJobStore>,
         job_runner: Arc<JobRunner>,
+        oauth_settings: Arc<Mutex<OAuthSettings>>,
+        oauth_settings_path: Option<std::path::PathBuf>,
     ) -> Self {
         let scheduler = Arc::new(Scheduler::spawn(
             SchedulerConfig::default(),
@@ -161,7 +171,19 @@ impl NotionState {
             job_runner,
             job_store,
             scheduler,
+            oauth: Arc::new(OAuthSessionManager::with_default_ttl()),
+            oauth_settings,
+            oauth_settings_path,
         }
+    }
+
+    pub fn current_oauth_config(&self) -> OAuthSessionConfig {
+        let settings = self
+            .oauth_settings
+            .lock()
+            .expect("oauth settings poisoned")
+            .clone();
+        OAuthSessionConfig::from_settings(&settings)
     }
 
     pub fn resume_pending_jobs(&self) {
@@ -189,11 +211,14 @@ impl NotionState {
 }
 
 pub fn create_default_state() -> NotionState {
+    let oauth_settings = Arc::new(Mutex::new(OAuthSettings::default()));
     let state = NotionState::new(
         Arc::new(InMemoryTokenStore::new()),
         Arc::new(MockNotionAdapter::new()),
         Arc::new(InMemoryJobStore::new()),
         Arc::new(JobRunner::new()),
+        oauth_settings,
+        None,
     );
     state.resume_pending_jobs();
     state
@@ -204,15 +229,19 @@ pub fn create_default_state_with_handle(app: AppHandle) -> NotionState {
     let adapter: Arc<dyn NotionAdapter> = Arc::new(MockNotionAdapter::new());
     let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
     let emitter: Arc<dyn JobEventEmitter> =
-        Arc::new(TauriJobEventEmitter::new(app, job_store.clone()));
+        Arc::new(TauriJobEventEmitter::new(app.clone(), job_store.clone()));
     let job_runner = Arc::new(JobRunner::with_emitter(emitter));
-    let state = NotionState::new(store, adapter, job_store, job_runner);
+    let oauth_settings = Arc::new(Mutex::new(OAuthSettings::default()));
+    let state = NotionState::new(store, adapter, job_store, job_runner, oauth_settings, None);
     state.resume_pending_jobs();
     state
 }
 
 #[cfg(feature = "notion-sqlite")]
 pub fn create_state_with_sqlite(app: AppHandle, db_path: PathBuf) -> NotionState {
+    if let Err(err) = SqliteTokenStore::ensure_schema(&db_path) {
+        eprintln!("[notion] failed to ensure notion_tokens schema: {}", err);
+    }
     let store: Arc<dyn TokenStore> = Arc::new(SqliteTokenStore::new(db_path.clone()));
     #[cfg(feature = "notion-http")]
     let adapter: Arc<dyn NotionAdapter> = Arc::new(HttpNotionAdapter);
@@ -223,12 +252,121 @@ pub fn create_state_with_sqlite(app: AppHandle, db_path: PathBuf) -> NotionState
     #[cfg(not(feature = "notion-sqlite"))]
     let job_store: Arc<dyn ImportJobStore> = Arc::new(InMemoryJobStore::new());
     let emitter: Arc<dyn JobEventEmitter> =
-        Arc::new(TauriJobEventEmitter::new(app, job_store.clone()));
+        Arc::new(TauriJobEventEmitter::new(app.clone(), job_store.clone()));
     let job_runner = Arc::new(JobRunner::with_emitter(emitter));
-    let mut state = NotionState::new(store, adapter, job_store, job_runner);
+    let settings_path = match app.path().app_config_dir() {
+        Ok(dir) => Some(default_settings_path(dir.as_path())),
+        Err(_) => None,
+    };
+    let initial_settings = settings_path
+        .as_ref()
+        .and_then(|path| load_oauth_settings(path).ok())
+        .unwrap_or_default();
+    let oauth_settings = Arc::new(Mutex::new(initial_settings));
+    let mut state = NotionState::new(
+        store,
+        adapter,
+        job_store,
+        job_runner,
+        oauth_settings,
+        settings_path,
+    );
     state.db_path = Some(db_path);
     state.resume_pending_jobs();
     state
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeOAuthCodeRequest {
+    pub pasted_url: String,
+    pub token_name: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthSettingsResponse {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_url: Option<String>,
+}
+
+impl From<OAuthSettings> for OAuthSettingsResponse {
+    fn from(settings: OAuthSettings) -> Self {
+        Self {
+            client_id: settings.client_id,
+            client_secret: settings.client_secret,
+            redirect_uri: settings.redirect_uri,
+            token_url: settings.token_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOAuthSettingsRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    #[serde(default)]
+    pub token_url: Option<String>,
+}
+
+#[tauri::command]
+pub fn notion_start_oauth_session(state: State<NotionState>) -> Result<StartOAuthSession, String> {
+    let config = state.current_oauth_config();
+    Ok(state.oauth.start_session(&config))
+}
+
+#[tauri::command]
+pub fn notion_get_oauth_settings(
+    state: State<NotionState>,
+) -> Result<OAuthSettingsResponse, String> {
+    let settings = state
+        .oauth_settings
+        .lock()
+        .map_err(|_| "读取 OAuth 设置失败".to_string())?
+        .clone();
+    Ok(settings.into())
+}
+
+#[tauri::command]
+pub fn notion_update_oauth_settings(
+    state: State<NotionState>,
+    req: UpdateOAuthSettingsRequest,
+) -> Result<OAuthSettingsResponse, String> {
+    let normalized = OAuthSettings {
+        client_id: req.client_id,
+        client_secret: req.client_secret,
+        redirect_uri: req.redirect_uri,
+        token_url: req.token_url,
+    }
+    .normalize();
+
+    if normalized.client_id.is_empty() {
+        return Err("Client ID 不能为空".into());
+    }
+    if normalized.redirect_uri.is_empty() {
+        return Err("Redirect URI 不能为空".into());
+    }
+
+    {
+        let mut guard = state
+            .oauth_settings
+            .lock()
+            .map_err(|_| "写入 OAuth 设置失败".to_string())?;
+        *guard = normalized.clone();
+    }
+
+    if let Some(path) = state.oauth_settings_path.as_ref() {
+        if let Err(err) = save_oauth_settings(path, &normalized) {
+            return Err(format!("保存 OAuth 设置失败：{}", err));
+        }
+    }
+
+    Ok(normalized.into())
 }
 
 #[tauri::command]
@@ -255,7 +393,11 @@ pub async fn notion_save_token(
             workspace_name: None,
             bot_name: None,
         });
-        let row = store.save(&name, &token, ws.workspace_name.clone());
+        let row = store.save_manual(ManualTokenParams {
+            name: name.clone(),
+            token: token.clone(),
+            workspace_name: ws.workspace_name.clone(),
+        });
         Ok::<TokenRow, String>(row)
     })
     .await
@@ -269,6 +411,15 @@ pub fn notion_list_tokens(state: State<NotionState>) -> Result<Vec<TokenRow>, St
 }
 
 #[tauri::command]
+pub fn notion_get_token_secret(state: State<NotionState>, id: String) -> Result<String, String> {
+    let secret = state
+        .store
+        .load(&id)
+        .ok_or_else(|| "Token not found".to_string())?;
+    Ok(secret.access_token)
+}
+
+#[tauri::command]
 pub fn notion_delete_token(state: State<NotionState>, id: String) -> Result<(), String> {
     if state.store.delete(&id) {
         Ok(())
@@ -278,16 +429,80 @@ pub fn notion_delete_token(state: State<NotionState>, id: String) -> Result<(), 
 }
 
 #[tauri::command]
+pub async fn notion_exchange_oauth_code(
+    state: State<'_, NotionState>,
+    req: ExchangeOAuthCodeRequest,
+) -> Result<TokenRow, String> {
+    let name = req.token_name.trim();
+    if name.is_empty() {
+        return Err("Token 别名不能为空".into());
+    }
+    let pasted = req.pasted_url.trim();
+    if pasted.is_empty() {
+        return Err("授权回调 URL 不能为空".into());
+    }
+
+    let manager = state.oauth.clone();
+    let store = state.store.clone();
+    let config = state.current_oauth_config();
+    let name_owned = name.to_string();
+    let url_owned = pasted.to_string();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.exchange_code(&config, store, &name_owned, &url_owned)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn notion_refresh_oauth_token(
+    state: State<'_, NotionState>,
+    token_id: String,
+) -> Result<TokenRow, String> {
+    let secret = state
+        .store
+        .load(&token_id)
+        .ok_or_else(|| "Token not found".to_string())?;
+    if secret.row.kind != TokenKind::Oauth {
+        return Err("仅 OAuth Token 支持刷新操作".into());
+    }
+    let refresh_token = secret
+        .refresh_token
+        .clone()
+        .ok_or_else(|| "该 OAuth Token 不支持刷新，请重新授权".to_string())?;
+
+    let manager = state.oauth.clone();
+    let config = state.current_oauth_config();
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        match manager.refresh_token(&config, &refresh_token) {
+            Ok(success) => store
+                .update_oauth_after_refresh(&token_id, success)
+                .ok_or_else(|| "Token not found".to_string()),
+            Err(err) => {
+                let message = err.to_string();
+                let _ = store.record_oauth_refresh_error(&token_id, message.clone());
+                Err(message)
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn notion_test_connection(
     state: State<'_, NotionState>,
     token_id: String,
 ) -> Result<WorkspaceInfo, String> {
-    let token = state
+    let secret = state
         .store
-        .get_token(&token_id)
+        .load(&token_id)
         .ok_or_else(|| "Token not found".to_string())?;
     let adapter = state.adapter.clone();
-    tauri::async_runtime::spawn_blocking(move || adapter.test_connection(&token))
+    tauri::async_runtime::spawn_blocking(move || adapter.test_connection(&secret.access_token))
         .await
         .map_err(|e| e.to_string())
         .and_then(|res| res)
@@ -300,12 +515,13 @@ pub async fn notion_search_databases(
     query: Option<String>,
     include_empty_title: Option<bool>,
 ) -> Result<Vec<DatabaseBrief>, String> {
-    let token = state
+    let secret = state
         .store
-        .get_token(&token_id)
+        .load(&token_id)
         .ok_or_else(|| "Token not found".to_string())?;
     let adapter = state.adapter.clone();
     let include_empty = include_empty_title.unwrap_or(false);
+    let token = secret.access_token.clone();
     let res = tauri::async_runtime::spawn_blocking(move || adapter.search_databases(&token, query))
         .await
         .map_err(|e| e.to_string())?;
@@ -323,12 +539,13 @@ pub async fn notion_search_databases_page(
     page_size: Option<u32>,
     include_empty_title: Option<bool>,
 ) -> Result<DatabasePage, String> {
-    let token = state
+    let secret = state
         .store
-        .get_token(&token_id)
+        .load(&token_id)
         .ok_or_else(|| "Token not found".to_string())?;
     let adapter = state.adapter.clone();
     let include_empty = include_empty_title.unwrap_or(false);
+    let token = secret.access_token.clone();
     let page = tauri::async_runtime::spawn_blocking(move || {
         adapter.search_databases_page(&token, query, cursor, page_size)
     })
@@ -349,11 +566,12 @@ pub async fn notion_get_database(
     token_id: String,
     database_id: String,
 ) -> Result<DatabaseSchema, String> {
-    let token = state
+    let secret = state
         .store
-        .get_token(&token_id)
+        .load(&token_id)
         .ok_or_else(|| "Token not found".to_string())?;
     let adapter = state.adapter.clone();
+    let token = secret.access_token.clone();
     tauri::async_runtime::spawn_blocking(move || adapter.get_database_schema(&token, &database_id))
         .await
         .map_err(|e| e.to_string())
@@ -1080,7 +1298,7 @@ fn handle_import_start(
         upsert,
     } = req;
 
-    if state.store.get_token(&token_id).is_none() {
+    if state.store.load(&token_id).is_none() {
         return Err("Token not found".to_string());
     }
 
@@ -1341,10 +1559,7 @@ fn handle_import_history(
         .job_store
         .list_history(offset, page_size, filter_slice)
         .map_err(|e| e)?;
-    let total = state
-        .job_store
-        .count_history(filter_slice)
-        .map_err(|e| e)?;
+    let total = state.job_store.count_history(filter_slice).map_err(|e| e)?;
     let has_more = offset.saturating_add(records.len()) < total;
     let summaries = records.into_iter().map(record_to_summary).collect();
     Ok(ImportHistoryPage {
@@ -1685,9 +1900,11 @@ mod tests {
     #[test]
     fn import_start_persists_job_in_store_and_runner() {
         let state = create_default_state();
-        let token = state
-            .store
-            .save("demo", "secret-token", Some("Workspace".into()));
+        let token = state.store.save_manual(ManualTokenParams {
+            name: "demo".into(),
+            token: "secret-token".into(),
+            workspace_name: Some("Workspace".into()),
+        });
 
         let file = Builder::new()
             .suffix(".json")

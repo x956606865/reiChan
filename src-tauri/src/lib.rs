@@ -11,6 +11,9 @@ use tauri::{async_runtime, Emitter, Manager};
 
 use rusqlite::{params, Connection};
 
+#[cfg(feature = "notion-sqlite")]
+use crate::notion::storage::SqliteTokenStore;
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortUsage {
@@ -942,9 +945,15 @@ pub fn run() {
             validate_manga_artifact,
             read_template_file,
             // Notion Import M1 (skeleton)
+            notion::commands::notion_start_oauth_session,
+            notion::commands::notion_exchange_oauth_code,
             notion::commands::notion_save_token,
             notion::commands::notion_list_tokens,
+            notion::commands::notion_get_token_secret,
+            notion::commands::notion_get_oauth_settings,
             notion::commands::notion_delete_token,
+            notion::commands::notion_refresh_oauth_token,
+            notion::commands::notion_update_oauth_settings,
             notion::commands::notion_test_connection,
             notion::commands::notion_search_databases,
             notion::commands::notion_search_databases_page,
@@ -986,10 +995,16 @@ fn initialize_database(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "CREATE TABLE IF NOT EXISTS notion_tokens (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'manual',
             token_cipher BLOB NOT NULL,
             workspace_name TEXT NULL,
+            workspace_icon TEXT NULL,
+            workspace_id TEXT NULL,
             created_at INTEGER NOT NULL,
             last_used_at INTEGER NULL,
+            expires_at INTEGER NULL,
+            refresh_token TEXT NULL,
+            last_refresh_error TEXT NULL,
             encryption_salt BLOB NULL
         )",
         [],
@@ -1035,6 +1050,10 @@ fn initialize_database(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         )",
         [],
     )?;
+    #[cfg(feature = "notion-sqlite")]
+    if let Err(err) = SqliteTokenStore::ensure_schema(path) {
+        eprintln!("[notion] failed to ensure notion_tokens schema: {}", err);
+    }
     Ok(())
 }
 

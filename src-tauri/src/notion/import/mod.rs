@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::notion::adapter::{
@@ -656,10 +656,7 @@ fn extract_default_payload(
                 .get("targetType")
                 .and_then(|val| val.as_str())
                 .ok_or_else(|| format!("defaults for '{}' missing targetType", prop_name))?;
-            let payload = obj
-                .get("value")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let payload = obj.get("value").cloned().unwrap_or(Value::Null);
             return Ok((target_type.to_string(), payload));
         }
     }
