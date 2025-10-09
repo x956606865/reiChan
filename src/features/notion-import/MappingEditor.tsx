@@ -483,7 +483,7 @@ useEffect(() => {
   return (
     <div>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-        <button className="ghost" onClick={onPrev}>返回数据源</button>
+        <button className="btn btn--ghost" onClick={onPrev}>返回数据源</button>
         <div style={{ flex: 1 }} />
         {loadingSchema ? <span>加载 schema…</span> : schemaError ? <span className="error">{schemaError}</span> : null}
       </div>
@@ -541,12 +541,12 @@ useEffect(() => {
                 </td>
                 <td><code>{mapping.targetType}</code></td>
                 <td>
-                  <button className="ghost" onClick={() => openTransformEditor(index)}>
+                  <button className="btn btn--ghost" onClick={() => openTransformEditor(index)}>
                     {mapping.transformCode ? '已设置' : '未设置'}
                   </button>
                 </td>
                 <td>
-                  <button className="ghost" onClick={() => removeRow(index)}>删除</button>
+                  <button className="btn btn--danger" onClick={() => removeRow(index)}>删除</button>
                 </td>
               </tr>
             ))}
@@ -585,7 +585,7 @@ useEffect(() => {
                 <td><code>{row.targetType}</code></td>
                 <td><span className="muted">—</span></td>
                 <td>
-                  <button className="ghost" onClick={() => removeDefaultRow(row.id)}>删除</button>
+                  <button className="btn btn--danger" onClick={() => removeDefaultRow(row.id)}>删除</button>
                 </td>
               </tr>
             ))}
@@ -603,13 +603,13 @@ useEffect(() => {
       </datalist>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
-        <button className="ghost" onClick={addRow}>添加映射</button>
-        <button className="ghost" onClick={addDefaultRow}>添加默认值</button>
+        <button className="btn btn--ghost" onClick={addRow}>添加映射</button>
+        <button className="btn btn--ghost" onClick={addDefaultRow}>添加默认值</button>
         <div style={{ flex: 1 }} />
         <input type="text" value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder="模板名称" />
-        <button className="primary" disabled={savingTemplate} onClick={saveTemplate}>{savingTemplate ? '保存中…' : '保存模板'}</button>
+        <button className="btn btn--primary" disabled={savingTemplate} onClick={saveTemplate}>{savingTemplate ? '保存中…' : '保存模板'}</button>
         <button
-          className="ghost"
+          className="btn"
           disabled={dryRunLoading || !schema || !hasSamples || defaultsError !== null || incompleteMappings > 0 || upsertInvalid}
           onClick={runDry}
         >
@@ -693,9 +693,9 @@ useEffect(() => {
             <li key={tpl.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <strong>{tpl.name}</strong>
               <span className="muted">（{tpl.mappings.length} 条映射）</span>
-              <button className="ghost" onClick={() => applyTemplate(tpl)}>加载并应用</button>
+              <button className="btn" onClick={() => applyTemplate(tpl)}>加载并应用</button>
               {tpl.id && (
-                <button className="ghost" disabled={deletingTemplateId === tpl.id} onClick={() => deleteTemplate(tpl.id!)}>
+                <button className="btn btn--danger" disabled={deletingTemplateId === tpl.id} onClick={() => deleteTemplate(tpl.id!)}>
                   {deletingTemplateId === tpl.id ? '删除中…' : '删除'}
                 </button>
               )}
@@ -726,7 +726,7 @@ useEffect(() => {
           {dryRunReport.failed === 0 && draft && onStartImport && !hasRunningJob && (
             <div style={{ marginTop: 12 }}>
               <button
-                className="primary"
+                className="btn btn--primary"
                 disabled={starting}
                 onClick={() => onStartImport(draft)}
               >
@@ -747,7 +747,7 @@ useEffect(() => {
           <div style={{ background: '#fff', padding: 16, borderRadius: 10, width: 680, maxWidth: '92vw', maxHeight: '92vh', overflow: 'auto' }}>
             <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
               <h4 style={{ margin: 0 }}>编辑 Transform（第 {transformEditor.index + 1} 行）</h4>
-              <button className="ghost" onClick={closeTransformEditor}>关闭</button>
+              <button className="btn btn--ghost" onClick={closeTransformEditor}>关闭</button>
             </header>
             <p className="muted">Transform 接收 value 与 ctx 返回新值；默认函数如下。</p>
             <textarea
@@ -766,12 +766,12 @@ useEffect(() => {
                   <option key={idx} value={idx}>#{idx + 1}</option>
                 ))}
               </select>
-              <button className="ghost" disabled={transformEditor.testing} onClick={testTransform}>
+              <button className="btn" disabled={transformEditor.testing} onClick={testTransform}>
                 {transformEditor.testing ? '测试中…' : '在样本上测试'}
               </button>
               <div style={{ flex: 1 }} />
-              <button className="ghost" onClick={() => setTransformEditor((prev) => prev ? { ...prev, code: DEFAULT_TRANSFORM } : prev)}>重置为默认</button>
-              <button className="primary" onClick={applyTransformFromEditor}>保存</button>
+              <button className="btn btn--ghost" onClick={() => setTransformEditor((prev) => prev ? { ...prev, code: DEFAULT_TRANSFORM } : prev)}>重置为默认</button>
+              <button className="btn btn--primary" onClick={applyTransformFromEditor}>保存</button>
             </div>
             {transformEditor.error && <p className="error">{transformEditor.error}</p>}
             {transformEditor.result && (

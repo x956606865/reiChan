@@ -252,7 +252,7 @@ export default function Runboard({ onBack }: RunboardProps) {
     <section className="runboard" style={{ marginTop: 16 }}>
       <header style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         {onBack && (
-          <button className="ghost" onClick={onBack}>
+          <button className="btn btn--ghost" onClick={onBack}>
             返回映射
           </button>
         )}
@@ -308,21 +308,21 @@ export default function Runboard({ onBack }: RunboardProps) {
 
       <ProgressBar counts={counts} />
 
-      <div className="controls" style={{ display: 'flex', gap: 8, marginTop: 16 }}>
-        <button className="ghost" onClick={handlePause} disabled={!canPause}>
+      <div className="runboard-controls" style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+        <button className="btn" onClick={handlePause} disabled={!canPause}>
           暂停
         </button>
-        <button className="ghost" onClick={handleResume} disabled={!canResume}>
+        <button className="btn btn--primary" onClick={handleResume} disabled={!canResume}>
           继续
         </button>
-        <button className="ghost" onClick={handleCancel} disabled={!canCancel}>
+        <button className="btn btn--danger" onClick={handleCancel} disabled={!canCancel}>
           取消
         </button>
-        <button className="ghost" onClick={handleExportFailed} disabled={!canExport || exporting}>
+        <button className="btn" onClick={handleExportFailed} disabled={!canExport || exporting}>
           {exporting ? '导出中…' : '导出失败行'}
         </button>
         <div style={{ flex: 1 }} />
-        <button className="ghost" onClick={() => actions.reset()}>
+        <button className="btn btn--ghost" onClick={() => actions.reset()}>
           重置看板
         </button>
       </div>
@@ -508,7 +508,7 @@ function QueuePanel({
       <header style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <strong>作业队列</strong>
         <div style={{ flex: 1 }} />
-        <button className="ghost" onClick={onRefresh}>
+        <button className="btn" onClick={onRefresh}>
           刷新
         </button>
       </header>
@@ -541,7 +541,7 @@ function QueuePanel({
               focusedJobId={focusedJobId}
               onSelect={onSelect}
               renderActions={(job) => (
-                <button className="ghost" onClick={() => onSetPriority(job)}>
+                <button className="btn btn--ghost" onClick={() => onSetPriority(job)}>
                   设置优先级
                 </button>
               )}
@@ -554,10 +554,10 @@ function QueuePanel({
               onSelect={onSelect}
               renderActions={(job) => (
                 <>
-                  <button className="ghost" onClick={() => onPromote(job.jobId)}>
+                  <button className="btn" onClick={() => onPromote(job.jobId)}>
                     提升优先级
                   </button>
-                  <button className="ghost" onClick={() => onSetPriority(job)}>
+                  <button className="btn btn--ghost" onClick={() => onSetPriority(job)}>
                     设置优先级
                   </button>
                 </>
@@ -570,7 +570,7 @@ function QueuePanel({
               focusedJobId={focusedJobId}
               onSelect={onSelect}
               renderActions={(job) => (
-                <button className="ghost" onClick={() => onRequeue(job.jobId)}>
+                <button className="btn btn--ghost" onClick={() => onRequeue(job.jobId)}>
                   重新排队
                 </button>
               )}
@@ -629,7 +629,7 @@ function QueueSection({
                   flexWrap: 'wrap',
                 }}
               >
-                <button className="ghost" onClick={() => onSelect(job.jobId)}>
+                <button className="btn" onClick={() => onSelect(job.jobId)}>
                   查看
                 </button>
                 <span style={{ fontWeight: 600 }}>{job.jobId}</span>
@@ -745,7 +745,7 @@ function HistoryPanel({
             return (
               <button
                 key={opt.key}
-                className="ghost"
+                className="btn btn--ghost"
                 disabled={loading}
                 onClick={() => onFilterChange(opt.states)}
                 style={{
@@ -759,7 +759,7 @@ function HistoryPanel({
           })}
         </div>
         <div style={{ flex: 1 }} />
-        <button className="ghost" onClick={onRefresh} disabled={loading}>
+        <button className="btn" onClick={onRefresh} disabled={loading}>
           {loading ? '加载中…' : '刷新'}
         </button>
       </header>
@@ -849,14 +849,14 @@ function HistoryPanel({
         }}
       >
         <button
-          className="ghost"
+          className="btn btn--ghost"
           onClick={() => onPageChange(Math.max(resolvedPage - 1, 0))}
           disabled={loading || resolvedPage <= 0}
         >
           上一页
         </button>
         <button
-          className="ghost"
+          className="btn btn--ghost"
           onClick={() => onPageChange(resolvedPage + 1)}
           disabled={loading || (!hasMore && (!history || history.items.length < pageSize))}
         >

@@ -153,11 +153,16 @@ export default function NotionImportAgent() {
           </header>
           <TokenSelectStep value={selectedTokenId} onChange={setSelectedTokenId} />
           <div className="wizard-controls">
-            <button type="button" className="primary" disabled={!selectedTokenId} onClick={() => {
-              if (selectedTokenId) {
-                setStep(2);
-              }
-            }}>
+            <button
+              type="button"
+              className="btn btn--primary"
+              disabled={!selectedTokenId}
+              onClick={() => {
+                if (selectedTokenId) {
+                  setStep(2);
+                }
+              }}
+            >
               下一步
             </button>
           </div>
@@ -176,7 +181,7 @@ export default function NotionImportAgent() {
             setStep(3);
           }} />
           <div className="wizard-controls">
-            <button type="button" onClick={backToTokenStep}>返回上一步</button>
+            <button type="button" className="btn btn--ghost" onClick={backToTokenStep}>返回上一步</button>
           </div>
         </section>
       )}
@@ -273,8 +278,10 @@ function TokenManager() {
             onChange={(e) => setToken(e.target.value)}
           />
         </div>
-        <div className="controls">
-          <button type="submit" disabled={!canSave || saving}>保存</button>
+        <div className="token-form-actions">
+          <button type="submit" className="btn btn--primary" disabled={!canSave || saving}>
+            保存
+          </button>
         </div>
       </form>
 
@@ -287,7 +294,7 @@ function TokenManager() {
             <strong>{t.name}</strong>
             {" "}
             <span className="muted">{t.workspaceName ?? "(未知工作区)"}</span>
-            <button className="ghost" onClick={() => remove(t.id)}>删除</button>
+            <button className="btn btn--danger" onClick={() => remove(t.id)}>删除</button>
           </li>
         ))}
         {tokens.length === 0 && <li className="muted">尚未添加 Token。</li>}
@@ -327,7 +334,7 @@ function TokenSelectStep(props: { value?: string | null; onChange?: (id: string 
   return (
     <div className="token-select">
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8 }}>
-        <button type="button" className="ghost" onClick={() => setShowManager(true)}>管理 Token</button>
+        <button type="button" className="btn btn--ghost" onClick={() => setShowManager(true)}>管理 Token</button>
       </div>
       {loading && <p>加载中…</p>}
       {error && <p className="error">{error}</p>}
@@ -347,7 +354,7 @@ function TokenSelectStep(props: { value?: string | null; onChange?: (id: string 
                 <span className="muted">{t.workspaceName ?? "(未知工作区)"}</span>
               </span>
             </label>
-            <button className="ghost" onClick={() => remove(t.id)}>删除</button>
+            <button className="btn btn--danger" onClick={() => remove(t.id)}>删除</button>
           </li>
         ))}
         {tokens.length === 0 && <li className="muted">尚未添加 Token，请点击「管理 Token」新增。</li>}
@@ -358,7 +365,7 @@ function TokenSelectStep(props: { value?: string | null; onChange?: (id: string 
           <div style={{ background: "#fff", padding: 16, borderRadius: 10, width: 640, maxWidth: "90vw" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <h4 style={{ margin: 0 }}>Token 管理</h4>
-              <button className="ghost" onClick={() => setShowManager(false)}>关闭</button>
+              <button className="btn btn--ghost" onClick={() => setShowManager(false)}>关闭</button>
             </div>
             <TokenManager />
           </div>
@@ -442,7 +449,7 @@ function DatabaseSearchStep(props: { tokenId: string | null; onPrev: () => void;
   return (
     <div className="db-search-step">
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-        <button className="ghost" onClick={props.onPrev}>返回上一步</button>
+        <button className="btn btn--ghost" onClick={props.onPrev}>返回上一步</button>
         <div style={{ flex: 1 }} />
         <input
           style={{ minWidth: 260 }}
@@ -454,7 +461,7 @@ function DatabaseSearchStep(props: { tokenId: string | null; onPrev: () => void;
             if (e.key === "Enter") onSearch();
           }}
         />
-        <button className="ghost" onClick={onSearch} disabled={!tokenId || loading}>{loading ? "搜索中…" : "搜索"}</button>
+        <button className="btn btn--ghost" onClick={onSearch} disabled={!tokenId || loading}>{loading ? "搜索中…" : "搜索"}</button>
         <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: 8 }} title="默认不包含标题为空的数据库。选中后会一并显示。">
           <input
             type="checkbox"
@@ -472,7 +479,7 @@ function DatabaseSearchStep(props: { tokenId: string | null; onPrev: () => void;
       {error && (
         <p className="error" style={{ marginTop: 0 }}>
           {error} {(/Token not found/i.test(error)) && (
-            <button className="ghost" onClick={props.onPrev} style={{ marginLeft: 8 }}>返回选择 Token</button>
+            <button className="btn btn--ghost" onClick={props.onPrev} style={{ marginLeft: 8 }}>返回选择 Token</button>
           )}
         </p>
       )}
@@ -494,7 +501,7 @@ function DatabaseSearchStep(props: { tokenId: string | null; onPrev: () => void;
                 <td>{db.title && db.title.trim().length > 0 ? db.title : <span className="muted">(无标题)</span>}</td>
                 <td><code>{db.id}</code></td>
                 <td>
-                  <button className="primary" onClick={() => props.onSelect(db as DbBrief)}>选择</button>
+                  <button className="btn btn--primary" onClick={() => props.onSelect(db as DbBrief)}>选择</button>
                 </td>
               </tr>
             ))}
@@ -510,8 +517,8 @@ function DatabaseSearchStep(props: { tokenId: string | null; onPrev: () => void;
       </div>
 
       <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
-        <button className="ghost" onClick={onPrev} disabled={pageIndex <= 0 || loading}>上一页</button>
-        <button className="ghost" onClick={onNext} disabled={!page.hasMore || loading}>下一页</button>
+        <button className="btn btn--ghost" onClick={onPrev} disabled={pageIndex <= 0 || loading}>上一页</button>
+        <button className="btn btn--ghost" onClick={onNext} disabled={!page.hasMore || loading}>下一页</button>
         <span className="muted">{`第 ${pageIndex + 1} 页`}</span>
       </div>
     </div>
@@ -583,7 +590,7 @@ function DataSourceStep(props: {
   return (
     <div className="data-source-step">
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: 'wrap' }}>
-        <button className="ghost" onClick={props.onPrev}>返回选择数据库</button>
+        <button className="btn btn--ghost" onClick={props.onPrev}>返回选择数据库</button>
         <input
           type="text"
           value={filePath}
@@ -601,7 +608,7 @@ function DataSourceStep(props: {
           style={{ flex: 1, minWidth: 260 }}
         />
         <button
-          className="ghost"
+          className="btn btn--ghost"
           onClick={async () => {
             if (!filePath) return
             await loadPreview(filePath, fileType === 'auto' ? undefined : fileType)
@@ -610,7 +617,7 @@ function DataSourceStep(props: {
         >
           加载预览
         </button>
-        <button className="ghost" onClick={chooseFile}>{filePath ? "重新选择文件" : "选择文件"}</button>
+        <button className="btn btn--ghost" onClick={chooseFile}>{filePath ? "重新选择文件" : "选择文件"}</button>
         <select
           value={fileType}
           onChange={(e) => setFileType(e.target.value)}
@@ -666,7 +673,7 @@ function DataSourceStep(props: {
 
       <div className="wizard-controls" style={{ marginTop: 12 }}>
         <button
-          className="primary"
+          className="btn btn--primary"
           disabled={!filePath || !preview || preview.fields.length === 0 || loading}
           onClick={() => {
             if (!filePath || !preview) return;
